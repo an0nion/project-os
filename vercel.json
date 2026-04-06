@@ -1,0 +1,22 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/deadlines",
+      "schedule": "0 8 * * *"
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/project/:key",
+      "destination": "/project/[key]"
+    }
+  ],
+  "functions": {
+    "app/api/scrape/route.js": {
+      "maxDuration": 60
+    },
+    "app/api/chat/route.js": {
+      "maxDuration": 60
+    }
+  }
+}
