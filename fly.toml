@@ -1,0 +1,15 @@
+# Fly.io config — Slack bot (Socket Mode worker, no HTTP)
+app = "project-os-bot"
+primary_region = "syd"   # Sydney — change to nearest: lax, ord, lhr, sin, etc.
+
+[build]
+
+[env]
+  NODE_ENV = "production"
+
+# No [[services]] — this is a pure worker process, no inbound traffic needed
+# Secrets (env vars) are set via: flyctl secrets set KEY=value
+
+[[vm]]
+  size   = "shared-cpu-1x"
+  memory = "256mb"

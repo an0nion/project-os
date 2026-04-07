@@ -72,7 +72,7 @@ app.message(async ({ message, say }) => {
       try {
         const res = await fetch(`${process.env.APP_URL}/api/inbox`, {
           method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
           body:    JSON.stringify({ url, text: userText, source: 'slack' }),
         });
         const data = await res.json();
@@ -124,7 +124,7 @@ app.message(async ({ message, say }) => {
     try {
       const res = await fetch(`${process.env.APP_URL}/api/inbox`, {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
         body:    JSON.stringify({ text: userText, source: 'slack' }),
       });
       const data = await res.json();
