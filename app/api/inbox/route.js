@@ -71,13 +71,15 @@ export async function POST(req) {
   }
 
   // ── Audit log ───────────────────────────────────────────────────────────────
-  await supabase.from('inbox_log').insert({
-    source:  source ?? 'unknown',
-    url:     url    ?? null,
-    text:    text   ?? null,
-    project,
-    summary,
-  }).catch(() => {});
+  try {
+    await supabase.from('inbox_log').insert({
+      source:  source ?? 'unknown',
+      url:     url    ?? null,
+      text:    text   ?? null,
+      project,
+      summary,
+    });
+  } catch { /* non-fatal */ }
 
   return NextResponse.json({
     project,

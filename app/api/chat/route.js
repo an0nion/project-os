@@ -160,10 +160,12 @@ export async function POST(req) {
     };
     if (projectKey) await addMessage(projectKey, 'assistant', result.text, meta).catch(() => {});
     if (appId || questionId) {
-      await supabase.from('chat_messages').insert([
-        { application_id: appId ?? null, question_id: questionId ?? null, role: 'user',      content: userMessage   },
-        { application_id: appId ?? null, question_id: questionId ?? null, role: 'assistant', content: result.text },
-      ]).catch(() => {});
+      try {
+        await supabase.from('chat_messages').insert([
+          { application_id: appId ?? null, question_id: questionId ?? null, role: 'user',      content: userMessage   },
+          { application_id: appId ?? null, question_id: questionId ?? null, role: 'assistant', content: result.text },
+        ]);
+      } catch { /* non-fatal */ }
     }
 
     return NextResponse.json({
