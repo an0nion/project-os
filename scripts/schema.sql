@@ -107,14 +107,69 @@ create trigger trg_base_answers_updated
   before update on base_answers
   for each row execute function update_timestamp();
 
+-- ── Project-level chat messages ─────────────────────────────────────────────
+create table if not exists messages (
+  id          uuid primary key default gen_random_uuid(),
+  project_key text not null,
+  role        text not null check (role in ('user', 'assistant', 'system')),
+  content     text not null,
+  metadata    jsonb,          -- tier, model, provider, cached, usage
+  created_at  timestamptz not null default now()
+);
+create index if not exists idx_messages_project on messages(project_key, created_at);
+
+-- ── User profile ─────────────────────────────────────────────────────────────
+create table if not exists profile (
+  id         uuid primary key default gen_random_uuid(),
+  data       jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+-- Seed an empty profile row so getProfile() always returns something
+insert into profile (data) values ('{}') on conflict do nothing;
+
+-- ── Cost log ─────────────────────────────────────────────────────────────────
+create table if not exists cost_log (
+  id            uuid primary key default gen_random_uuid(),
+  model         text not null,
+  provider      text not null,
+  tier          int not null,
+  input_tokens  int default 0,
+  output_tokens int default 0,
+  cost_usd      numeric(10,6) default 0,
+  cached        boolean default false,
+  project_key   text,
+  created_at    timestamptz not null default now()
+);
+create index if not exists idx_cost_log_created on cost_log(created_at desc);
+create index if not exists idx_cost_log_project on cost_log(project_key, created_at);
+
+-- ── Batch jobs ────────────────────────────────────────────────────────────────
+create table if not exists batch_jobs (
+  id          uuid primary key default gen_random_uuid(),
+  batch_id    text not null unique,
+  status      text not null default 'in_progress',
+  job_count   int default 0,
+  project_key text,
+  metadata    jsonb,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+create trigger trg_batch_jobs_updated
+  before update on batch_jobs
+  for each row execute function update_timestamp();
+
 -- ── Disable Row Level Security (single-user app — RLS would return empty queries) ──
 -- If you ever add multi-user auth, re-enable RLS and add policies instead.
-alter table applications     disable row level security;
-alter table questions        disable row level security;
-alter table base_answers     disable row level security;
-alter table chat_messages    disable row level security;
+alter table applications       disable row level security;
+alter table questions          disable row level security;
+alter table base_answers       disable row level security;
+alter table chat_messages      disable row level security;
 alter table push_subscriptions disable row level security;
-alter table inbox_log        disable row level security;
+alter table inbox_log          disable row level security;
+alter table messages           disable row level security;
+alter table profile            disable row level security;
+alter table cost_log           disable row level security;
+alter table batch_jobs         disable row level security;
 
 -- ── Seed: default base answer categories (empty, user fills these in) ──
 insert into base_answers (category, content) values

@@ -7,10 +7,14 @@
  * Response: { project, projectLabel, summary, questionsCount?, deadline?, appId? }
  */
 
-import { NextResponse } from 'next/server';
-import { route }        from '../../../lib/router.js';
+/**
+ * router.js now uses chatWithModel('gemini-flash-lite') for its AI fallback —
+ * Tier 1 routing costs ~$0 on the free tier (1000 req/day).
+ */
+import { NextResponse }      from 'next/server';
+import { route }             from '../../../lib/router.js';
 import { scrapeApplication } from '../../../scraper/index.js';
-import { supabase }     from '../../../lib/supabase.js';
+import { supabase }          from '../../../lib/supabase.js';
 
 export async function POST(req) {
   const { url, text, source } = await req.json();
