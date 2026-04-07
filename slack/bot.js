@@ -28,8 +28,30 @@ function isDuplicate(clientMsgId) {
   if (!clientMsgId) return false;
   if (_seen.has(clientMsgId)) return true;
   _seen.add(clientMsgId);
-  // Keep set small — clear old entries after 500 messages
   if (_seen.size > 500) _seen.clear();
+  return false;
+}
+
+// ── Pending clarification state ───────────────────────────────────────────────
+// userId → { url, text, step: 1|2, context: 'work'|'personal' }
+const clarificationPending = new Map();
+
+/**
+ * Returns true when routing context is ambiguous (work vs personal learning).
+ * GitHub/arXiv/HuggingFace URLs are always ambiguous.
+ * Generic "learn/check out" messages with no clear context are too.
+ */
+function isAmbiguous(text, urls) {
+  const lower = text.toLowerCase();
+
+  // Clear work signal → route directly, no clarification
+  if (/\bfor work\b|\bat work\b|\bwork task\b|\bmy job\b|\bsprint\b|\bticket\b|\bdeployment\b/.test(lower)) return false;
+  // Clear personal signal → route directly, no clarification
+  if (/\bfor fun\b|\bpersonal\b|\bmy hobby\b|\bjust curious\b|\bcuriosity\b/.test(lower)) return false;
+
+  // Tech repo/paper URLs → ambiguous
+  if (urls.some(u => /github\.com|arxiv\.org|huggingface\.co|papers\.with\.code/.test(u))) return true;
+
   return false;
 }
 
@@ -39,10 +61,8 @@ function extractUrls(message) {
   const urls = [];
   const urlRegex = /https?:\/\/[^\s<>|]+/g;
 
-  // Plain text
   if (message.text) urls.push(...(message.text.match(urlRegex) ?? []));
 
-  // Slack block kit
   if (message.blocks) {
     const walkElements = (elements) => {
       for (const el of elements ?? []) {
@@ -53,7 +73,6 @@ function extractUrls(message) {
     message.blocks.forEach(b => walkElements(b.elements));
   }
 
-  // Unfurled link previews in attachments
   if (message.attachments) {
     for (const att of message.attachments) {
       if (att.original_url) urls.push(att.original_url);
@@ -67,7 +86,7 @@ function extractUrls(message) {
   );
 }
 
-// ── API helper ────────────────────────────────────────────────────────────────
+// ── API helpers ───────────────────────────────────────────────────────────────
 
 async function callInbox(body) {
   const res = await fetch(`${process.env.APP_URL}/api/inbox`, {
@@ -80,68 +99,124 @@ async function callInbox(body) {
   });
 
   const text = await res.text();
-
-  // Guard against HTML responses (e.g. login redirect)
   if (!text.startsWith('{')) {
     throw new Error(`Non-JSON response (status ${res.status}) — check APP_SECRET`);
   }
-
   return JSON.parse(text);
+}
+
+async function postInboxResult(say, data) {
+  if (data.error) {
+    await say(`⚠️ Couldn't process that: ${data.error}\n\nOpen the app: ${process.env.APP_URL}`);
+    return;
+  }
+  await say({
+    text: `✅ Added to *${data.projectLabel ?? data.project}*`,
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text:
+            `✅ *${data.summary ?? 'Added'}*\n` +
+            `→ Project: *${data.projectLabel ?? data.project}*\n` +
+            (data.questionsCount ? `❓ ${data.questionsCount} questions extracted\n` : '') +
+            (data.deadline ? `📅 Deadline: ${new Date(data.deadline).toLocaleDateString()}\n` : ''),
+        },
+      },
+      {
+        type: 'actions',
+        elements: [{
+          type:      'button',
+          text:      { type: 'plain_text', text: '✍️ Open in app' },
+          url:       `${process.env.APP_URL}?project=${data.project}`,
+          action_id: 'open_app',
+          style:     'primary',
+        }],
+      },
+    ],
+  });
 }
 
 // ── Main DM listener ──────────────────────────────────────────────────────────
 
 app.message(async ({ message, say }) => {
-  // Only respond to direct messages
   if (message.channel_type !== 'im') return;
-
-  // Deduplicate — Slack sometimes delivers the same event twice
   if (isDuplicate(message.client_msg_id)) return;
-
-  // Ignore bot messages (prevent echo loops)
   if (message.bot_id) return;
 
+  const userId   = message.user;
   const urls     = extractUrls(message);
   const userText = message.text ?? '';
 
-  // ── Case 1: Message contains URLs ──────────────────────────────────────────
-  if (urls.length > 0) {
-    for (const url of urls) {
-      await say(`⏳ Processing: ${url}`);
+  // ── Handle pending clarification responses ─────────────────────────────────
+  if (clarificationPending.has(userId)) {
+    const state = clarificationPending.get(userId);
+    const lower = userText.toLowerCase();
+
+    if (state.step === 1) {
+      // Expecting "work" or "personal"
+      const isWork     = /\bwork\b/i.test(lower);
+      const isPersonal = /\bpersonal\b|\blearning\b|\bfun\b|\bmine\b|\bcurious\b/i.test(lower);
+
+      if (isWork) {
+        clarificationPending.set(userId, { ...state, step: 2, context: 'work' });
+        await say('Got it, work 💼\n\nAny urgency — *today*, *this week*, or *no rush*?');
+        return;
+      }
+
+      if (isPersonal) {
+        clarificationPending.set(userId, { ...state, step: 2, context: 'personal' });
+        await say('Personal learning 📚\n\nWant to look at it *soon* or just *saving for later*?');
+        return;
+      }
+
+      // Didn't understand — re-ask
+      await say('Just checking — is this for *work* or *personal* learning?');
+      return;
+    }
+
+    if (state.step === 2) {
+      // Got urgency/timeline — finalize routing
+      const project  = state.context === 'work' ? 'work' : 'learning_tech';
+      const timeline = userText.trim();
+
+      // Enrich the stored text with context for the summary
+      const enrichedText = state.context === 'work'
+        ? `[Work] ${state.text || state.url} — urgency: ${timeline}`
+        : `[Personal learning] ${state.text || state.url} — timeline: ${timeline}`;
+
+      clarificationPending.delete(userId);
 
       try {
-        const data = await callInbox({ url, text: userText, source: 'slack' });
+        const data = await callInbox({
+          url:     state.url  || undefined,
+          text:    enrichedText,
+          source:  'slack',
+          project,               // forced — bypasses AI routing
+        });
+        await postInboxResult(say, data);
+      } catch (err) {
+        await say(`❌ Error: ${err.message}`);
+      }
+      return;
+    }
+  }
 
-        if (data.error) {
-          await say(`⚠️ Couldn't process that link: ${data.error}\n\nOpen the app manually:\n${process.env.APP_URL}`);
-        } else {
-          await say({
-            text: `✅ Added to *${data.projectLabel ?? data.project}*`,
-            blocks: [
-              {
-                type: 'section',
-                text: {
-                  type: 'mrkdwn',
-                  text:
-                    `✅ *${data.summary ?? 'Added'}*\n` +
-                    `→ Project: *${data.projectLabel ?? data.project}*\n` +
-                    (data.questionsCount ? `❓ ${data.questionsCount} questions extracted\n` : '') +
-                    (data.deadline ? `📅 Deadline: ${new Date(data.deadline).toLocaleDateString()}\n` : ''),
-                },
-              },
-              {
-                type: 'actions',
-                elements: [{
-                  type:      'button',
-                  text:      { type: 'plain_text', text: '✍️ Open in app' },
-                  url:       `${process.env.APP_URL}?project=${data.project}`,
-                  action_id: 'open_app',
-                  style:     'primary',
-                }],
-              },
-            ],
-          });
-        }
+  // ── Case 1: Message contains URLs ──────────────────────────────────────────
+  if (urls.length > 0) {
+    // Check if routing context is ambiguous
+    if (isAmbiguous(userText, urls)) {
+      clarificationPending.set(userId, { url: urls[0], text: userText, step: 1 });
+      await say('Is this for *work* or *personal* learning?');
+      return;
+    }
+
+    for (const url of urls) {
+      await say(`⏳ Processing: ${url}`);
+      try {
+        const data = await callInbox({ url, text: userText, source: 'slack' });
+        await postInboxResult(say, data);
       } catch (err) {
         await say(`❌ Error: ${err.message}`);
       }
@@ -151,6 +226,13 @@ app.message(async ({ message, say }) => {
 
   // ── Case 2: Text-only message ───────────────────────────────────────────────
   if (userText.trim()) {
+    // Also check text-only ambiguity (e.g. "want to learn about transformers")
+    if (isAmbiguous(userText, [])) {
+      clarificationPending.set(userId, { url: null, text: userText, step: 1 });
+      await say('Is this for *work* or *personal* learning?');
+      return;
+    }
+
     try {
       const data = await callInbox({ text: userText, source: 'slack' });
       await say(
@@ -166,7 +248,7 @@ app.message(async ({ message, say }) => {
   // ── Case 3: Empty message ───────────────────────────────────────────────────
   await say(
     `Send me a link or a message and I'll route it to the right project.\n` +
-    `Example: forward a post here, or type _"want to learn about X"_`,
+    `Example: forward a post, paste a GitHub link, or type _"need to learn X for work"_`,
   );
 });
 

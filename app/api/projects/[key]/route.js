@@ -17,7 +17,13 @@ export async function GET(req, { params }) {
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
-  return NextResponse.json({ applications: data ?? [] });
+  // Inbox item count for this project (for non-application project tiles)
+  const { count: inboxCount } = await supabase
+    .from('inbox_log')
+    .select('*', { count: 'exact', head: true })
+    .eq('project', key);
+
+  return NextResponse.json({ applications: data ?? [], inboxCount: inboxCount ?? 0 });
 }
 
 export async function PATCH(req, { params }) {

@@ -12,25 +12,41 @@ import { NextResponse }      from 'next/server';
 import { route }             from '../../../lib/router.js';
 import { scrapeApplication } from '../../../scraper/index.js';
 import { supabase }          from '../../../lib/supabase.js';
+import { PROJECTS }          from '../../../lib/projects.js';
 
 export async function POST(req) {
-  const { url, text, source } = await req.json();
+  const { url, text, source, project: forcedProject } = await req.json();
 
   if (!url && !text) {
     return NextResponse.json({ error: 'url or text required' }, { status: 400 });
   }
 
-  // ── Route to project (keyword match → gemini-flash free → deepseek fallback) ──
-  const routeInput = text || url;
-  const { project, projectLabel, confidence, summary, suggested_action, is_new_task } = await route(routeInput);
+  // ── Route to project ────────────────────────────────────────────────────────
+  // forcedProject: set by Slack bot after clarification flow (bypasses AI routing)
+  let project, projectLabel, confidence, summary, suggested_action, is_new_task;
 
-  // ── Scrape URL if provided ──────────────────────────────────────────────────
+  if (forcedProject) {
+    const pDef   = PROJECTS.find(p => p.key === forcedProject);
+    project          = forcedProject;
+    projectLabel     = pDef?.label ?? forcedProject;
+    confidence       = 1.0;
+    summary          = (text || url || '').slice(0, 80);
+    suggested_action = 'Add to project';
+    is_new_task      = true;
+  } else {
+    const routeInput = text || url;
+    ({ project, projectLabel, confidence, summary, suggested_action, is_new_task } = await route(routeInput));
+  }
+
+  // ── Scrape URL if provided (skip GitHub — it's not a job application) ──────
   let appId          = null;
   let questionsCount = 0;
   let deadline       = null;
   let scrapeError    = null;
 
-  if (url) {
+  const isGitHub = url && (url.includes('github.com') || url.includes('gitlab.com'));
+
+  if (url && !isGitHub) {
     const scraped = await scrapeApplication(url);
 
     if (!scraped.error) {
