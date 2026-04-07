@@ -1,16 +1,13 @@
 /**
  * POST /api/inbox
  * Universal entry point for all captured items (Slack, bookmarklet, PWA share target).
- * Routes the item to a project via keyword match then Claude fallback.
+ * Routes the item to a project via keyword match then AI fallback (free model).
  *
  * Body: { url?, text?, source? }
- * Response: { project, projectLabel, summary, questionsCount?, deadline?, appId? }
+ * Response: { project, projectLabel, confidence, summary, suggested_action, is_new_task,
+ *             appId?, questionsCount?, deadline?, routedBy, routingCost }
  */
 
-/**
- * router.js now uses chatWithModel('gemini-flash-lite') for its AI fallback —
- * Tier 1 routing costs ~$0 on the free tier (1000 req/day).
- */
 import { NextResponse }      from 'next/server';
 import { route }             from '../../../lib/router.js';
 import { scrapeApplication } from '../../../scraper/index.js';
@@ -19,16 +16,15 @@ import { supabase }          from '../../../lib/supabase.js';
 export async function POST(req) {
   const { url, text, source } = await req.json();
 
-  // Need at least one of url or text
   if (!url && !text) {
     return NextResponse.json({ error: 'url or text required' }, { status: 400 });
   }
 
-  // Route to project
+  // ── Route to project (keyword match → gemini-flash free → deepseek fallback) ──
   const routeInput = text || url;
   const { project, projectLabel, confidence, summary, suggested_action, is_new_task } = await route(routeInput);
 
-  // If we have a URL, kick off scraping
+  // ── Scrape URL if provided ──────────────────────────────────────────────────
   let appId          = null;
   let questionsCount = 0;
   let deadline       = null;
@@ -38,7 +34,6 @@ export async function POST(req) {
     const scraped = await scrapeApplication(url);
 
     if (!scraped.error) {
-      // Save application to DB
       const { data: app, error: appErr } = await supabase
         .from('applications')
         .insert({
@@ -57,7 +52,6 @@ export async function POST(req) {
         appId    = app.id;
         deadline = scraped.deadline;
 
-        // Save questions
         if (scraped.questions?.length) {
           await supabase.from('questions').insert(
             scraped.questions.map(q => ({
@@ -76,14 +70,14 @@ export async function POST(req) {
     }
   }
 
-  // Log to inbox_log for QA / audit trail
+  // ── Audit log ───────────────────────────────────────────────────────────────
   await supabase.from('inbox_log').insert({
-    source:   source ?? 'unknown',
-    url:      url    ?? null,
-    text:     text   ?? null,
+    source:  source ?? 'unknown',
+    url:     url    ?? null,
+    text:    text   ?? null,
     project,
     summary,
-  }).throwOnError().catch(() => {}); // non-fatal if table not yet created
+  }).catch(() => {});
 
   return NextResponse.json({
     project,
@@ -95,7 +89,9 @@ export async function POST(req) {
     appId,
     questionsCount,
     deadline,
+    routedBy:    'gemini-flash',
+    routingCost: 0,
+    source:      source ?? 'unknown',
     ...(scrapeError ? { error: scrapeError } : {}),
-    source: source ?? 'unknown',
   });
 }
