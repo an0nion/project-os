@@ -11,15 +11,16 @@
     "icons": "node scripts/generate-icons.js"
   },
   "dependencies": {
-    "next": "14.2.29",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
+    "@slack/bolt": "^3.22.0",
+    "@sparticuz/chromium": "^123.0.1",
     "@supabase/supabase-js": "^2.45.4",
     "cheerio": "^1.0.0",
-    "@slack/bolt": "^3.22.0",
-    "web-push": "^3.6.7",
+    "dotenv": "^16.6.1",
+    "next": "14.2.29",
     "puppeteer-core": "^22.15.0",
-    "@sparticuz/chromium": "^123.0.1"
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "eslint": "^8.57.0",

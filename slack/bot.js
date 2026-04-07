@@ -12,6 +12,7 @@
  * Run: npm run slack
  */
 
+import 'dotenv/config';
 import bolt from '@slack/bolt';
 const { App } = bolt;
 
