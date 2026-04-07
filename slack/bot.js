@@ -22,6 +22,17 @@ const app = new App({
   socketMode: true,
 });
 
+// ── Deduplication (Slack can fire the same event twice) ───────────────────────
+const _seen = new Set();
+function isDuplicate(clientMsgId) {
+  if (!clientMsgId) return false;
+  if (_seen.has(clientMsgId)) return true;
+  _seen.add(clientMsgId);
+  // Keep set small — clear old entries after 500 messages
+  if (_seen.size > 500) _seen.clear();
+  return false;
+}
+
 // ── URL extraction helper ─────────────────────────────────────────────────────
 
 function extractUrls(message) {
@@ -31,7 +42,7 @@ function extractUrls(message) {
   // Plain text
   if (message.text) urls.push(...(message.text.match(urlRegex) ?? []));
 
-  // Slack block kit (forwarded/shared messages embed links in blocks)
+  // Slack block kit
   if (message.blocks) {
     const walkElements = (elements) => {
       for (const el of elements ?? []) {
@@ -56,11 +67,39 @@ function extractUrls(message) {
   );
 }
 
+// ── API helper ────────────────────────────────────────────────────────────────
+
+async function callInbox(body) {
+  const res = await fetch(`${process.env.APP_URL}/api/inbox`, {
+    method:  'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-secret': process.env.APP_SECRET,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const text = await res.text();
+
+  // Guard against HTML responses (e.g. login redirect)
+  if (!text.startsWith('{')) {
+    throw new Error(`Non-JSON response (status ${res.status}) — check APP_SECRET`);
+  }
+
+  return JSON.parse(text);
+}
+
 // ── Main DM listener ──────────────────────────────────────────────────────────
 
 app.message(async ({ message, say }) => {
-  // Only respond to direct messages — ignore anything in channels
+  // Only respond to direct messages
   if (message.channel_type !== 'im') return;
+
+  // Deduplicate — Slack sometimes delivers the same event twice
+  if (isDuplicate(message.client_msg_id)) return;
+
+  // Ignore bot messages (prevent echo loops)
+  if (message.bot_id) return;
 
   const urls     = extractUrls(message);
   const userText = message.text ?? '';
@@ -71,20 +110,10 @@ app.message(async ({ message, say }) => {
       await say(`⏳ Processing: ${url}`);
 
       try {
-        const res = await fetch(`${process.env.APP_URL}/api/inbox`, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
-          body:    JSON.stringify({ url, text: userText, source: 'slack' }),
-        });
-        const data = await res.json();
+        const data = await callInbox({ url, text: userText, source: 'slack' });
 
-        if (data.error === 'scrape_failed') {
-          // Scraping failed — send link to manual paste
-          await say(
-            `⚠️ Couldn't scrape that page automatically.\n\n` +
-            `Open the app to paste the questions manually:\n` +
-            `${process.env.APP_URL}?inbox=${encodeURIComponent(url)}`,
-          );
+        if (data.error) {
+          await say(`⚠️ Couldn't process that link: ${data.error}\n\nOpen the app manually:\n${process.env.APP_URL}`);
         } else {
           await say({
             text: `✅ Added to *${data.projectLabel ?? data.project}*`,
@@ -97,7 +126,7 @@ app.message(async ({ message, say }) => {
                     `✅ *${data.summary ?? 'Added'}*\n` +
                     `→ Project: *${data.projectLabel ?? data.project}*\n` +
                     (data.questionsCount ? `❓ ${data.questionsCount} questions extracted\n` : '') +
-                    (data.deadline       ? `📅 Deadline: ${new Date(data.deadline).toLocaleDateString()}\n` : ''),
+                    (data.deadline ? `📅 Deadline: ${new Date(data.deadline).toLocaleDateString()}\n` : ''),
                 },
               },
               {
@@ -120,34 +149,28 @@ app.message(async ({ message, say }) => {
     return;
   }
 
-  // ── Case 2: Text-only message — route via AI ────────────────────────────────
+  // ── Case 2: Text-only message ───────────────────────────────────────────────
   if (userText.trim()) {
     try {
-      const res = await fetch(`${process.env.APP_URL}/api/inbox`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
-        body:    JSON.stringify({ text: userText, source: 'slack' }),
-      });
-      const data = await res.json();
-
+      const data = await callInbox({ text: userText, source: 'slack' });
       await say(
         `📋 Routed to *${data.projectLabel ?? data.project}*: ${data.summary ?? ''}\n` +
         `${process.env.APP_URL}?project=${data.project}`,
       );
-    } catch {
-      await say(`Added to inbox. Open the app to review:\n${process.env.APP_URL}`);
+    } catch (err) {
+      await say(`❌ Error: ${err.message}`);
     }
     return;
   }
 
-  // ── Case 3: Nothing useful (empty DM, sticker, etc.) ───────────────────────
+  // ── Case 3: Empty message ───────────────────────────────────────────────────
   await say(
     `Send me a link or a message and I'll route it to the right project.\n` +
     `Example: forward a post here, or type _"want to learn about X"_`,
   );
 });
 
-// ── Deadline nudge (called by cron handler) ───────────────────────────────────
+// ── Deadline nudge (called by cron) ──────────────────────────────────────────
 
 export async function sendSlackDeadlineNudge(slackUserId, apps) {
   const dm = await app.client.conversations.open({ users: slackUserId });
@@ -161,8 +184,8 @@ export async function sendSlackDeadlineNudge(slackUserId, apps) {
 
   let text = '📋 *Upcoming deadlines:*\n\n';
   for (const a of urgent) {
-    const d     = Math.ceil((new Date(a.deadline) - new Date()) / 86_400_000);
-    const emoji = d <= 1 ? '🔴' : d <= 3 ? '🟡' : '⚪';
+    const d          = Math.ceil((new Date(a.deadline) - new Date()) / 86_400_000);
+    const emoji      = d <= 1 ? '🔴' : d <= 3 ? '🟡' : '⚪';
     const unanswered = (a.questions ?? []).filter(q => !q.answer?.trim()).length;
     text += `${emoji} *${a.org}* — ${d}d left${unanswered ? ` (${unanswered} unanswered)` : ''}\n`;
   }
