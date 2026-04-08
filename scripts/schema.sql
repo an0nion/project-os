@@ -67,14 +67,29 @@ create table if not exists push_subscriptions (
 
 -- ── Inbox log (audit trail for all captured items) ───────────
 create table if not exists inbox_log (
-  id         uuid primary key default gen_random_uuid(),
-  source     text not null default 'unknown',  -- 'slack' | 'web' | 'pwa' | 'bookmarklet'
-  url        text,
-  text       text,
-  project    text not null,
-  summary    text,
-  created_at timestamptz not null default now()
+  id                uuid primary key default gen_random_uuid(),
+  source            text not null default 'unknown',  -- 'slack' | 'web' | 'pwa'
+  url               text,
+  text              text,
+  project           text not null,         -- final routed project (may be forced by bot)
+  summary           text,
+  -- ── Training signal columns ──────────────────────────────────────────────
+  model_project     text,                  -- what the router predicted (before any override)
+  model_confidence  float,                 -- router confidence score
+  final_project     text,                  -- what was actually used (= project unless overridden)
+  corrected_project text,                  -- user's correction (null = model was right)
+  correction_note   text,                  -- raw correction message from user
+  is_correction     boolean default false, -- true = labelled training example (error case)
+  created_at        timestamptz not null default now()
 );
+
+-- Run this if inbox_log already exists (additive migration):
+alter table inbox_log add column if not exists model_project    text;
+alter table inbox_log add column if not exists model_confidence float;
+alter table inbox_log add column if not exists final_project    text;
+alter table inbox_log add column if not exists corrected_project text;
+alter table inbox_log add column if not exists correction_note  text;
+alter table inbox_log add column if not exists is_correction    boolean default false;
 
 create index if not exists idx_inbox_log_created on inbox_log(created_at desc);
 

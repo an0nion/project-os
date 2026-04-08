@@ -111,8 +111,16 @@ export async function POST(req) {
 
   // ── 1. Route to project ─────────────────────────────────────────────────────
   let project, projectLabel, confidence, summary, suggested_action, is_new_task;
+  let modelProject    = null;   // what the router predicted (training signal)
+  let modelConfidence = null;
 
   if (forcedProject) {
+    // Bot forced routing after clarification — still run router to capture prediction
+    const routeInput = text || url;
+    const prediction = await route(routeInput).catch(() => null);
+    modelProject     = prediction?.project    ?? null;
+    modelConfidence  = prediction?.confidence ?? null;
+
     const pDef       = PROJECTS.find(p => p.key === forcedProject);
     project          = forcedProject;
     projectLabel     = pDef?.label ?? forcedProject;
@@ -123,6 +131,8 @@ export async function POST(req) {
   } else {
     const routeInput = text || url;
     ({ project, projectLabel, confidence, summary, suggested_action, is_new_task } = await route(routeInput));
+    modelProject     = project;
+    modelConfidence  = confidence;
   }
 
   const projectDef = PROJECTS.find(p => p.key === project);
@@ -228,23 +238,34 @@ export async function POST(req) {
     } catch { /* non-fatal */ }
   }
 
-  // ── 4. Audit log ────────────────────────────────────────────────────────────
+  // ── 4. Audit log (training signal) ─────────────────────────────────────────
+  let logId = null;
   try {
-    await supabase.from('inbox_log').insert({
-      source:  source  ?? 'unknown',
-      url:     url     ?? null,
-      text:    text    ?? null,
-      project,
-      summary: itemTitle ?? summary,
-    });
+    const { data: logRow } = await supabase
+      .from('inbox_log')
+      .insert({
+        source:           source           ?? 'unknown',
+        url:              url              ?? null,
+        text:             text             ?? null,
+        project,
+        summary:          itemTitle        ?? summary,
+        model_project:    modelProject,
+        model_confidence: modelConfidence,
+        final_project:    project,          // same as project unless corrected later
+      })
+      .select('id')
+      .single();
+    if (logRow) logId = logRow.id;
   } catch { /* non-fatal */ }
 
   return NextResponse.json({
     project,
     projectLabel,
     confidence,
-    summary:          itemTitle ?? summary,
-    description:      itemDesc  ?? null,
+    summary:          itemTitle     ?? summary,
+    description:      itemDesc      ?? null,
+    logId,            // returned so bot can reference for corrections
+    modelProject,     // what router predicted (may differ from project if forced)
     suggested_action,
     is_new_task,
     itemId,

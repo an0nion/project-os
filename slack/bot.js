@@ -30,8 +30,53 @@ function isDuplicate(message) {
   return false;
 }
 
-// ── Pending clarification (userId → { url, text, step }) ─────────────────────
+// ── Pending clarification (userId → { url, text, step, searchMode? }) ────────
 const pending = new Map();
+
+// ── Last saved item per user (for correction flow) ────────────────────────────
+// userId → { logId, project, title }
+// Expires after 5 minutes — corrections must be immediate
+const lastSaved = new Map();
+function setLastSaved(userId, data) {
+  lastSaved.set(userId, { ...data, at: Date.now() });
+  setTimeout(() => lastSaved.delete(userId), 5 * 60 * 1000);
+}
+
+// ── Project name → key map (for parsing correction replies) ──────────────────
+const PROJECT_ALIASES = {
+  'school':        'school',        'uni': 'school',      'university': 'school',
+  'work':          'work',          'job': 'work',
+  'research':      'research_apps', 'applications': 'research_apps', 'apps': 'research_apps',
+  'learning':      'learning_tech', 'tech': 'learning_tech', 'learn': 'learning_tech',
+  'circuits':      'circuitry',     'electronics': 'circuitry',  'arduino': 'circuitry',
+  'baking':        'baking',        'bread': 'baking',
+  'beads':         'beadwork',      'beadwork': 'beadwork', 'jewelry': 'beadwork',
+  'art':           'art',           'drawing': 'art', 'pastels': 'art',
+  'reading':       'reading',       'books': 'reading',
+  'exercise':      'exercise',      'gym': 'exercise', 'fitness': 'exercise',
+};
+
+function parseProjectFromText(text) {
+  const lower = text.toLowerCase().replace(/[^a-z\s]/g, ' ');
+  for (const [alias, key] of Object.entries(PROJECT_ALIASES)) {
+    if (lower.includes(alias)) return key;
+  }
+  return null;
+}
+
+// ── Correction detection ──────────────────────────────────────────────────────
+function isCorrection(text) {
+  return /^(wrong|no|incorrect|not right|nope|bad routing|should( have)? be|should go to|→|->|actually)/i.test(text.trim());
+}
+
+async function callCorrect(logId, correctedProject, note) {
+  const res = await fetch(`${process.env.APP_URL}/api/inbox/correct`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
+    body:    JSON.stringify({ logId, correctedProject, note }),
+  });
+  return res.ok;
+}
 
 // ── Context extraction ────────────────────────────────────────────────────────
 // Read work/personal + timeline from user's message text upfront.
@@ -181,6 +226,47 @@ app.message(async ({ message, say }) => {
   const userText = message.text ?? '';
   const ctx      = parseContext(userText);
 
+  // ── Correction flow ───────────────────────────────────────────────────────
+  // "wrong", "should be school", "→ work", etc. — within 5 min of a save
+  if (!pending.has(userId) && isCorrection(userText) && urls.length === 0) {
+    const prev = lastSaved.get(userId);
+    if (!prev) {
+      await say('nothing recent to correct');
+      return;
+    }
+
+    // Try to parse project from the correction message directly
+    const correctedProject = parseProjectFromText(userText);
+
+    if (!correctedProject) {
+      // Ask which project
+      pending.set(userId, { ...prev, correctionMode: true });
+      await say('which project? (school / work / learning / research / art / baking / beads / circuits / reading / exercise)');
+      return;
+    }
+
+    // Save correction immediately
+    await callCorrect(prev.logId, correctedProject, userText);
+    lastSaved.delete(userId);
+    await say(`got it — logged as ${correctedProject}`);
+    return;
+  }
+
+  // Handle pending correction project selection
+  if (pending.has(userId) && pending.get(userId).correctionMode) {
+    const state            = pending.get(userId);
+    const correctedProject = parseProjectFromText(userText);
+    if (!correctedProject) {
+      await say('didn\'t catch that — try: school, work, learning, research, art, baking, beads, circuits, reading, exercise');
+      return;
+    }
+    pending.delete(userId);
+    await callCorrect(state.logId, correctedProject, userText);
+    lastSaved.delete(userId);
+    await say(`logged as ${correctedProject}`);
+    return;
+  }
+
   // Ignore conversational feedback/questions directed at the bot
   if (!pending.has(userId) && isConversational(userText) && urls.length === 0) return;
 
@@ -201,6 +287,7 @@ app.message(async ({ message, say }) => {
           // Save as text — router will classify as research_apps, no URL to scrape
           try {
             const data = await callInbox({ text: state.text, source: 'slack', project: 'research_apps' });
+            if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
             await reply(message.channel, buildSuccessMessage(data, {}));
           } catch {
             await say('couldn\'t save that');
@@ -231,6 +318,7 @@ app.message(async ({ message, say }) => {
 
       try {
         const data = await callInbox({ url: state.url, text: enrichedText, source: 'slack', project });
+        if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
         await reply(message.channel, buildSuccessMessage(data, clarCtx));
       } catch {
         await say('couldn\'t save that');
@@ -255,6 +343,7 @@ app.message(async ({ message, say }) => {
           source:  'slack',
           ...(project ? { project } : {}),
         });
+        if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
         await reply(message.channel, buildSuccessMessage(data, ctx));
       } catch {
         await say('couldn\'t save that');
@@ -285,6 +374,7 @@ app.message(async ({ message, say }) => {
 
     try {
       const data = await callInbox({ text: userText, source: 'slack' });
+      if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
       await reply(message.channel, buildSuccessMessage(data, ctx));
     } catch {
       await say('couldn\'t save that');
