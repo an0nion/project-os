@@ -21,6 +21,55 @@ const app = new App({
   socketMode: true,
 });
 
+// ── Parse a natural-language timeline into YYYY-MM-DD (runs in bot process) ───
+function parseTimelineToDate(timeline) {
+  if (!timeline) return null;
+  const now = new Date();
+  const low = timeline.toLowerCase().trim();
+
+  if (/\b(today|tonight|now|asap)\b/.test(low)) return now.toISOString().slice(0, 10);
+
+  if (/\btomorrow\b/.test(low)) {
+    const d = new Date(now); d.setDate(d.getDate() + 1); return d.toISOString().slice(0, 10);
+  }
+
+  // Day-of-week: "this Saturday", "next Monday", bare "Saturday"
+  const DOW = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+  for (let i = 0; i < DOW.length; i++) {
+    if (new RegExp(`\\b${DOW[i]}\\b`).test(low)) {
+      const d = new Date(now);
+      const diff = (i - d.getDay() + 7) % 7 || 7;
+      d.setDate(d.getDate() + diff);
+      return d.toISOString().slice(0, 10);
+    }
+  }
+
+  // Ordinal day: "13th", "13th of this month", "the 13th"
+  const ordM = low.match(/\b(\d{1,2})(?:st|nd|rd|th)\b/);
+  if (ordM) {
+    const day = parseInt(ordM[1], 10);
+    if (day >= 1 && day <= 31) {
+      const d = new Date(now.getFullYear(), now.getMonth(), day);
+      if (d <= now) d.setMonth(d.getMonth() + 1);
+      return d.toISOString().slice(0, 10);
+    }
+  }
+
+  // "in X weeks" / "in X days"
+  const wk = low.match(/in (\d+) week/);
+  if (wk) { const d = new Date(now); d.setDate(d.getDate() + parseInt(wk[1]) * 7); return d.toISOString().slice(0, 10); }
+  const dy = low.match(/in (\d+) day/);
+  if (dy) { const d = new Date(now); d.setDate(d.getDate() + parseInt(dy[1])); return d.toISOString().slice(0, 10); }
+
+  // Native parse fallback: "June 13", "13 June"
+  const stripped = low.replace(/^(by|on|at)\s+/, '');
+  const parsed   = new Date(stripped);
+  if (!isNaN(parsed.getTime()) && parsed.getFullYear() >= now.getFullYear()) {
+    return parsed.toISOString().slice(0, 10);
+  }
+  return null;
+}
+
 // ── Google Calendar colorId routing (single-calendar, per-event colours) ──────
 // colorId 1-11 per Google Calendar API. No calendar switching needed.
 function pickCalendarColor(project, text) {
@@ -668,33 +717,67 @@ Rules:
     return;
   }
 
-  // Reminder/appointment: save to personal project + create calendar event
+  // Reminder intent:
+  //   Has date → calendar only (one-off, date is the point — no Kanban clutter)
+  //   No date  → personal Kanban only (ongoing reference, no date to anchor to)
   if (cls.intent === 'reminder') {
-    const timeNote = cls.timeline ? ` — ${cls.timeline}` : '';
+    // ── AI: extract clean actionable title, strip filler ─────────────────────
+    let reminderTitle = null;
     try {
-      const data = await callInbox({
-        text:          userText + timeNote,
-        source:        'slack',
-        project:       'personal',
-        priority_tier: cls.priority_tier ?? undefined,
-        timeline:      cls.timeline      ?? undefined,
+      const tr = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
+        system: 'Extract the task or event name. Strip "remind me to", "set a reminder", dates, and time words. Capitalise first word only. Max 8 words. Examples: "remind me to buy cleansing oil on Saturday" → "Buy cleansing oil". "assignment notification for linear algebra Assignment 2 due 13th" → "Linear Algebra Assignment 2 due".',
+        messages: [{ role: 'user', content: userText }],
+        maxTokens: 25,
       });
-      if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
+      logCostViaApi(tr.modelKey, tr.usage, 'reminder_title');
+      reminderTitle = tr.text?.trim().replace(/\.$/, '') || null;
+    } catch { /* fallback below */ }
 
-      // ── Also create Google Calendar event (fire-and-forget, non-fatal) ───
-      if (process.env.CALENDAR_ENABLED === 'true' && data.deadline) {
-        const colorId = pickCalendarColor(cls.project_hint ?? 'personal', userText);
-        fetch(`${process.env.APP_URL}/api/calendar/event`, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
-          body:    JSON.stringify({ title: data.summary, date: data.deadline, colorId, description: userText }),
-        }).catch(err => console.error('[calendar] event creation failed:', err.message));
+    if (!reminderTitle) {
+      // Simple regex fallback
+      reminderTitle = userText
+        .replace(/^(set (a )?reminder (for \S+ )?to|remind me to)\s*/i, '')
+        .replace(/\s+(on|at|by|this|next)\s+\S.*$/i, '')
+        .trim().slice(0, 60);
+      reminderTitle = reminderTitle.charAt(0).toUpperCase() + reminderTitle.slice(1);
+    }
+
+    const hasDate = !!cls.timeline;
+
+    if (hasDate) {
+      // ── Date set → calendar only ────────────────────────────────────────────
+      const date    = parseTimelineToDate(cls.timeline);
+      const colorId = pickCalendarColor(cls.project_hint ?? 'personal', userText);
+      let calCreated = false;
+
+      if (process.env.CALENDAR_ENABLED === 'true' && date) {
+        try {
+          const calRes = await fetch(`${process.env.APP_URL}/api/calendar/event`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
+            body:    JSON.stringify({ title: reminderTitle, date, colorId, description: userText }),
+          });
+          calCreated = calRes.ok;
+        } catch (err) { console.error('[calendar] event creation failed:', err.message); }
       }
 
-      const calNote = process.env.CALENDAR_ENABLED === 'true' && data.deadline ? ' · added to calendar' : '';
-      await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${(data.summary ?? 'reminder').slice(0, 60)}>${timeNote ? ` · ${cls.timeline}` : ''}${calNote}`);
-    } catch {
-      await say("couldn't save that");
+      const dateLabel = cls.timeline ?? date ?? '';
+      await say(`📅 ${reminderTitle}${dateLabel ? ` · ${dateLabel}` : ''}${calCreated ? ' · added to calendar' : ''}`);
+
+    } else {
+      // ── No date → personal Kanban only ──────────────────────────────────────
+      try {
+        const data = await callInbox({
+          text:    userText,
+          title:   reminderTitle,
+          source:  'slack',
+          project: 'personal',
+        });
+        if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: reminderTitle });
+        await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${reminderTitle.slice(0, 60)}>`);
+      } catch {
+        await say("couldn't save that");
+      }
     }
     return;
   }
