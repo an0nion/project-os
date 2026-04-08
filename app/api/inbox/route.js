@@ -104,8 +104,54 @@ function extractSubtitle(text) {
   return parts.length ? parts.join(' · ') : null;
 }
 
+// ── Parse a human timeline string into an ISO date (best-effort) ─────────────
+// Returns a YYYY-MM-DD string or null. Handles "by June 30", "this Friday",
+// "in 2 weeks", "tomorrow", "end of month". Good enough for tier-1/2 deadlines.
+function parseDeadlineDate(timeline) {
+  if (!timeline) return null;
+  const now  = new Date();
+  const low  = timeline.toLowerCase().trim();
+
+  if (/tomorrow/.test(low)) {
+    const d = new Date(now); d.setDate(d.getDate() + 1);
+    return d.toISOString().slice(0, 10);
+  }
+  if (/today|tonight|asap|urgent/.test(low)) {
+    return now.toISOString().slice(0, 10);
+  }
+  if (/this week/.test(low)) {
+    const d = new Date(now); d.setDate(d.getDate() + 7);
+    return d.toISOString().slice(0, 10);
+  }
+  if (/next week/.test(low)) {
+    const d = new Date(now); d.setDate(d.getDate() + 14);
+    return d.toISOString().slice(0, 10);
+  }
+  if (/in (\d+) week/.test(low)) {
+    const weeks = parseInt(low.match(/in (\d+) week/)[1]);
+    const d = new Date(now); d.setDate(d.getDate() + weeks * 7);
+    return d.toISOString().slice(0, 10);
+  }
+  if (/in (\d+) month/.test(low)) {
+    const months = parseInt(low.match(/in (\d+) month/)[1]);
+    const d = new Date(now); d.setMonth(d.getMonth() + months);
+    return d.toISOString().slice(0, 10);
+  }
+  if (/end of month/.test(low)) {
+    const d = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+    return d.toISOString().slice(0, 10);
+  }
+  // "by June 30", "June 30", "30 June" — try direct Date parse
+  const stripped = low.replace(/^by\s+/, '');
+  const parsed   = new Date(stripped);
+  if (!isNaN(parsed.getTime()) && parsed.getFullYear() >= now.getFullYear()) {
+    return parsed.toISOString().slice(0, 10);
+  }
+  return null;
+}
+
 export async function POST(req) {
-  const { url, text, source, project: forcedProject } = await req.json();
+  const { url, text, source, project: forcedProject, priority_tier, timeline } = await req.json();
 
   if (!url && !text) {
     return NextResponse.json({ error: 'url or text required' }, { status: 400 });
@@ -245,12 +291,14 @@ export async function POST(req) {
       const { data: item } = await supabase
         .from('items')
         .insert({
-          project_key: project,
-          title:       itemTitle.slice(0, 200),
-          subtitle:    itemSubtitle,
-          status:      firstCol,
-          url:         url      ?? null,
-          notes:       itemDesc ?? null,   // one-liner description for card
+          project_key:   project,
+          title:         itemTitle.slice(0, 200),
+          subtitle:      itemSubtitle,
+          status:        firstCol,
+          url:           url            ?? null,
+          notes:         itemDesc       ?? null,
+          priority_tier: priority_tier  ?? null,
+          deadline:      parseDeadlineDate(timeline),
         })
         .select()
         .single();

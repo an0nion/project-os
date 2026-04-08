@@ -651,8 +651,10 @@ Rules:
   try {
     const data = await callInbox({
       url,
-      text:   enrichedText || userText || undefined,
-      source: 'slack',
+      text:         enrichedText || userText || undefined,
+      source:       'slack',
+      timeline:     cls.timeline      ?? undefined,
+      priority_tier: cls.priority_tier ?? undefined,
       ...(project ? { project } : {}),
     });
     if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
