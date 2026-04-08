@@ -2,8 +2,8 @@
  * Slack DM Bot — Socket Mode
  *
  * Design principles:
- *   - Read context from the user's message upfront (personal/work, timeline)
- *   - Only ask for clarification when context is genuinely missing
+ *   - AI classifies every fresh message (intent, context, timeline, project hint)
+ *   - Only ask for clarification when the AI genuinely can't tell
  *   - Ask ONE question max, not two steps
  *   - Responses sound like a person, not a notification system
  *   - Silent on success unless there's something worth saying
@@ -11,6 +11,8 @@
 
 import 'dotenv/config';
 import bolt from '@slack/bolt';
+import { chatWithModel } from '../lib/multiModelClient.js';
+
 const { App } = bolt;
 
 const app = new App({
@@ -30,7 +32,7 @@ function isDuplicate(message) {
   return false;
 }
 
-// ── Pending clarification (userId → { url, text, step, searchMode? }) ────────
+// ── Pending clarification (userId → { url, text, step, searchMode?, correctionMode? }) ──
 const pending = new Map();
 
 // ── Last saved item per user (for correction flow) ────────────────────────────
@@ -42,7 +44,7 @@ function setLastSaved(userId, data) {
   setTimeout(() => lastSaved.delete(userId), 5 * 60 * 1000);
 }
 
-// ── Project name → key map (for parsing correction replies) ──────────────────
+// ── Project name → key map (for correction fallback parsing) ──────────────────
 const PROJECT_ALIASES = {
   'school':        'school',        'uni': 'school',      'university': 'school',
   'work':          'work',          'job': 'work',
@@ -64,11 +66,87 @@ function parseProjectFromText(text) {
   return null;
 }
 
-// ── Correction detection ──────────────────────────────────────────────────────
-function isCorrection(text) {
-  return /^(wrong|no|incorrect|not right|nope|bad routing|should( have)? be|should go to|→|->|actually)/i.test(text.trim());
+// ── AI Intent Classifier ──────────────────────────────────────────────────────
+// Replaces: isConversational, isCorrection, isAmbiguous, hasNoUsableUrl, parseContext
+// Returns: { intent, context, timeline, project_hint, corrected_project, needs_clarification }
+const PROJECT_KEYS = [
+  'school', 'work', 'research_apps', 'learning_tech',
+  'baking', 'beadwork', 'art', 'reading', 'exercise', 'circuitry',
+];
+
+const INTENT_SYSTEM_PROMPT = `You are a message intent classifier for a personal project management Slack bot. The user sends short messages to save things or talk to you.
+
+Return ONLY a valid JSON object with these exact fields (no markdown, no explanation):
+{
+  "intent": "save" | "correct" | "converse" | "search_request",
+  "context": "work" | "personal" | null,
+  "timeline": string or null,
+  "project_hint": string or null,
+  "corrected_project": string or null,
+  "needs_clarification": boolean
 }
 
+Intent meanings:
+- "save": user wants to capture something — URL, note, resource, program to apply to, task, reminder
+- "correct": user says the bot routed the last item wrong ("wrong", "should be X", "→ school", "actually this is work", "no that's research")
+- "converse": casual message not about saving — feedback on bot behavior, questions ("did you save that?", "why did you do that?"), reactions ("nice", "ok", "lol", "your formatting is bad", "did u add that?", "what happened"), greetings
+- "search_request": user wants to apply to something (fellowship, program, internship) but gives no URL — implies they want help finding the link
+
+context: "work" if clearly professional/job-related, "personal" if clearly personal, null if can't tell
+
+timeline: extract any time reference and return concise string ("1-2 months", "by June", "this week", "ASAP") or null
+
+project_hint: one of ${PROJECT_KEYS.join(', ')} — only if clearly identifiable:
+- school: coursework, assignment, exam, essay, uni, lecture notes, academic submission
+- work: job tasks, sprint, ticket, meeting, client, professional deadline
+- research_apps: applying to fellowship/program/grant/PhD/internship/residency/competition
+- learning_tech: GitHub repos, papers, tutorials, tools to explore (personal, not work)
+- baking: recipes, bread, food, cooking
+- beadwork: beading, jewelry, craft beadwork
+- art: drawing, painting, pastels, sketching, visual art
+- reading: books, articles to read for pleasure
+- exercise: gym, fitness, workout, running, sport
+- circuitry: Arduino, electronics, PCB, circuits, hardware hacking
+
+corrected_project: same enum as project_hint — only set if intent is "correct" and user named a specific project; null otherwise
+
+needs_clarification: true ONLY when all three are true:
+1. intent is "save"
+2. context is null (genuinely ambiguous between work and personal)
+3. content is tech-related (GitHub, paper, tool, technical resource) where work vs personal routing matters`;
+
+async function classifyIntent(text, urls) {
+  const hasUrls = urls.length > 0;
+  const urlList = urls.slice(0, 3).join(', ');
+  const userContent = `Message: ${text || '(empty)'}${hasUrls ? `\nURLs: ${urlList}` : ''}`;
+
+  try {
+    const result = await chatWithModel('gemini-flash', {
+      system:    INTENT_SYSTEM_PROMPT,
+      messages:  [{ role: 'user', content: userContent }],
+      maxTokens: 150,
+    });
+
+    const raw    = result.text?.trim() ?? '';
+    const json   = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
+    const parsed = JSON.parse(json);
+
+    return {
+      intent:              parsed.intent              ?? 'save',
+      context:             parsed.context             ?? null,
+      timeline:            parsed.timeline            ?? null,
+      project_hint:        parsed.project_hint        ?? null,
+      corrected_project:   parsed.corrected_project   ?? null,
+      needs_clarification: parsed.needs_clarification ?? false,
+    };
+  } catch (err) {
+    console.warn('[intent] classify failed:', err.message);
+    // Fallback: treat as a save — bot will still work, just without smart routing
+    return { intent: 'save', context: null, timeline: null, project_hint: null, corrected_project: null, needs_clarification: false };
+  }
+}
+
+// ── Correction API call ───────────────────────────────────────────────────────
 async function callCorrect(logId, correctedProject, note) {
   const res = await fetch(`${process.env.APP_URL}/api/inbox/correct`, {
     method:  'POST',
@@ -78,42 +156,19 @@ async function callCorrect(logId, correctedProject, note) {
   return res.ok;
 }
 
-// ── Context extraction ────────────────────────────────────────────────────────
-// Read work/personal + timeline from user's message text upfront.
-// Returns { context: 'work'|'personal'|null, timeline: string|null, urgency: 'urgent'|'soon'|'later'|null }
-function parseContext(text) {
-  if (!text) return { context: null, timeline: null, urgency: null };
-  const t = text.toLowerCase();
-
-  let context = null;
-  if (/\bfor work\b|\bat work\b|\bwork (task|project|deadline|related)\b|\bmy job\b|\bsprint\b|\bticket\b/i.test(text))
-    context = 'work';
-  else if (/\bpersonal\b|\bfor (me|fun|myself)\b|\bmy own\b|\bcurious\b|\binterested in\b/i.test(text))
-    context = 'personal';
-
-  let timeline = null;
-  const tlMatch = text.match(/within\s+(\d+[-–]\d+\s*\w+|\d+\s*\w+)|(\d+[-–]\d+\s*(months?|weeks?|days?))|in\s+(a\s+)?(week|month|few\s+weeks|couple\s+months)/i);
-  if (tlMatch) timeline = tlMatch[0].replace(/^within\s+/i, '').trim();
-
-  let urgency = null;
-  if (/\btoday\b|\burgent\b|\basap\b|\bright now\b/i.test(t))      urgency = 'urgent';
-  else if (/\bthis week\b|\bsoon\b|\bshortly\b/i.test(t))          urgency = 'soon';
-  else if (/\bno rush\b|\blater\b|\beventually\b|\bsomeday\b/i.test(t)) urgency = 'later';
-
-  return { context, timeline, urgency };
+// ── Inbox API call ────────────────────────────────────────────────────────────
+async function callInbox(body) {
+  const res = await fetch(`${process.env.APP_URL}/api/inbox`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
+    body:    JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (!text.startsWith('{')) throw new Error(`Non-JSON response (${res.status}) — check APP_SECRET`);
+  return JSON.parse(text);
 }
 
-// ── Ambiguity check ───────────────────────────────────────────────────────────
-// Only ambiguous if we genuinely can't tell work from personal AND it's a tech URL.
-function isAmbiguous(text, urls, ctx) {
-  if (ctx.context) return false;  // already know
-  // Only ask for tech/learning content where the distinction matters
-  const isTechUrl = urls.some(u => /github\.com|gitlab\.com|arxiv\.org|huggingface\.co|papers\.with\.code/.test(u));
-  const isTechText = /\blearn\b|\bcheck\s+out\b|\bthis\s+(repo|paper|tool|project|lib)\b/i.test(text);
-  return isTechUrl || isTechText;
-}
-
-// ── URL extraction (http/https only — ignore mailto:, tel:, etc.) ────────────
+// ── URL extraction (http/https only — ignore mailto:, tel:, etc.) ─────────────
 function extractUrls(message) {
   const urls = [];
   const urlRegex = /https?:\/\/[^\s<>|]+/g;
@@ -139,76 +194,60 @@ function extractUrls(message) {
   );
 }
 
-// ── Detect conversational messages directed at the bot ────────────────────────
-// These are feedback/questions about the bot's behaviour, not things to save.
-function isConversational(text) {
-  return /^(see|why|how|what|you |u |did you|didn't you|can you|could you|should you|that's|thats|lol|haha|nice|ok|okay|wait|no,|yes,|yeah|nope)/i.test(text.trim());
-}
-
-// ── Detect application text with no real URL ──────────────────────────────────
-// e.g. forwarded email/flyer about a program — has deadline/apply language but no link
-function hasNoUsableUrl(urls, text) {
-  if (urls.length > 0) return false;
-  return /\bapply\b|\bapplication\b|\bdeadline\b|\bfellowship\b|\bresidency\b|\binternship\b/i.test(text);
-}
-
-// ── API call ──────────────────────────────────────────────────────────────────
-async function callInbox(body) {
-  const res = await fetch(`${process.env.APP_URL}/api/inbox`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
-    body:    JSON.stringify(body),
-  });
-  const text = await res.text();
-  if (!text.startsWith('{')) throw new Error(`Non-JSON response (${res.status}) — check APP_SECRET`);
-  return JSON.parse(text);
-}
-
 // ── Minimal success reply ─────────────────────────────────────────────────────
 // One line, embedded link, no buttons, no blocks.
 // Format: "📚 <url|Title> · 1-2 months"
-function buildSuccessMessage(data, ctx) {
+function buildSuccessMessage(data, cls) {
   const projectEmoji = {
-    learning_tech:  '📚',
-    work:           '💼',
-    school:         '🎓',
-    research_apps:  '🔬',
-    baking:         '🍞',
-    beadwork:       '📿',
-    art:            '🎨',
-    reading:        '📖',
-    exercise:       '💪',
-    circuitry:      '⚡',
+    learning_tech: '📚',
+    work:          '💼',
+    school:        '🎓',
+    research_apps: '🔬',
+    baking:        '🍞',
+    beadwork:      '📿',
+    art:           '🎨',
+    reading:       '📖',
+    exercise:      '💪',
+    circuitry:     '⚡',
   }[data.project] ?? '📁';
 
   const appUrl = `${process.env.APP_URL}/project/${data.project}`;
 
-  // Clean title: strip newlines, emoji, collapse whitespace, cap at 60 chars
+  // Clean title: strip newlines, emoji codes, chars that break Slack link syntax
   const rawTitle = data.summary ?? '';
   const cleanTitle = rawTitle
     .replace(/\n|\r/g, ' ')
-    .replace(/:[a-z_]+:/g, '')          // remove :emoji_codes:
-    .replace(/[<>|]/g, '')              // remove chars that break Slack link syntax
+    .replace(/:[a-z_]+:/g, '')
+    .replace(/[<>|]/g, '')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 60);
 
   const parts = [];
   if (cleanTitle) parts.push(`<${appUrl}|${cleanTitle}>`);
-  if (ctx?.timeline) parts.push(ctx.timeline);
+  if (cls?.timeline) parts.push(cls.timeline);
 
   return `${projectEmoji} ${parts.join(' · ') || 'saved'}`;
 }
 
-// ── Parse clarification reply for both context + timeline ─────────────────────
-function parseClarificationReply(text) {
-  const ctx = parseContext(text);
-  // Also try bare keywords
-  if (!ctx.context) {
-    if (/\bwork\b/i.test(text)) ctx.context = 'work';
-    else if (/\bpersonal\b|\bmine\b|\bme\b|\blearning\b/i.test(text)) ctx.context = 'personal';
-  }
-  return ctx;
+// ── Build enriched text for routing context ───────────────────────────────────
+function buildEnrichedText(context, timeline, text, url) {
+  const parts = [];
+  if (context === 'work')     parts.push('[Work]');
+  if (context === 'personal') parts.push('[Personal]');
+  if (text && text !== url)   parts.push(text.replace(url ?? '', '').trim());
+  if (timeline)               parts.push(`— ${timeline}`);
+  return parts.filter(Boolean).join(' ');
+}
+
+// ── Parse a clarification reply (for pending work/personal question) ──────────
+function parseClarificationContext(text) {
+  const t = text.toLowerCase();
+  if (/\bwork\b|\bjob\b|\bprofessional\b|\bsprint\b|\bticket\b/i.test(text)) return 'work';
+  if (/\bpersonal\b|\bmine\b|\bme\b|\blearning\b|\bfun\b|\bcurious\b/i.test(text)) return 'personal';
+  if (/^w\b/i.test(t.trim())) return 'work';     // bare "w"
+  if (/^p\b/i.test(t.trim())) return 'personal';  // bare "p"
+  return null;
 }
 
 // ── Post a clean one-liner (no link unfurls) ──────────────────────────────────
@@ -226,179 +265,131 @@ app.message(async ({ message, say }) => {
   const userId   = message.user;
   const urls     = extractUrls(message);
   const userText = message.text ?? '';
-  const ctx      = parseContext(userText);
 
-  // ── Correction flow ───────────────────────────────────────────────────────
-  // "wrong", "should be school", "→ work", etc. — within 5 min of a save
-  if (!pending.has(userId) && isCorrection(userText) && urls.length === 0) {
+  // ── Handle pending states first (no AI needed, user is answering a specific question) ──
+
+  if (pending.has(userId)) {
+    const state = pending.get(userId);
+
+    // Correction mode: "which project did you mean?"
+    if (state.correctionMode) {
+      const proj = parseProjectFromText(userText);
+      if (!proj) {
+        await say("didn't catch that — try: school, work, learning, research, art, baking, beads, circuits, reading, exercise");
+        return;
+      }
+      pending.delete(userId);
+      await callCorrect(state.logId, proj, userText);
+      lastSaved.delete(userId);
+      await say(`logged as ${proj}`);
+      return;
+    }
+
+    // Search mode: "no link — want me to search? (y/n)"
+    if (state.searchMode) {
+      pending.delete(userId);
+      if (/^y/i.test(userText.trim())) {
+        try {
+          const data = await callInbox({ text: state.text, source: 'slack', project: 'research_apps' });
+          if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
+          await reply(message.channel, buildSuccessMessage(data, {}));
+        } catch {
+          await say("couldn't save that");
+        }
+      } else {
+        await say('ok, ignored');
+      }
+      return;
+    }
+
+    // Work/personal clarification mode
+    // If they sent a genuinely new URL, abort pending and treat as a fresh message
+    const isNewUrl = urls.length > 0 && urls[0] !== state.url;
+    if (!isNewUrl) {
+      const context = parseClarificationContext(userText);
+      if (!context) {
+        await say('work or personal?');
+        return;
+      }
+
+      const project      = context === 'work' ? 'work' : 'learning_tech';
+      const enrichedText = buildEnrichedText(context, null, state.text, state.url);
+      pending.delete(userId);
+
+      try {
+        const data = await callInbox({ url: state.url ?? undefined, text: enrichedText, source: 'slack', project });
+        if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
+        await reply(message.channel, buildSuccessMessage(data, {}));
+      } catch {
+        await say("couldn't save that");
+      }
+      return;
+    }
+
+    // New URL arrived → drop pending, fall through to fresh handling
+    pending.delete(userId);
+  }
+
+  // ── Fresh message — classify intent with AI ───────────────────────────────
+  const cls = await classifyIntent(userText, urls);
+
+  // Conversational: ignore silently
+  if (cls.intent === 'converse') return;
+
+  // Correction: update the training log
+  if (cls.intent === 'correct') {
     const prev = lastSaved.get(userId);
     if (!prev) {
       await say('nothing recent to correct');
       return;
     }
 
-    // Try to parse project from the correction message directly
-    const correctedProject = parseProjectFromText(userText);
-
-    if (!correctedProject) {
-      // Ask which project
+    const proj = cls.corrected_project ?? parseProjectFromText(userText);
+    if (!proj) {
       pending.set(userId, { ...prev, correctionMode: true });
       await say('which project? (school / work / learning / research / art / baking / beads / circuits / reading / exercise)');
       return;
     }
 
-    // Save correction immediately
-    await callCorrect(prev.logId, correctedProject, userText);
+    await callCorrect(prev.logId, proj, userText);
     lastSaved.delete(userId);
-    await say(`got it — logged as ${correctedProject}`);
+    await say(`got it — logged as ${proj}`);
     return;
   }
 
-  // Handle pending correction project selection
-  if (pending.has(userId) && pending.get(userId).correctionMode) {
-    const state            = pending.get(userId);
-    const correctedProject = parseProjectFromText(userText);
-    if (!correctedProject) {
-      await say('didn\'t catch that — try: school, work, learning, research, art, baking, beads, circuits, reading, exercise');
-      return;
-    }
-    pending.delete(userId);
-    await callCorrect(state.logId, correctedProject, userText);
-    lastSaved.delete(userId);
-    await say(`logged as ${correctedProject}`);
+  // Search request: application text with no URL
+  if (cls.intent === 'search_request') {
+    pending.set(userId, { url: null, text: userText, searchMode: true, step: 1 });
+    await say('no link — want me to search for the application page? (y/n)');
     return;
   }
 
-  // Ignore conversational feedback/questions directed at the bot
-  if (!pending.has(userId) && isConversational(userText) && urls.length === 0) return;
-
-  // ── Pending clarification reply ───────────────────────────────────────────
-  if (pending.has(userId)) {
-    const state = pending.get(userId);
-
-    // If they sent a new message (new URL or clearly new content), start fresh
-    const isNewUrl = urls.length > 0 && (!state.url || urls[0] !== state.url);
-    if (isNewUrl) {
-      pending.delete(userId);
-      // fall through to normal handling
-    } else {
-      // Search mode: user said they want to apply but gave no link
-      if (state.searchMode) {
-        if (/^y/i.test(userText.trim())) {
-          pending.delete(userId);
-          // Save as text — router will classify as research_apps, no URL to scrape
-          try {
-            const data = await callInbox({ text: state.text, source: 'slack', project: 'research_apps' });
-            if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
-            await reply(message.channel, buildSuccessMessage(data, {}));
-          } catch {
-            await say('couldn\'t save that');
-          }
-        } else {
-          pending.delete(userId);
-          await say('ok, ignored');
-        }
-        return;
-      }
-
-      const clarCtx = parseClarificationReply(userText);
-
-      if (!clarCtx.context) {
-        await say('work or personal?');
-        return;
-      }
-
-      const project      = clarCtx.context === 'work' ? 'work' : 'learning_tech';
-      const timeStr      = clarCtx.timeline ?? clarCtx.urgency ?? '';
-      const enrichedText = [
-        clarCtx.context === 'work' ? '[Work]' : '[Personal learning]',
-        state.text || state.url || '',
-        timeStr ? `— ${timeStr}` : '',
-      ].filter(Boolean).join(' ');
-
-      pending.delete(userId);
-
-      try {
-        const data = await callInbox({ url: state.url, text: enrichedText, source: 'slack', project });
-        if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
-        await reply(message.channel, buildSuccessMessage(data, clarCtx));
-      } catch {
-        await say('couldn\'t save that');
-      }
-      return;
-    }
-  }
-
-  // ── URL message ───────────────────────────────────────────────────────────
-  if (urls.length > 0) {
-    const url = urls[0];
-
-    // Context already in message → route directly, no question
-    if (!isAmbiguous(userText, urls, ctx)) {
-      const project = ctx.context === 'work' ? 'work' : null; // null = let router decide
-      const enrichedText = buildEnrichedText(ctx, userText, url);
-
-      try {
-        const data = await callInbox({
-          url,
-          text:    enrichedText || userText || undefined,
-          source:  'slack',
-          ...(project ? { project } : {}),
-        });
-        if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
-        await reply(message.channel, buildSuccessMessage(data, ctx));
-      } catch {
-        await say('couldn\'t save that');
-      }
-      return;
-    }
-
-    // Ambiguous → ask one short question
-    pending.set(userId, { url, text: userText, step: 1 });
+  // Save — default intent
+  if (cls.needs_clarification) {
+    pending.set(userId, { url: urls[0] ?? null, text: userText, step: 1 });
     await say('work or personal?');
     return;
   }
 
-  // ── Text-only message ─────────────────────────────────────────────────────
-  if (userText.trim()) {
-    // Application/fellowship text with no link → ask to search
-    if (hasNoUsableUrl(urls, userText)) {
-      pending.set(userId, { url: null, text: userText, searchMode: true, step: 1 });
-      await say('no link — want me to search for the application page? (y/n)');
-      return;
-    }
+  const url     = urls[0] ?? undefined;
+  const project = cls.project_hint ?? (cls.context === 'work' ? 'work' : null);
+  const enrichedText = buildEnrichedText(cls.context, cls.timeline, userText, url);
 
-    if (isAmbiguous(userText, [], ctx)) {
-      pending.set(userId, { url: null, text: userText, step: 1 });
-      await say('work or personal?');
-      return;
-    }
-
-    try {
-      const data = await callInbox({ text: userText, source: 'slack' });
-      if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
-      await reply(message.channel, buildSuccessMessage(data, ctx));
-    } catch {
-      await say('couldn\'t save that');
-    }
-    return;
+  try {
+    const data = await callInbox({
+      url,
+      text:   enrichedText || userText || undefined,
+      source: 'slack',
+      ...(project ? { project } : {}),
+    });
+    if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
+    await reply(message.channel, buildSuccessMessage(data, cls));
+  } catch {
+    await say("couldn't save that");
   }
-
-  // ── Empty / unrecognised ──────────────────────────────────────────────────
-  await say('send me a link or a note');
 });
 
-// ── Build enriched text for routing context ───────────────────────────────────
-function buildEnrichedText(ctx, text, url) {
-  const parts = [];
-  if (ctx.context === 'work')     parts.push('[Work]');
-  if (ctx.context === 'personal') parts.push('[Personal learning]');
-  if (text && text !== url)       parts.push(text.replace(url, '').trim());
-  if (ctx.timeline)               parts.push(`— ${ctx.timeline}`);
-  return parts.filter(Boolean).join(' ');
-}
-
-// ── Deadline nudge ────────────────────────────────────────────────────────────
+// ── Deadline nudge (called externally by cron/scheduler) ─────────────────────
 export async function sendSlackDeadlineNudge(slackUserId, apps) {
   const dm = await app.client.conversations.open({ users: slackUserId });
 
