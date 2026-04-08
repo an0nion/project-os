@@ -12,7 +12,6 @@
 import 'dotenv/config';
 import bolt from '@slack/bolt';
 import { chatWithModel } from '../lib/multiModelClient.js';
-import { logCost }       from '../lib/costTracker.js';
 
 const { App } = bolt;
 
@@ -131,8 +130,6 @@ async function classifyIntent(text, urls) {
     const raw    = result.text?.trim() ?? '';
     const json   = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
     const parsed = JSON.parse(json);
-
-    logCost(result.modelKey, result.usage, { reason: 'intent_classification' }).catch(() => {});
 
     return {
       intent:              parsed.intent              ?? 'save',
