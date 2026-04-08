@@ -147,61 +147,51 @@ const TITLE_EXTRACTION_PROMPT = 'Extract the topic, concept, or event name from 
 // of the Slack Bolt runtime.
 
 /**
- * The exact system prompt sent to the AI when classifying a learning reply.
+ * TWO prompt constants — one for each AI call in the two-call learningMode architecture.
  * MUST be kept in sync with bot.js learningMode handler.
+ *
+ * CALL 1: Classification only — tiny JSON, maxTokens:60, never truncates.
+ * CALL 2: Plain-text explanation — no JSON, maxTokens:180, only when type=chat.
  */
-const LEARNING_REPLY_SYSTEM_PROMPT = (originalText) =>
-`You are classifying a reply in a learning dialogue. Your job is to decide if the user has given a CLEAR TASK STATEMENT or is still exploring and needs more information.
+const LEARNING_CLASSIFY_PROMPT = (originalText) =>
+`You are classifying a reply in a learning dialogue about: "${originalText.slice(0, 150)}"
+The user was asked: "what do you want to do — read, implement, understand the theory, or write about it?"
 
-Topic the user wants to learn: "${originalText.slice(0, 200)}"
-You asked: "what do you want to do with this — read, implement something, understand the theory, or write about it?"
+Return ONLY valid JSON, nothing else: {"type": "action"} or {"type": "chat"}
 
-Return ONLY valid JSON (no markdown, no code fences):
-{
-  "type": "action" | "chat",
-  "task": "clean verb-led task, max 80 chars (ONLY when type=action)",
-  "reply": "2-3 sentences explaining the topic, end with: do you want to [implement / read / understand / write about] it? (ONLY when type=chat)"
-}
+type=action: reply is a short unambiguous task commitment. Examples:
+  "implement it" → action  |  "read the paper" → action  |  "write a summary" → action
+type=chat: everything else — user wants more info, is exploring, asking questions, or hasn't decided. When in doubt: chat.`;
 
-DEFAULT TO type=chat. Only use type=action when the reply is a short, clean, unambiguous task and nothing else.
-
-type=action — the reply is ONLY a task. Nothing but the task. Examples:
-  "implement it from scratch" → action
-  "read the paper" → action
-  "understand the maths" → action
-  "write a summary" → action
-
-type=chat — everything else. When in doubt, choose chat. Examples:
-  "I want to use it for AI safety but need to figure out a specific use case" → chat (uncertain, exploring)
-  "well I want to do X but I want to figure out Y first so can you tell me more" → chat (wants info first)
-  "tell me more about it" → chat
-  "can you explain how it works?" → chat
-  "I'll tell you how I want to use it after you explain" → chat (conditional)
-  "I'm not sure yet, what do people usually do with it?" → chat (question)
-
-RULE: if the reply mentions wanting to "figure out", asks a question, says they need more info, or is more than one sentence explaining their situation — it is type=chat. Only use type=action for a clean one-phrase task commitment.`;
+const LEARNING_EXPLAIN_PROMPT = (originalText) =>
+`You are a helpful learning assistant. The user wants to learn about: "${originalText.slice(0, 150)}"
+Explain this topic in 2-3 sentences: what it is, why it matters, and how people typically use it.
+End with exactly one question: "Would you like to read about it, implement something, or understand the theory?"
+Plain text only — no markdown, no lists, no bullet points.`;
 
 /**
- * Decision logic: given a parsed AI JSON response and the current step,
+ * Decision logic: given the parsed Call 1 JSON (only has {type}) and the current step,
  * return { saveAsText, chatReply }.
- * This is the pure decision function extracted from the learningMode handler.
+ * NOTE: chatReply is NOT derived from the parsed JSON — it comes from Call 2 separately.
+ * This function only handles the action path; chat path chatReply comes from the explain call.
  */
 function handleLearningReplyResult(parsed, step) {
   let saveAsText = null;
   let chatReply  = null;
-  if (parsed?.type === 'action' && parsed?.task) {
-    saveAsText = parsed.task;
-  } else if (parsed?.type === 'chat' && parsed?.reply && step < 2) {
-    chatReply = parsed.reply;
+  if (parsed?.type === 'action') {
+    // bot.js uses userText.trim().slice(0, 60) as saveAsText — simulate with a placeholder
+    saveAsText = 'action-task';
+  } else if (parsed?.type === 'chat' && step < 3) {
+    // chatReply is set by Call 2 (explain call) — from test perspective, mark as "would explain"
+    chatReply = 'would-explain';
   }
   return { saveAsText, chatReply };
 }
 
 /**
  * Fallback when AI call fails.
- * NEW behaviour (vs old): does NOT save raw userText at step=1.
- * Instead returns null → bot re-asks the clarification question.
- * At step=2, saves a generic "Explore and learn about [topic]" task.
+ * step=1: return null → bot re-asks.
+ * step>=2: saves generic "Explore and learn about [topic]" task.
  */
 function learningReplyFallback(userText, step, originalText) {
   if (step >= 2) {
@@ -563,61 +553,47 @@ describe('parseProjectFromText — correction alias mapping', () => {
 // Does NOT call the AI — tests the decision tree given a known parsed response.
 // ══════════════════════════════════════════════════════════════════════════════
 
-describe('handleLearningReplyResult — decision logic given AI JSON response', () => {
+describe('handleLearningReplyResult — decision logic given Call 1 JSON (type only)', () => {
+  // NOTE: Call 1 only returns {"type": "action"} or {"type": "chat"} — no task/reply fields.
+  // chatReply is set by Call 2 (explain call) independently — not derived from parsed JSON.
+  // This function maps: action → saveAsText set; chat+step<3 → chatReply set (placeholder).
 
   // ── type=action cases ──
-  test('action + task → saveAsText is set, chatReply is null', () => {
-    const { saveAsText, chatReply } = handleLearningReplyResult(
-      { type: 'action', task: 'implement a linear probe in PyTorch' }, 1
-    );
-    assert.equal(saveAsText, 'implement a linear probe in PyTorch');
+  test('action → saveAsText is set, chatReply is null', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'action' }, 1);
+    assert.ok(saveAsText !== null);
     assert.equal(chatReply, null);
   });
 
-  test('action + task at step 2 → still saves (action always saves regardless of step)', () => {
-    const { saveAsText, chatReply } = handleLearningReplyResult(
-      { type: 'action', task: 'read the paper carefully' }, 2
-    );
-    assert.equal(saveAsText, 'read the paper carefully');
+  test('action at step 2 → still saves (action always saves regardless of step)', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'action' }, 2);
+    assert.ok(saveAsText !== null);
     assert.equal(chatReply, null);
   });
 
-  test('action with empty task string → saveAsText is null (empty task rejected)', () => {
-    const { saveAsText } = handleLearningReplyResult({ type: 'action', task: '' }, 1);
-    assert.equal(saveAsText, null);
-  });
-
-  test('action with missing task field → saveAsText is null', () => {
-    const { saveAsText } = handleLearningReplyResult({ type: 'action' }, 1);
-    assert.equal(saveAsText, null);
+  test('action at step 3 → still saves (step limit only blocks chat, not action)', () => {
+    const { saveAsText } = handleLearningReplyResult({ type: 'action' }, 3);
+    assert.ok(saveAsText !== null);
   });
 
   // ── type=chat cases ──
-  test('chat + reply at step 1 → chatReply is set, saveAsText is null', () => {
-    const { saveAsText, chatReply } = handleLearningReplyResult(
-      { type: 'chat', reply: 'Linear probes are classifiers trained on frozen representations...' }, 1
-    );
-    assert.equal(chatReply, 'Linear probes are classifiers trained on frozen representations...');
+  test('chat at step 1 → chatReply set (explain call will fire), saveAsText null', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'chat' }, 1);
+    assert.ok(chatReply !== null);
     assert.equal(saveAsText, null);
   });
 
-  test('chat + reply at step 2 → chatReply is NULL (step limit, force save)', () => {
-    // This is the step-limit: only 1 explanation allowed, then must save
-    const { saveAsText, chatReply } = handleLearningReplyResult(
-      { type: 'chat', reply: 'Another explanation...' }, 2
-    );
-    assert.equal(chatReply, null);
-    assert.equal(saveAsText, null); // falls through to saveAsText ?? userText in bot.js
+  test('chat at step 2 → chatReply set (step cap is now 3)', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'chat' }, 2);
+    assert.ok(chatReply !== null);
+    assert.equal(saveAsText, null);
   });
 
-  test('chat with empty reply string → chatReply is null (empty reply rejected)', () => {
-    const { chatReply } = handleLearningReplyResult({ type: 'chat', reply: '' }, 1);
+  test('chat at step 3 → chatReply is NULL (step limit reached, force save)', () => {
+    // Step cap is 3 — at step=3 the bot force-saves instead of explaining again
+    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'chat' }, 3);
     assert.equal(chatReply, null);
-  });
-
-  test('chat with missing reply field → chatReply is null', () => {
-    const { chatReply } = handleLearningReplyResult({ type: 'chat' }, 1);
-    assert.equal(chatReply, null);
+    assert.equal(saveAsText, null); // bot.js sets generic task inline at this point
   });
 
   // ── Malformed AI responses ──
@@ -634,13 +610,13 @@ describe('handleLearningReplyResult — decision logic given AI JSON response', 
   });
 
   test('unknown type "save" → both null', () => {
-    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'save', task: 'something' }, 1);
+    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'save' }, 1);
     assert.equal(saveAsText, null);
     assert.equal(chatReply, null);
   });
 
   test('unknown type "converse" → both null', () => {
-    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'converse', reply: 'hi' }, 1);
+    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'converse' }, 1);
     assert.equal(saveAsText, null);
     assert.equal(chatReply, null);
   });
@@ -660,50 +636,42 @@ describe('handleLearningReplyResult — decision logic given AI JSON response', 
 
 describe('Learning reply: step state machine', () => {
 
-  test('step=1 allows chat response (1 < 2)', () => {
-    const step = 1;
-    const { chatReply } = handleLearningReplyResult(
-      { type: 'chat', reply: 'Here is an explanation...' }, step
-    );
+  test('step=1 allows chat response (1 < 3)', () => {
+    const { chatReply } = handleLearningReplyResult({ type: 'chat' }, 1);
     assert.ok(chatReply !== null);
   });
 
-  test('step=2 blocks chat (2 is NOT < 2) → forces save', () => {
-    const step = 2;
-    const { chatReply } = handleLearningReplyResult(
-      { type: 'chat', reply: 'Another explanation...' }, step
-    );
+  test('step=2 still allows chat (2 < 3) — second explanation permitted', () => {
+    const { chatReply } = handleLearningReplyResult({ type: 'chat' }, 2);
+    assert.ok(chatReply !== null);
+  });
+
+  test('step=3 blocks chat (3 is NOT < 3) → both null, bot force-saves inline', () => {
+    const { chatReply, saveAsText } = handleLearningReplyResult({ type: 'chat' }, 3);
     assert.equal(chatReply, null);
+    assert.equal(saveAsText, null);
   });
 
   test('step=0 allows chat (edge case: step defaults to 1 in bot.js, but 0 also passes)', () => {
-    const { chatReply } = handleLearningReplyResult(
-      { type: 'chat', reply: 'explanation' }, 0
-    );
+    const { chatReply } = handleLearningReplyResult({ type: 'chat' }, 0);
     assert.ok(chatReply !== null);
   });
 
   test('after chat response, step increments: state.step becomes step+1', () => {
-    // Simulate bot.js: pending.set(userId, { ...state, step: step + 1 })
     const state = { learningMode: true, originalText: 'topic', step: 1 };
     const newState = { ...state, step: state.step + 1 };
     assert.equal(newState.step, 2);
   });
 
   test('at step=2, action still works (step limit only blocks chat)', () => {
-    const { saveAsText } = handleLearningReplyResult(
-      { type: 'action', task: 'implement it' }, 2
-    );
-    assert.equal(saveAsText, 'implement it');
+    const { saveAsText } = handleLearningReplyResult({ type: 'action' }, 2);
+    assert.ok(saveAsText !== null);
   });
 
   test('missing step (state.step undefined) defaults to 1 via ?? 1', () => {
     const step = undefined ?? 1;
     assert.equal(step, 1);
-    // step=1 allows chat
-    const { chatReply } = handleLearningReplyResult(
-      { type: 'chat', reply: 'explanation' }, step
-    );
+    const { chatReply } = handleLearningReplyResult({ type: 'chat' }, step);
     assert.ok(chatReply !== null);
   });
 });
@@ -840,110 +808,93 @@ describe('bareAction fast-path — saves without AI call', () => {
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SECTION 6D — System prompt content validation
-// Tests that the prompt contains the exact criteria needed for correct AI behaviour.
-// If bot.js prompt changes, these tests catch whether key safety criteria were removed.
+// SECTION 6D — Prompt content validation (two-call architecture)
+// Call 1: LEARNING_CLASSIFY_PROMPT — tiny JSON classification only
+// Call 2: LEARNING_EXPLAIN_PROMPT  — plain text explanation only
 // ══════════════════════════════════════════════════════════════════════════════
 
-describe('LEARNING_REPLY_SYSTEM_PROMPT — content validation', () => {
+describe('LEARNING_CLASSIFY_PROMPT — Call 1 content validation', () => {
 
-  const prompt = LEARNING_REPLY_SYSTEM_PROMPT(
-    'I want to learn about linear probes like Neel Nanda safety work'
-  );
+  const topic  = 'linear probes like Neel Nanda safety work';
+  const prompt = LEARNING_CLASSIFY_PROMPT(topic);
 
-  // ── Original topic is injected into the prompt ──
-  test('prompt contains the original topic text', () => {
+  test('prompt injects the learning topic', () => {
     assert.ok(prompt.includes('linear probes like Neel Nanda safety work'));
   });
 
-  test('prompt contains what question was asked (for context)', () => {
-    assert.ok(prompt.includes('what do you want to do with this'));
+  test('prompt specifies the question context that was asked', () => {
+    assert.ok(prompt.includes('read, implement') || prompt.includes('what do you want to do'));
   });
 
-  // ── JSON schema is present and correct ──
-  test('prompt specifies the "type" field with both valid values', () => {
+  test('prompt returns ONLY JSON — no markdown or prose', () => {
+    assert.ok(prompt.includes('ONLY valid JSON') || prompt.includes('nothing else'));
+  });
+
+  test('prompt output schema has only {"type"} — no task or reply fields', () => {
     assert.ok(prompt.includes('"type"'));
+    assert.ok(!prompt.includes('"task"'));
+    assert.ok(!prompt.includes('"reply"'));
+  });
+
+  test('prompt defines type=action with clear examples', () => {
     assert.ok(prompt.includes('action'));
+    assert.ok(prompt.includes('implement'));
+  });
+
+  test('prompt defines type=chat for exploratory/uncertain replies', () => {
     assert.ok(prompt.includes('chat'));
+    assert.ok(prompt.includes('more info') || prompt.includes('exploring') || prompt.includes('hasn\'t decided'));
   });
 
-  test('prompt specifies "task" field for action type', () => {
-    assert.ok(prompt.includes('"task"'));
+  test('prompt has "when in doubt: chat" bias', () => {
+    assert.ok(prompt.toLowerCase().includes('when in doubt'));
   });
 
-  test('prompt specifies "reply" field for chat type', () => {
-    assert.ok(prompt.includes('"reply"'));
+  test('prompt explicitly requires unambiguous task commitment for type=action', () => {
+    assert.ok(prompt.includes('unambiguous') || prompt.includes('short') || prompt.includes('commitment'));
   });
 
-  test('prompt requires verb-led task', () => {
-    assert.ok(prompt.includes('verb-led'));
+  test('prompt is compact — designed for maxTokens:60', () => {
+    // Prompt itself should be under 300 words so the model can fit response in 60 tokens
+    const wordCount = prompt.trim().split(/\s+/).length;
+    assert.ok(wordCount < 300, `Prompt is ${wordCount} words — may be too long for 60-token budget`);
+  });
+});
+
+describe('LEARNING_EXPLAIN_PROMPT — Call 2 content validation', () => {
+
+  const topic  = 'linear probes like Neel Nanda safety work';
+  const prompt = LEARNING_EXPLAIN_PROMPT(topic);
+
+  test('prompt injects the learning topic', () => {
+    assert.ok(prompt.includes('linear probes like Neel Nanda safety work'));
   });
 
-  test('prompt enforces 80-char task limit', () => {
-    assert.ok(prompt.includes('80'));
+  test('prompt asks for 2-3 sentences of explanation', () => {
+    assert.ok(prompt.includes('2-3 sentences') || prompt.includes('2–3 sentences'));
   });
 
-  test('prompt says no markdown / no code fences in output', () => {
-    assert.ok(prompt.includes('no markdown') || prompt.includes('no code fences'));
+  test('prompt requires plain text — explicitly forbids markdown', () => {
+    assert.ok(prompt.includes('Plain text only') || prompt.includes('no markdown'));
   });
 
-  // ── type=action criteria is explicit ──
-  test('prompt defines type=action with examples of clear intents', () => {
-    assert.ok(prompt.includes('implement') && prompt.includes('type=action'));
+  test('prompt does NOT ask for JSON output', () => {
+    assert.ok(!prompt.includes('"type"'));
+    assert.ok(!prompt.includes('{"'));
+    assert.ok(!prompt.includes('JSON'));
   });
 
-  test('prompt includes "read the paper" as action example', () => {
-    assert.ok(prompt.includes('read the paper'));
+  test('prompt asks the explanation to end with a specific question', () => {
+    assert.ok(prompt.includes('Would you like to read') || prompt.includes('implement something'));
   });
 
-  test('prompt includes "understand the theory" as action example', () => {
-    assert.ok(prompt.includes('understand the theory'));
-  });
-
-  // ── type=chat criteria covers the exact failing scenario ──
-  test('prompt includes conditional phrasing ("I\'ll tell you") as a type=chat example', () => {
-    // "I'll tell you how I want to use it after you explain" is in the prompt
-    assert.ok(prompt.includes("I'll tell you"));
-  });
-
-  test('prompt labels conditional phrasing as → chat', () => {
-    assert.ok(prompt.includes('conditional') || prompt.includes('needs info FIRST'));
-  });
-
-  test('prompt includes "can you explain how it works?" as chat example (question)', () => {
-    assert.ok(prompt.includes('explain how it works') || prompt.includes('can you explain'));
-  });
-
-  test('prompt includes "tell me more" phrasing as chat example', () => {
-    assert.ok(prompt.includes('tell me more'));
-  });
-
-  // ── Rule about conditional intent is present ──
-  test('prompt contains a RULE about conditional/exploratory phrasing → type=chat', () => {
-    assert.ok(prompt.includes('RULE') || prompt.includes('CRITICAL'));
-  });
-
-  test('prompt covers "figure out" intent → type=chat', () => {
-    assert.ok(prompt.includes('figure out'));
-  });
-
-  test('prompt covers "needs more info" intent → type=chat', () => {
+  test('prompt covers what makes a good explanation (what it is, why it matters, use cases)', () => {
     assert.ok(
-      prompt.includes('need more info') ||
-      prompt.includes('needs more info') ||
-      prompt.includes('needs information') ||
-      prompt.includes('need more information') ||
-      prompt.includes('more info')
+      prompt.includes('what it is') ||
+      prompt.includes('why it matters') ||
+      prompt.includes('use it') ||
+      prompt.includes('typically use')
     );
-  });
-
-  test('prompt explicitly says type=action requires unambiguous intent', () => {
-    assert.ok(prompt.includes('unambiguous'));
-  });
-
-  test('prompt requires type=action to be a clean, standalone task commitment', () => {
-    // Key rule: only a bare task phrase → action; everything else → chat
-    assert.ok(prompt.includes('clean') || prompt.includes('nothing but the task') || prompt.includes('only a task'));
   });
 });
 
@@ -1022,89 +973,63 @@ describe('buildFinalTask — enriched task format quality', () => {
 
 describe('REGRESSION — "tell me more" must NOT save immediately', () => {
 
-  // ── The prompt must classify these as type=chat ──
-  // We verify by checking that the prompt's criteria text covers each case.
-  const prompt = LEARNING_REPLY_SYSTEM_PROMPT('linear probes Neel Nanda safety');
+  // ── Call 1 classify prompt must cover exploratory phrasing as type=chat ──
+  const classifyPrompt = LEARNING_CLASSIFY_PROMPT('linear probes Neel Nanda safety');
 
-  test('Failing message pattern ("tell me more"+"I\'ll tell you") covered by type=chat criteria in prompt', () => {
-    // The prompt has "tell me more about it" and "I'll tell you how I want to use it after you explain"
-    // as separate type=chat examples — together they cover the failing pattern
-    assert.ok(prompt.includes('tell me more'));
-    assert.ok(prompt.includes("I'll tell you"));
-  });
-
-  test('"tell me more" phrasing is covered by type=chat criteria', () => {
-    assert.ok(prompt.includes('tell me more'));
-  });
-
-  test('"explain it" phrasing is covered by type=chat criteria', () => {
-    assert.ok(prompt.includes('explain'));
-  });
-
-  test('"I\'ll tell you how" conditional is explicitly flagged as type=chat', () => {
-    assert.ok(prompt.includes("I'll tell you"));
-  });
-
-  // ── Decision logic: given the AI correctly returns type=chat, bot does NOT save ──
-  test('decision: type=chat at step=1 → chatReply set, saveAsText null', () => {
-    const { saveAsText, chatReply } = handleLearningReplyResult(
-      { type: 'chat', reply: 'Linear probes are classifiers trained on frozen model representations...' },
-      1
+  test('classify prompt covers "more info" / exploratory intent → type=chat', () => {
+    assert.ok(
+      classifyPrompt.includes('more info') ||
+      classifyPrompt.includes('exploring') ||
+      classifyPrompt.includes('hasn\'t decided')
     );
+  });
+
+  test('classify prompt covers "when in doubt: chat" bias', () => {
+    assert.ok(classifyPrompt.toLowerCase().includes('when in doubt'));
+  });
+
+  test('classify prompt only returns {"type"} — never includes explanation in output', () => {
+    assert.ok(!classifyPrompt.includes('"reply"'));
+    assert.ok(!classifyPrompt.includes('"task"'));
+  });
+
+  // ── Decision logic: given Call 1 correctly returns type=chat, bot does NOT save ──
+  test('decision: type=chat at step=1 → chatReply set (explain call fires), saveAsText null', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'chat' }, 1);
     assert.equal(saveAsText, null);
     assert.ok(chatReply !== null);
-    assert.ok(chatReply.length > 0);
   });
 
-  test('decision: type=chat → bot keeps pending state (step increments)', () => {
-    const originalStep = 1;
-    const { chatReply } = handleLearningReplyResult(
-      { type: 'chat', reply: 'explanation' }, originalStep
-    );
+  test('decision: type=chat → bot keeps pending state (step increments to 2)', () => {
+    const { chatReply } = handleLearningReplyResult({ type: 'chat' }, 1);
     assert.ok(chatReply !== null);
-    // In bot.js: pending.set(userId, { ...state, step: step + 1 })
-    const newStep = originalStep + 1;
+    const newStep = 1 + 1;
     assert.equal(newStep, 2);
   });
 
   test('decision: type=action → saveAsText set, bot saves immediately', () => {
-    const { saveAsText, chatReply } = handleLearningReplyResult(
-      { type: 'action', task: 'implement linear probes in PyTorch' }, 1
-    );
+    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'action' }, 1);
     assert.ok(saveAsText !== null);
     assert.equal(chatReply, null);
   });
 
-  // ── Similar failing messages (variations of the bug) ──
-  test('"explain it then I\'ll implement it" → prompt classifies as chat', () => {
-    // These messages contain "implement" but are conditional → must be chat
-    const conditionalMessages = [
-      "tell me more about it, explain it and I'll tell u how I want to implement it",
-      "explain it then I'll decide what to do",
-      "what is it? once I understand I'll tell you if I want to implement it",
-      "I'll implement it after you explain what it is",
-    ];
-    for (const msg of conditionalMessages) {
-      // Verify the CRITICAL RULE in the prompt covers these
-      assert.ok(
-        prompt.includes("I'll tell you") || prompt.includes('conditional'),
-        `Prompt must cover conditional phrasing for: "${msg}"`
-      );
-    }
+  // ── Call 2 explain prompt must generate real information ──
+  test('explain prompt asks for explanation of the actual topic', () => {
+    const explainPrompt = LEARNING_EXPLAIN_PROMPT('linear probes Neel Nanda safety');
+    assert.ok(explainPrompt.includes('linear probes Neel Nanda safety'));
+    assert.ok(!explainPrompt.includes('JSON'));
   });
 
-  // ── Contrast: these ARE direct intents → type=action ──
-  test('clear action phrases produce type=action from decision function', () => {
+  // ── Contrast: clear actions → type=action from decision function ──
+  test('clear action responses produce type=action from decision function', () => {
     const directIntents = [
-      { type: 'action', task: 'implement it from scratch' },
-      { type: 'action', task: 'read the paper carefully' },
-      { type: 'action', task: 'understand the theory' },
-      { type: 'action', task: 'write a summary of the key ideas' },
-      { type: 'action', task: 'build a demo in PyTorch' },
+      { type: 'action' },
+      { type: 'action' },
+      { type: 'action' },
     ];
     for (const parsed of directIntents) {
       const { saveAsText } = handleLearningReplyResult(parsed, 1);
-      assert.ok(saveAsText !== null, `Expected saveAsText for: ${parsed.task}`);
+      assert.ok(saveAsText !== null);
     }
   });
 });
@@ -1123,85 +1048,77 @@ describe('Full conversation simulation: topic → question → reply → [explai
       'I want to learn about linear probes like Neel Nanda safety work', []
     ));
 
-    // Turn 2: user gives direct intent → bot saves
-    const parsed = { type: 'action', task: 'implement a linear probe in PyTorch from scratch' };
-    const { saveAsText, chatReply } = handleLearningReplyResult(parsed, 1);
+    // Turn 2: user gives direct intent → Call 1 returns type=action → saveAsText set
+    // In bot.js: saveAsText = userText.trim().slice(0, 60) — user's own words
+    const userReply = 'implement a linear probe in PyTorch from scratch';
+    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'action' }, 1);
     assert.ok(saveAsText !== null);
     assert.equal(chatReply, null);
 
-    // Final saved task: verb-led, topic included
-    const saved = buildFinalTask(saveAsText, 'I want to learn about linear probes like Neel Nanda safety work');
+    // Simulate bot.js: saveAsText = userReply.trim().slice(0, 60)
+    const actualSaveAsText = userReply.trim().slice(0, 60);
+    const topic = 'I want to learn about linear probes like Neel Nanda safety work';
+    const saved = buildFinalTask(actualSaveAsText, topic);
     assert.ok(saved.startsWith('implement'));
     assert.ok(saved.includes('linear probes'));
     assert.ok(saved.includes(' — '));
     assert.ok(!saved.startsWith('I want to learn')); // not vague
   });
 
-  test('CHAT PATH: "tell me more" → explanation → intent → saves', () => {
+  test('CHAT PATH: "tell me more" → classify=chat → explain call fires → step→2 → user gives intent → saves', () => {
     // Turn 1: topic → question
     assert.ok(isExplicitLearning('I want to learn about linear probes', []));
 
-    // Turn 2: "tell me more" → type=chat at step=1 → gives explanation, keeps pending
-    const chatParsed = { type: 'chat', reply: 'Linear probes are simple classifiers on frozen representations. They reveal what a layer "knows". Do you want to implement one, or read the key papers?' };
-    const turn2 = handleLearningReplyResult(chatParsed, 1);
+    // Turn 2: "tell me more" → Call 1 returns type=chat at step=1 → explain call fires
+    const turn2 = handleLearningReplyResult({ type: 'chat' }, 1);
     assert.equal(turn2.saveAsText, null);
-    assert.ok(turn2.chatReply !== null);
+    assert.ok(turn2.chatReply !== null); // marks that explain call would fire
 
-    // State: step becomes 2
+    // State: step becomes 2 (still < 3, so chat still allowed next turn)
     const newStep = 2;
 
-    // Turn 3: user gives intent → type=action at step=2 → saves
-    const actionParsed = { type: 'action', task: 'implement a linear probe in PyTorch' };
-    const turn3 = handleLearningReplyResult(actionParsed, newStep);
+    // Turn 3: user gives intent → Call 1 returns type=action → saves
+    const turn3 = handleLearningReplyResult({ type: 'action' }, newStep);
     assert.ok(turn3.saveAsText !== null);
     assert.equal(turn3.chatReply, null);
-
-    // Final saved task
-    const saved = buildFinalTask(turn3.saveAsText, 'I want to learn about linear probes');
-    assert.ok(saved.startsWith('implement'));
-    assert.ok(saved.includes('linear probes'));
   });
 
-  test('STEP LIMIT PATH: "tell me more" → still vague → force save at step=2', () => {
-    // Turn 2: "tell me more" at step=1 → explanation given, step → 2
-    const turn2 = handleLearningReplyResult(
-      { type: 'chat', reply: 'An explanation...' }, 1
-    );
+  test('STEP LIMIT PATH: vague → explain → vague → explain → vague → force save at step=3', () => {
+    // Step 1: chat → explain (step → 2)
+    const turn2 = handleLearningReplyResult({ type: 'chat' }, 1);
     assert.ok(turn2.chatReply !== null);
 
-    // Turn 3: still vague at step=2 → chatReply blocked, falls through to save
-    const turn3 = handleLearningReplyResult(
-      { type: 'chat', reply: 'Still wants more info...' }, 2
-    );
-    assert.equal(turn3.chatReply, null);  // blocked at step=2
-    assert.equal(turn3.saveAsText, null); // no action either
-    // In bot.js: else if (type=chat && step>=2) → saves "Explore and learn about [topic]"
+    // Step 2: still chat → explain again (step → 3)
+    const turn3 = handleLearningReplyResult({ type: 'chat' }, 2);
+    assert.ok(turn3.chatReply !== null);
+
+    // Step 3: still chat → BLOCKED (step >= 3), bot.js saves generic inline
+    const turn4 = handleLearningReplyResult({ type: 'chat' }, 3);
+    assert.equal(turn4.chatReply, null);
+    assert.equal(turn4.saveAsText, null); // bot.js sets generic task inline
   });
 
-  test('FALLBACK PATH: AI fails at step=1 → re-asks; at step=2 → saves generic task', () => {
+  test('FALLBACK PATH: AI classify fails at step=1 → re-asks; at step=2 → saves generic task', () => {
     const topic = 'linear probes in neural networks';
 
-    // Step=1 fallback → null → bot re-asks (does NOT save garbage)
-    const step1 = learningReplyFallback('implement it', 1, topic);
+    // Step=1 classify failure → null → bot re-asks
+    const step1 = learningReplyFallback('tell me more', 1, topic);
     assert.equal(step1.saveAsText, null);
 
-    // Step=2 fallback → saves generic "Explore and learn about [topic]"
+    // Step=2 classify failure → saves generic
     const step2 = learningReplyFallback('still not sure', 2, topic);
     assert.ok(step2.saveAsText !== null);
     assert.ok(step2.saveAsText.startsWith('Explore and learn about'));
     assert.ok(step2.saveAsText.includes('linear probes'));
   });
 
-  test('STEP LIMIT: step=2 chat result → handleLearningReplyResult returns both null (bot.js adds generic inline)', () => {
-    // Pure function: type=chat at step=2 → chatReply blocked, saveAsText not set
-    // (bot.js inline sets saveAsText = "Explore and learn about..." directly)
-    const result = handleLearningReplyResult({ type: 'chat', reply: 'Still vague...' }, 2);
+  test('STEP LIMIT: step=3 chat → handleLearningReplyResult returns both null (bot.js adds generic inline)', () => {
+    const result = handleLearningReplyResult({ type: 'chat' }, 3);
     assert.equal(result.chatReply, null);
     assert.equal(result.saveAsText, null);
   });
 
   test('FALLBACK: AI exception at step=2 → learningReplyFallback saves generic task', () => {
-    // learningReplyFallback is called when AI throws — step=2 → generic task
     const fallback = learningReplyFallback('Still vague...', 2, 'linear probes');
     assert.ok(fallback.saveAsText.startsWith('Explore and learn about'));
     assert.ok(fallback.saveAsText.includes('linear probes'));

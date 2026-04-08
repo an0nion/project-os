@@ -320,14 +320,14 @@ app.message(async ({ message, say }) => {
       return;
     }
 
-    // Learning clarification mode — AI decides what the reply actually means:
-    // - Direct intent ("implement it", "read the paper") → extract clean task + save
-    // - Wants more context ("tell me more", "explain it") → respond with a brief
-    //   explanation of the topic, then ask again (max 1 exchange before forcing save)
+    // Learning clarification mode — two-call architecture:
+    // Call 1: classify reply as "action" (has clear intent) or "chat" (wants more info) — tiny JSON, 60 tokens
+    // Call 2: if chat, generate plain-text explanation of the topic — no JSON, 180 tokens
+    // This split avoids the fragile single-call pattern where JSON truncation silently broke classification.
     if (state.learningMode) {
       const step = state.step ?? 1;
-      let saveAsText = null;  // AI-extracted clean task — set ONLY on unambiguous action
-      let chatReply  = null;  // explanation to send — set when user still exploring
+      let saveAsText = null;
+      let chatReply  = null;
 
       // ── Fast-path: bare action words need no AI ────────────────────────────
       const bareAction = /^(read|implement|write|understand|learn|theory|both|all)(\s+(it|the paper|more|about it|everything))?$/i.test(userText.trim());
@@ -342,84 +342,67 @@ app.message(async ({ message, say }) => {
         return;
       }
 
+      // ── Call 1: classify only — tiny JSON, never truncates ─────────────────
+      let classifyType = null;
       try {
-        // Use deepseek-chat as primary here — it follows strict classification rules
-        // more reliably than Gemini Flash for ambiguous conversational inputs.
-        const result = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
-          system: `You are classifying a reply in a learning dialogue. Your job is to decide if the user has given a CLEAR TASK STATEMENT or is still exploring and needs more information.
+        const classifyResult = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
+          system: `You are classifying a reply in a learning dialogue about: "${state.originalText.slice(0, 150)}"
+The user was asked: "what do you want to do — read, implement, understand the theory, or write about it?"
 
-Topic the user wants to learn: "${state.originalText.slice(0, 200)}"
-You asked: "what do you want to do with this — read, implement something, understand the theory, or write about it?"
+Return ONLY valid JSON, nothing else: {"type": "action"} or {"type": "chat"}
 
-Return ONLY valid JSON (no markdown, no code fences):
-{
-  "type": "action" | "chat",
-  "task": "clean verb-led task, max 80 chars (ONLY when type=action)",
-  "reply": "2-3 sentences explaining the topic, end with: do you want to [implement / read / understand / write about] it? (ONLY when type=chat)"
-}
-
-DEFAULT TO type=chat. Only use type=action when the reply is a short, clean, unambiguous task and nothing else.
-
-type=action — the reply is ONLY a task. Nothing but the task. Examples:
-  "implement it from scratch" → action
-  "read the paper" → action
-  "understand the maths" → action
-  "write a summary" → action
-
-type=chat — everything else. When in doubt, choose chat. Examples:
-  "I want to use it for AI safety but need to figure out a specific use case" → chat (uncertain, exploring)
-  "well I want to do X but I want to figure out Y first so can you tell me more" → chat (wants info first)
-  "tell me more about it" → chat
-  "can you explain how it works?" → chat
-  "I'll tell you how I want to use it after you explain" → chat (conditional)
-  "I'm not sure yet, what do people usually do with it?" → chat (question)
-
-RULE: if the reply mentions wanting to "figure out", asks a question, says they need more info, or is more than one sentence explaining their situation — it is type=chat. Only use type=action for a clean one-phrase task commitment.`,
+type=action: reply is a short unambiguous task commitment. Examples:
+  "implement it" → action  |  "read the paper" → action  |  "write a summary" → action
+type=chat: everything else — user wants more info, is exploring, asking questions, or hasn't decided. When in doubt: chat.`,
           messages: [{ role: 'user', content: userText }],
-          maxTokens: 220,
+          maxTokens: 60,
         });
-        logCostViaApi(result.modelKey, result.usage, 'learning_reply_classify');
-
-        const raw    = result.text?.trim() ?? '';
-        const json   = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
-        const parsed = JSON.parse(json);
-
-        if (parsed.type === 'action' && parsed.task) {
-          saveAsText = parsed.task;
-        } else if (parsed.type === 'chat' && parsed.reply && step < 2) {
-          chatReply = parsed.reply;
-        } else if (parsed.type === 'chat' && step >= 2) {
-          // Step limit reached — save a generic exploratory task rather than raw text
-          saveAsText = `Explore and learn about ${state.originalText.slice(0, 60)}`;
-        }
-      } catch {
-        // AI failed. At step 1: re-ask the question rather than saving garbage.
-        // At step 2: save a generic task so we don't loop forever.
-        if (step >= 2) {
-          saveAsText = `Explore and learn about ${state.originalText.slice(0, 60)}`;
-        }
+        logCostViaApi(classifyResult.modelKey, classifyResult.usage, 'learning_classify');
+        const raw    = classifyResult.text?.trim() ?? '';
+        const parsed = JSON.parse(raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim());
+        classifyType = parsed?.type ?? null;
+      } catch (err) {
+        console.error('[learningMode] classify call failed:', err.message);
       }
 
-      // User still exploring → respond with context, keep state alive for one more turn
+      // ── Decide based on classification ────────────────────────────────────
+      if (classifyType === 'action') {
+        // User gave a clear task — use their own words (enriched format adds topic context)
+        saveAsText = userText.trim().slice(0, 60);
+
+      } else if (classifyType === 'chat' && step < 3) {
+        // ── Call 2: generate plain-text explanation — no JSON, generous budget ──
+        try {
+          const explainResult = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
+            system: `You are a helpful learning assistant. The user wants to learn about: "${state.originalText.slice(0, 150)}"
+Explain this topic in 2-3 sentences: what it is, why it matters, and how people typically use it.
+End with exactly one question: "Would you like to read about it, implement something, or understand the theory?"
+Plain text only — no markdown, no lists, no bullet points.`,
+            messages: [{ role: 'user', content: userText }],
+            maxTokens: 180,
+          });
+          logCostViaApi(explainResult.modelKey, explainResult.usage, 'learning_explain');
+          chatReply = explainResult.text?.trim() ?? null;
+        } catch (err) {
+          console.error('[learningMode] explain call failed:', err.message);
+        }
+
+      } else if (classifyType === 'chat' && step >= 3) {
+        // Step limit — save generic task
+        saveAsText = `Explore and learn about ${state.originalText.slice(0, 60)}`;
+
+      } else if (classifyType === null && step >= 2) {
+        // AI failed twice — save generic rather than loop forever
+        saveAsText = `Explore and learn about ${state.originalText.slice(0, 60)}`;
+      }
+
       if (chatReply) {
         pending.set(userId, { ...state, step: step + 1 });
         await say(chatReply);
         return;
       }
 
-      // No clear intent yet — re-ask once, then force-save to prevent infinite loop
       if (!saveAsText) {
-        if (step >= 2) {
-          // Already re-asked — save generic task rather than looping forever
-          pending.delete(userId);
-          const enriched = `Explore and learn about ${state.originalText.slice(0, 60)} — ${state.originalText.slice(0, 120)}`;
-          try {
-            const data = await callInbox({ text: enriched, source: 'slack', project: 'learning_tech' });
-            await say(buildSuccessMessage(data));
-          } catch { await say('saved to Learning & Tech ✓'); }
-          return;
-        }
-        // Increment step so the next re-ask breaks the loop
         pending.set(userId, { ...state, step: step + 1 });
         await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
         return;
