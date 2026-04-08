@@ -23,11 +23,13 @@ const app = new App({
 });
 
 // ── Deduplication (Slack can fire the same event twice) ───────────────────────
+// Use client_msg_id when available, fall back to ts (Slack's unique event timestamp).
 const _seen = new Set();
-function isDuplicate(clientMsgId) {
-  if (!clientMsgId) return false;
-  if (_seen.has(clientMsgId)) return true;
-  _seen.add(clientMsgId);
+function isDuplicate(message) {
+  const key = message.client_msg_id ?? message.ts;
+  if (!key) return false;
+  if (_seen.has(key)) return true;
+  _seen.add(key);
   if (_seen.size > 500) _seen.clear();
   return false;
 }
@@ -142,8 +144,9 @@ async function postInboxResult(say, data) {
 
 app.message(async ({ message, say }) => {
   if (message.channel_type !== 'im') return;
-  if (isDuplicate(message.client_msg_id)) return;
+  if (message.subtype) return;           // ignore message_changed, message_deleted, etc.
   if (message.bot_id) return;
+  if (isDuplicate(message)) return;
 
   const userId   = message.user;
   const urls     = extractUrls(message);
@@ -152,54 +155,59 @@ app.message(async ({ message, say }) => {
   // ── Handle pending clarification responses ─────────────────────────────────
   if (clarificationPending.has(userId)) {
     const state = clarificationPending.get(userId);
-    const lower = userText.toLowerCase();
 
-    if (state.step === 1) {
-      // Expecting "work" or "personal"
-      const isWork     = /\bwork\b/i.test(lower);
-      const isPersonal = /\bpersonal\b|\blearning\b|\bfun\b|\bmine\b|\bcurious\b/i.test(lower);
+    // If the user sends a completely new message with a URL while we're mid-clarification,
+    // abandon the old flow and treat this as a fresh message.
+    const hasNewUrl = urls.length > 0;
+    const isAboutOldItem = state.url && hasNewUrl && urls[0] === state.url;
+    const isNewMessage   = hasNewUrl && !isAboutOldItem;
 
-      if (isWork) {
-        clarificationPending.set(userId, { ...state, step: 2, context: 'work' });
-        await say('Got it, work 💼\n\nAny urgency — *today*, *this week*, or *no rush*?');
-        return;
-      }
-
-      if (isPersonal) {
-        clarificationPending.set(userId, { ...state, step: 2, context: 'personal' });
-        await say('Personal learning 📚\n\nWant to look at it *soon* or just *saving for later*?');
-        return;
-      }
-
-      // Didn't understand — re-ask
-      await say('Just checking — is this for *work* or *personal* learning?');
-      return;
-    }
-
-    if (state.step === 2) {
-      // Got urgency/timeline — finalize routing
-      const project  = state.context === 'work' ? 'work' : 'learning_tech';
-      const timeline = userText.trim();
-
-      // Enrich the stored text with context for the summary
-      const enrichedText = state.context === 'work'
-        ? `[Work] ${state.text || state.url} — urgency: ${timeline}`
-        : `[Personal learning] ${state.text || state.url} — timeline: ${timeline}`;
-
+    if (isNewMessage) {
       clarificationPending.delete(userId);
+      // Fall through to normal URL handling below
+    } else {
+      const lower = userText.toLowerCase();
 
-      try {
-        const data = await callInbox({
-          url:     state.url  || undefined,
-          text:    enrichedText,
-          source:  'slack',
-          project,               // forced — bypasses AI routing
-        });
-        await postInboxResult(say, data);
-      } catch (err) {
-        await say(`❌ Error: ${err.message}`);
+      if (state.step === 1) {
+        const isWork     = /\bwork\b/i.test(lower);
+        const isPersonal = /\bpersonal\b|\blearning\b|\bfun\b|\bmine\b|\bcurious\b/i.test(lower);
+
+        if (isWork) {
+          clarificationPending.set(userId, { ...state, step: 2, context: 'work' });
+          await say('Got it, work 💼\n\nAny urgency — *today*, *this week*, or *no rush*?');
+          return;
+        }
+        if (isPersonal) {
+          clarificationPending.set(userId, { ...state, step: 2, context: 'personal' });
+          await say('Personal 📚\n\nWant to look at it *soon* or just *saving for later*?');
+          return;
+        }
+        await say('Just checking — is this for *work* or *personal* learning?');
+        return;
       }
-      return;
+
+      if (state.step === 2) {
+        const project      = state.context === 'work' ? 'work' : 'learning_tech';
+        const timeline     = userText.trim();
+        const enrichedText = state.context === 'work'
+          ? `[Work] ${state.text || state.url} — urgency: ${timeline}`
+          : `[Personal learning] ${state.text || state.url} — timeline: ${timeline}`;
+
+        clarificationPending.delete(userId);
+
+        try {
+          const data = await callInbox({
+            url:    state.url || undefined,
+            text:   enrichedText,
+            source: 'slack',
+            project,
+          });
+          await postInboxResult(say, data);
+        } catch (err) {
+          await say(`❌ Error: ${err.message}`);
+        }
+        return;
+      }
     }
   }
 

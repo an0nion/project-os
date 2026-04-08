@@ -11,6 +11,11 @@
  *   all others    — creates row in items table (generic Kanban card)
  *   GitHub/GitLab — never scraped; always creates an item (not an application)
  *
+ * Title priority for items:
+ *   1. Page <title> fetched from URL (lightweight, no scraping)
+ *   2. AI router summary (for text-only or when fetch fails)
+ *   3. Last path segment of URL
+ *
  * Response: { project, projectLabel, confidence, summary, suggested_action,
  *             is_new_task, itemId?, appId?, questionsCount?, deadline?,
  *             routedBy, routingCost }
@@ -21,6 +26,42 @@ import { route }             from '../../../lib/router.js';
 import { scrapeApplication } from '../../../scraper/index.js';
 import { supabase }          from '../../../lib/supabase.js';
 import { PROJECTS }          from '../../../lib/projects.js';
+
+// ── Lightweight page title fetch (not a full scrape) ─────────────────────────
+async function fetchPageTitle(url) {
+  try {
+    const res = await fetch(url, {
+      signal:  AbortSignal.timeout(4000),
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProjectOS/1.0)' },
+    });
+    const html  = await res.text();
+    // Grab <title> — usually in first 2 KB, no need for full parse
+    const match = html.match(/<title[^>]*>([^<]{1,200})<\/title>/i);
+    if (!match) return null;
+    return match[1]
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&#x27;/g, "'").replace(/&quot;/g, '"')
+      .trim();
+  } catch {
+    return null;
+  }
+}
+
+// ── Context subtitle from text (e.g. "For Work · urgent", "Personal · 1-2 months") ──
+function extractSubtitle(text) {
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  const parts = [];
+  if (/\bfor work\b|\[work\]/i.test(text))               parts.push('Work');
+  else if (/\bpersonal\b|\[personal\]/i.test(text))       parts.push('Personal');
+  if (/\btoday\b|\burgent\b|\basap\b/i.test(lower))       parts.push('Urgent');
+  else if (/\bthis week\b|\bsoon\b/i.test(lower))         parts.push('Soon');
+  else if (/(\d+[-–]\d+\s*(month|week|day))/i.test(text)) {
+    const m = text.match(/(\d+[-–]\d+\s*(month|week|day)s?)/i);
+    if (m) parts.push(m[0]);
+  }
+  return parts.length ? parts.join(' · ') : null;
+}
 
 export async function POST(req) {
   const { url, text, source, project: forcedProject } = await req.json();
@@ -48,7 +89,31 @@ export async function POST(req) {
   const projectDef = PROJECTS.find(p => p.key === project);
   const firstCol   = projectDef?.columns?.[0]?.key ?? 'backlog';
 
-  // ── 2. Create a card ────────────────────────────────────────────────────────
+  // ── 2. Build a good item title ──────────────────────────────────────────────
+  // For URL captures: fetch real page title. For text-only: use AI summary.
+  let itemTitle    = null;
+  let itemSubtitle = extractSubtitle(text);
+
+  if (url) {
+    // Fetch real page title — much better than URL slug or truncated text
+    itemTitle = await fetchPageTitle(url);
+  }
+
+  if (!itemTitle) {
+    // Fall back to AI router summary, or last URL path segment
+    if (summary && summary !== (text || url || '').slice(0, 80)) {
+      itemTitle = summary;
+    } else if (url) {
+      // e.g. github.com/google-research/timesfm → "timesfm"
+      const slug = url.split('/').filter(Boolean).pop()?.replace(/[-_]/g, ' ') ?? '';
+      const host = new URL(url).hostname.replace('www.', '');
+      itemTitle = slug ? `${slug} — ${host}` : host;
+    } else {
+      itemTitle = (text ?? '').slice(0, 120);
+    }
+  }
+
+  // ── 3. Create a card ────────────────────────────────────────────────────────
   let itemId         = null;
   let appId          = null;
   let questionsCount = 0;
@@ -65,7 +130,7 @@ export async function POST(req) {
       const { data: app, error: appErr } = await supabase
         .from('applications')
         .insert({
-          name:          scraped.position || summary || 'Untitled Application',
+          name:          scraped.position || itemTitle || 'Untitled Application',
           org:           scraped.org      || 'Unknown',
           url,
           deadline:      scraped.deadline || null,
@@ -95,36 +160,42 @@ export async function POST(req) {
       }
     } else {
       scrapeError = scraped.error;
+      // Still create a plain item so nothing is lost
+      try {
+        const { data: item } = await supabase
+          .from('items')
+          .insert({ project_key: project, title: itemTitle.slice(0, 200), subtitle: itemSubtitle, status: firstCol, url: url ?? null, notes: text ?? null })
+          .select().single();
+        if (item) itemId = item.id;
+      } catch { /* non-fatal */ }
     }
   } else {
-    // All other projects (or research_apps without URL): items table
-    const title = summary || (url ? url.split('/').filter(Boolean).pop() : text?.slice(0, 80)) || 'Untitled';
-
+    // All other projects: items table
     try {
       const { data: item } = await supabase
         .from('items')
         .insert({
           project_key: project,
-          title:       title.slice(0, 200),
-          subtitle:    null,
+          title:       itemTitle.slice(0, 200),
+          subtitle:    itemSubtitle,
           status:      firstCol,
-          url:         url ?? null,
-          notes:       text && url ? text : null,   // keep original text as notes if we also have a url
+          url:         url  ?? null,
+          notes:       text ?? null,
         })
         .select()
         .single();
       if (item) itemId = item.id;
-    } catch { /* non-fatal — item creation failure shouldn't break inbox */ }
+    } catch { /* non-fatal */ }
   }
 
-  // ── 3. Audit log ────────────────────────────────────────────────────────────
+  // ── 4. Audit log ────────────────────────────────────────────────────────────
   try {
     await supabase.from('inbox_log').insert({
       source:  source  ?? 'unknown',
       url:     url     ?? null,
       text:    text    ?? null,
       project,
-      summary,
+      summary: itemTitle ?? summary,
     });
   } catch { /* non-fatal */ }
 
@@ -132,7 +203,7 @@ export async function POST(req) {
     project,
     projectLabel,
     confidence,
-    summary,
+    summary:          itemTitle ?? summary,
     suggested_action,
     is_new_task,
     itemId,

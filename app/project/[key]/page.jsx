@@ -119,7 +119,8 @@ export default function ProjectPage({ params }) {
   const [draft,      setDraft]      = useState('');
   const [chatLoading,setChatLoading]= useState(false);
   const [newTitle,   setNewTitle]   = useState('');
-  const [addingCol,  setAddingCol]  = useState(null);   // column key where we're adding a card
+  const [addingCol,  setAddingCol]  = useState(null);
+  const [expandedCols, setExpandedCols] = useState({});  // collapsed cols the user has expanded
   const chatEndRef = useRef(null);
 
   // Load project definition + items
@@ -230,12 +231,46 @@ export default function ProjectPage({ params }) {
       {/* ── Kanban board ──────────────────────────────────────────────── */}
       <div style={styles.kanban}>
         {columns.map(col => {
-          const cards = grouped[col.key] ?? [];
+          const cards      = grouped[col.key] ?? [];
+          const isCollapsed = col.collapsed && !expandedCols[col.key];
+
+          // Collapsed done column — slim count bar
+          if (isCollapsed) {
+            return (
+              <button
+                key={col.key}
+                onClick={() => setExpandedCols(prev => ({ ...prev, [col.key]: true }))}
+                style={styles.collapsedCol}
+                title={`Show ${cards.length} ${col.label}`}
+              >
+                <span style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)', fontSize: '0.75rem', color: '#555', letterSpacing: '0.06em', textTransform: 'uppercase' }}>
+                  {col.label}
+                </span>
+                {cards.length > 0 && (
+                  <span style={{ fontSize: '0.72rem', color: '#444', marginTop: '0.4rem' }}>
+                    {cards.length}
+                  </span>
+                )}
+              </button>
+            );
+          }
+
           return (
             <div key={col.key} style={{ ...styles.column, background: STATUS_COLORS[col.key] ?? '#1e2130' }}>
               <div style={styles.colHeader}>
                 <span style={{ color: '#a0a8b8' }}>{col.label}</span>
-                <span style={{ color: '#555', fontSize: '0.78rem' }}>{cards.length}</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                  <span style={{ color: '#555', fontSize: '0.78rem' }}>{cards.length}</span>
+                  {col.collapsed && (
+                    <button
+                      onClick={() => setExpandedCols(prev => ({ ...prev, [col.key]: false }))}
+                      style={{ background: 'none', border: 'none', color: '#444', cursor: 'pointer', fontSize: '0.75rem', padding: 0 }}
+                      title="Collapse"
+                    >
+                      ←
+                    </button>
+                  )}
+                </div>
               </div>
 
               {cards.map(item => (
@@ -268,10 +303,7 @@ export default function ProjectPage({ params }) {
                   <button onClick={() => { setAddingCol(null); setNewTitle(''); }} style={styles.cancelBtn}>✕</button>
                 </div>
               ) : (
-                <button
-                  onClick={() => setAddingCol(col.key)}
-                  style={styles.addCardBtn}
-                >
+                <button onClick={() => setAddingCol(col.key)} style={styles.addCardBtn}>
                   + Add
                 </button>
               )}
@@ -340,6 +372,13 @@ const styles = {
   column: {
     minWidth: 210, flex: '0 0 210px', borderRadius: 10,
     padding: '0.75rem', display: 'flex', flexDirection: 'column',
+  },
+  collapsedCol: {
+    flex: '0 0 28px', minWidth: 28, borderRadius: 10,
+    background: '#0f1118', border: '1px dashed #1e2130',
+    display: 'flex', flexDirection: 'column', alignItems: 'center',
+    justifyContent: 'flex-start', padding: '0.6rem 0', cursor: 'pointer',
+    alignSelf: 'stretch',
   },
   colHeader: {
     display: 'flex', justifyContent: 'space-between', alignItems: 'center',

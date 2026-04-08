@@ -17,13 +17,19 @@ export async function GET(req, { params }) {
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
-  // Inbox item count for this project (for non-application project tiles)
-  const { count: inboxCount } = await supabase
-    .from('inbox_log')
-    .select('*', { count: 'exact', head: true })
-    .eq('project', key);
+  // Item count — items table for all projects except research_apps (uses applications)
+  let itemCount = 0;
+  if (key === 'research_apps') {
+    itemCount = (data ?? []).length;
+  } else {
+    const { count } = await supabase
+      .from('items')
+      .select('*', { count: 'exact', head: true })
+      .eq('project_key', key);
+    itemCount = count ?? 0;
+  }
 
-  return NextResponse.json({ applications: data ?? [], inboxCount: inboxCount ?? 0 });
+  return NextResponse.json({ applications: data ?? [], inboxCount: itemCount });
 }
 
 export async function PATCH(req, { params }) {
