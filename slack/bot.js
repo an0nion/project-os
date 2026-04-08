@@ -312,11 +312,62 @@ app.message(async ({ message, say }) => {
       return;
     }
 
-    // Learning clarification mode: user answered "what do you want to do with this?"
+    // Learning clarification mode — AI decides what the reply actually means:
+    // - Direct intent ("implement it", "read the paper") → extract clean task + save
+    // - Wants more context ("tell me more", "explain it") → respond with a brief
+    //   explanation of the topic, then ask again (max 1 exchange before forcing save)
     if (state.learningMode) {
+      const step = state.step ?? 1;
+      let saveAsText  = null;   // AI-extracted actionable task
+      let chatReply   = null;   // explanation to send before asking again
+
+      try {
+        const result = await callModelWithFallback('gemini-flash', 'deepseek-chat', {
+          system: `You help capture personal learning tasks from conversational messages.
+
+The user said they want to learn: "${state.originalText.slice(0, 200)}"
+You asked: "what do you want to do with this — read, implement something, understand the theory, or write about it?"
+
+Classify their reply and return ONLY valid JSON (no markdown):
+{
+  "type": "action" | "chat",
+  "task": "verb-led actionable task, max 80 chars (only when type=action)",
+  "reply": "2-3 plain sentences explaining the topic concisely, ending with a specific question like 'do you want to implement it, read the key papers, or understand the theory?' (only when type=chat)"
+}
+
+type=action: reply describes a clear intent — implement, read, write, understand, build, explore, do X with it
+type=chat: reply asks for more info, wants explanation first, or is vague/conversational ("tell me more", "what is that", "explain it")`,
+          messages: [{ role: 'user', content: userText }],
+          maxTokens: 220,
+        });
+        logCostViaApi(result.modelKey, result.usage, 'learning_reply_classify');
+
+        const raw    = result.text?.trim() ?? '';
+        const json   = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
+        const parsed = JSON.parse(json);
+
+        if (parsed.type === 'action' && parsed.task) {
+          saveAsText = parsed.task;
+        } else if (parsed.type === 'chat' && parsed.reply && step < 2) {
+          // Only allow one explanation round — after that, force save whatever they say
+          chatReply = parsed.reply;
+        }
+      } catch {
+        // Fallback: ≤8 words is probably a direct intent (implement, read, etc.)
+        if (userText.trim().split(/\s+/).filter(Boolean).length <= 8) saveAsText = userText;
+      }
+
+      // Still wants to discuss → reply with context, keep state alive for one more turn
+      if (chatReply) {
+        pending.set(userId, { ...state, step: step + 1 });
+        await say(chatReply);
+        return;
+      }
+
+      // Save the task — use AI-cleaned text or raw reply as fallback
       pending.delete(userId);
-      // Combine the clarification answer with the original topic for an actionable task
-      const enriched = `${userText} — ${state.originalText.slice(0, 120)}`;
+      const taskText = saveAsText ?? userText;
+      const enriched = `${taskText} — ${state.originalText.slice(0, 120)}`;
       try {
         const data = await callInbox({ text: enriched, source: 'slack', project: 'learning_tech' });
         if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });

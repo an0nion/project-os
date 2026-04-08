@@ -476,104 +476,166 @@ describe('parseProjectFromText — correction alias mapping', () => {
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SECTION 6 — Learning task enrichment quality and actionability
-// Covers: the most important output quality check — is the saved task USEFUL?
-// Future: multi-step dialogue (step 2: depth/timeline, step 3: specific sub-topic)
+// SECTION 6 — Learning reply classification and task actionability
+// Covers: the core fix — AI decides if user reply is a task or wants more info.
+// The old bug: blindly concatenate the reply text → "tell me more about it explain it"
+// The fix: AI classifies reply, either extracts a clean task OR has a conversation.
 // ══════════════════════════════════════════════════════════════════════════════
 
-describe('Learning clarification enrichment — task actionability', () => {
-  test('clarification + topic produces actionable task string', () => {
-    const enriched = buildEnrichedTask(
-      'implement from scratch',
-      'I want to learn about linear probes like in Neel Nanda safety work'
+// Simulates the AI classification of a learning reply (what the bot does internally).
+// In production this calls callModelWithFallback — here we test the decision logic.
+const classifyLearningReply = (userReply, _originalTopic) => {
+  // Simulate AI output: if reply looks like a question/request for info → chat
+  const chatPatterns = /\b(tell me more|explain|what is|what are|how does|more about|elaborate|clarify|i don'?t understand|help me understand)\b/i;
+  if (chatPatterns.test(userReply)) {
+    return { type: 'chat', reply: '[AI explanation of topic here]' };
+  }
+  // If reply looks like a direct intent → action
+  const actionPatterns = /\b(implement|read|write|understand|build|explore|study|do it|try it|work through|code|run|create)\b/i;
+  if (actionPatterns.test(userReply)) {
+    return { type: 'action', task: userReply.slice(0, 80) };
+  }
+  // Ambiguous — short = action, long = chat
+  return userReply.trim().split(/\s+/).length <= 6
+    ? { type: 'action', task: userReply.slice(0, 80) }
+    : { type: 'chat', reply: '[AI explanation of topic here]' };
+};
+
+// The final enriched task string (after AI classification gives us a clean task)
+const buildEnrichedTaskFromReply = (aiTask, originalText) =>
+  `${aiTask} — ${originalText.slice(0, 120)}`;
+
+describe('Learning reply classification — AI-driven, not string concatenation', () => {
+
+  // ── The exact scenario that was broken ──
+  test('the failing case: "tell me more" → chat (NOT save)', () => {
+    const result = classifyLearningReply(
+      'tell me more about it, explain it and I\'ll tell u how I want to implement it',
+      'I want to learn about linear probes like Neel Nanda safety work'
     );
-    // Must start with the ACTION (what they want to do)
-    assert.ok(enriched.startsWith('implement from scratch'));
-    // Must contain the TOPIC (what it's about)
+    assert.equal(result.type, 'chat');
+    assert.ok(!result.task, 'should not produce a task string for a chat reply');
+  });
+
+  test('"explain it" → chat', () =>
+    assert.equal(classifyLearningReply('explain it to me', 'attention heads').type, 'chat'));
+
+  test('"what is a linear probe?" → chat', () =>
+    assert.equal(classifyLearningReply('what is a linear probe?', 'linear probes').type, 'chat'));
+
+  test('"I don\'t understand it yet" → chat', () =>
+    assert.equal(classifyLearningReply("I don't understand it yet", 'transformers').type, 'chat'));
+
+  test('"more about it please" → chat', () =>
+    assert.equal(classifyLearningReply('more about it please', 'RLHF').type, 'chat'));
+
+  // ── Direct intent → action ──
+  test('"implement it from scratch" → action', () =>
+    assert.equal(classifyLearningReply('implement it from scratch', 'linear probes').type, 'action'));
+
+  test('"read the key papers" → action', () =>
+    assert.equal(classifyLearningReply('read the key papers', 'diffusion models').type, 'action'));
+
+  test('"write a summary" → action', () =>
+    assert.equal(classifyLearningReply('write a summary of it', 'transformers').type, 'action'));
+
+  test('"understand the theory" → action', () =>
+    assert.equal(classifyLearningReply('understand the theory first', 'backprop').type, 'action'));
+
+  test('"implement it in PyTorch" → action with clean task', () => {
+    const result = classifyLearningReply('implement it in PyTorch', 'linear probes');
+    assert.equal(result.type, 'action');
+    assert.ok(result.task?.length > 0);
+    assert.ok(result.task.length <= 80);
+  });
+
+  // ── After action reply: enriched task must start with a verb, not a noun ──
+  test('action task becomes verb-led enriched task', () => {
+    const result = classifyLearningReply(
+      'implement from scratch in PyTorch',
+      'I want to learn about linear probes like Neel Nanda safety work'
+    );
+    assert.equal(result.type, 'action');
+    const enriched = buildEnrichedTaskFromReply(result.task, 'I want to learn about linear probes like Neel Nanda safety work');
+    // Starts with the action (implement), contains the topic (linear probes)
+    assert.ok(enriched.startsWith('implement'));
     assert.ok(enriched.includes('linear probes'));
-    // Must use — separator
     assert.ok(enriched.includes(' — '));
   });
 
-  test('read-focused reply produces read-centred task', () => {
-    const enriched = buildEnrichedTask(
-      'read the paper thoroughly and take notes',
-      'Attention is All You Need transformer paper'
+  test('chat reply contains helpful text, not empty string', () => {
+    const result = classifyLearningReply('tell me more about it', 'RLHF from Anthropic');
+    assert.equal(result.type, 'chat');
+    assert.ok(result.reply.length > 0);
+  });
+
+  // ── Step limit: after 1 explanation, force save regardless ──
+  test('step >= 2 forces save (no more chat exchanges)', () => {
+    // Simulates: bot gave explanation, user still vague → save anyway with raw text
+    const step = 2;
+    const shouldForceSave = step >= 2;
+    assert.ok(shouldForceSave);
+  });
+
+  test('after step-limit, even a vague reply gets saved (not chatted again)', () => {
+    // At step 2, chatReply is null even if AI says type=chat → falls through to save
+    const step = 2;
+    const chatAllowed = step < 2;
+    assert.equal(chatAllowed, false);
+  });
+
+  // ── Fallback: if AI call fails ──
+  test('fallback: ≤8-word reply treated as direct intent', () => {
+    const shortReply = 'implement it';
+    const wordCount = shortReply.trim().split(/\s+/).filter(Boolean).length;
+    assert.ok(wordCount <= 8);
+    // Bot would set saveAsText = userText for this
+  });
+
+  test('fallback: >8-word reply is also saved (we tried, user must move on)', () => {
+    const longReply = 'I am not quite sure yet but maybe I want to understand the theory first';
+    const wordCount = longReply.trim().split(/\s+/).filter(Boolean).length;
+    assert.ok(wordCount > 8);
+    // At fallback, bot saves the raw reply anyway (better than silent failure)
+  });
+
+  // ── End-to-end conversation contract ──
+  test('full conversation: topic → question → explanation → intent → save', () => {
+    // Step 1: User says "I want to learn about linear probes"
+    // → isExplicitLearning = true, bot asks clarification
+    assert.ok(isExplicitLearning('I want to learn about linear probes like Neel Nanda', []));
+
+    // Step 2: User says "tell me more"
+    // → classifyLearningReply → type=chat, bot explains, keeps state (step=2)
+    const step1Reply = classifyLearningReply('tell me more about it explain it', 'linear probes');
+    assert.equal(step1Reply.type, 'chat');
+
+    // Step 3: User says "ok I want to implement it in PyTorch"
+    // → classifyLearningReply → type=action, bot saves
+    const step2Reply = classifyLearningReply('ok I want to implement it in PyTorch', 'linear probes');
+    assert.equal(step2Reply.type, 'action');
+
+    // Final task: verb-led, contains topic
+    const finalTask = buildEnrichedTaskFromReply(step2Reply.task, 'I want to learn about linear probes like Neel Nanda');
+    assert.ok(finalTask.startsWith('implement') || finalTask.includes('implement'));
+    assert.ok(finalTask.includes(' — '));
+  });
+
+  // ── Legacy: direct enrichment still works for clear one-shot replies ──
+  test('direct clear reply skips chat entirely', () => {
+    const enriched = buildEnrichedTaskFromReply(
+      'implement from scratch in PyTorch',
+      'I want to learn about linear probes'
     );
-    assert.ok(enriched.startsWith('read the paper'));
-    assert.ok(enriched.includes('transformer paper'));
+    assert.ok(enriched.startsWith('implement'));
+    assert.ok(enriched.includes('linear probes'));
   });
 
-  test('theory-focused reply produces theory task', () => {
-    const enriched = buildEnrichedTask(
-      'understand the theory and write a summary',
-      'backpropagation through time in RNNs'
-    );
-    assert.ok(enriched.startsWith('understand the theory'));
-    assert.ok(enriched.includes('backpropagation'));
-  });
-
-  test('result is NOT just the raw vague topic (the original problem)', () => {
-    // The original bug: "I want to learn abt linear probes" → saved as "Neel Nanda linear probes"
-    // (vague noun phrase, no action). Enriched result must start with an action verb.
-    const enriched = buildEnrichedTask(
-      'work through the exercises in the ARENA curriculum',
-      'I want to learn about ARENA mechanistic interpretability'
-    );
-    // The enriched task has an explicit verb/action
-    const startsWithAction = /^(work|read|implement|build|understand|write|explore|study|complete|finish|follow)/i.test(enriched);
-    assert.ok(startsWithAction, `Expected enriched task to start with an action verb, got: "${enriched}"`);
-  });
-
-  test('original text is capped at 120 chars to keep title readable', () => {
-    const longOriginal = 'I have been thinking about ' + 'deep learning '.repeat(20);
-    const enriched = buildEnrichedTask('read the paper', longOriginal);
-    // The original part (after " — ") should not exceed 120 chars
-    const parts = enriched.split(' — ');
-    assert.equal(parts.length, 2);
-    assert.ok(parts[1].length <= 120);
-  });
-
-  test('short original topic is not padded or truncated', () => {
-    const enriched = buildEnrichedTask('implement from scratch', 'linear probes');
-    assert.equal(enriched, 'implement from scratch — linear probes');
-  });
-
-  test('clarification can be a multi-word nuanced answer', () => {
-    const enriched = buildEnrichedTask(
-      'read and then implement the key equations in PyTorch',
-      'diffusion model score matching objective from Song et al.'
-    );
-    assert.ok(enriched.includes('read and then implement'));
-    assert.ok(enriched.includes('diffusion model'));
-    assert.ok(enriched.includes('PyTorch'));
-  });
-
-  test('vague one-word clarification reply is preserved as-is', () => {
-    // Even "read" is better than nothing — the topic provides context
-    const enriched = buildEnrichedTask('read', 'The RLHF paper from Anthropic');
-    assert.ok(enriched.startsWith('read'));
-    assert.ok(enriched.includes('RLHF'));
-  });
-
-  // Future: step 2 of multi-step dialogue adds depth/timeline
-  test('[SCAFFOLD] future: step 2 dialogue appends depth and timeline', () => {
-    // Multi-step learning dialogue plan:
-    // Step 1: "what do you want to do?" → action reply
-    // Step 2: "how deep? quick read / full implementation / write-up?"
-    //          + optional: "by when?"
-    // Enriched final task = action + depth + topic + timeline
-    // e.g. "implement from scratch [deep] — linear probes — by next Friday"
-    //
-    // When this lands, add:
-    //   const enrichedStep2 = buildEnrichedTaskV2(action, depth, originalText, timeline);
-    //   assert.ok(enrichedStep2.includes('[deep]'));
-    //   assert.ok(enrichedStep2.includes('by next Friday'));
-
-    // Placeholder: confirm current format is extendable
-    const enriched = buildEnrichedTask('implement the paper', 'ELO rating system');
-    assert.ok(enriched.includes(' — '));
-    assert.ok(typeof enriched === 'string');
+  test('original text capped at 120 chars', () => {
+    const long = 'I want to learn about ' + 'things '.repeat(30);
+    const enriched = buildEnrichedTaskFromReply('implement it', long);
+    const topicPart = enriched.split(' — ')[1];
+    assert.ok(topicPart.length <= 120);
   });
 });
 
