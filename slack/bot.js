@@ -343,14 +343,23 @@ app.message(async ({ message, say }) => {
       let saveAsText = null;
       let chatReply  = null;
 
+      // ── Build a clean, action-led Kanban title from the learning dialogue ────
+      // Format: "Verb phrase · topic" capped at 80 chars.
+      // Passed as forcedTitle to /api/inbox so the AI title extractor is bypassed.
+      const buildLearningTitle = (action, topic) => {
+        const topicSlug = topic.replace(/^i (want to learn|am learning|want to understand)\s+(about\s+)?/i, '').trim();
+        return `${action} · ${topicSlug}`.slice(0, 80);
+      };
+
       // ── Fast-path: bare action words need no AI ────────────────────────────
       const bareAction = /^(read|implement|write|understand|learn|theory|both|all)(\s+(it|the paper|more|about it|everything))?$/i.test(userText.trim());
       if (bareAction) {
         pending.delete(userId);
         const task     = userText.trim().toLowerCase();
+        const title    = buildLearningTitle(task, state.originalText);
         const enriched = `${task} — ${state.originalText.slice(0, 120)}`;
         try {
-          const data = await callInbox({ text: enriched, source: 'slack', project: 'learning_tech' });
+          const data = await callInbox({ text: enriched, title, source: 'slack', project: 'learning_tech' });
           await say({ text: buildSuccessMessage(data), thread_ts: threadTs });
         } catch { await say({ text: 'saved ✓', thread_ts: threadTs }); }
         return;
@@ -367,9 +376,10 @@ app.message(async ({ message, say }) => {
         // User said what to save (or anything non-negative) — save it
         pending.delete(userId);
         const saveText = userText.trim().slice(0, 60) || `Explore ${state.originalText.slice(0, 60)}`;
+        const title    = buildLearningTitle(saveText, state.originalText);
         const enriched = `${saveText} — ${state.originalText.slice(0, 120)}`;
         try {
-          const data = await callInbox({ text: enriched, source: 'slack', project: 'learning_tech' });
+          const data = await callInbox({ text: enriched, title, source: 'slack', project: 'learning_tech' });
           if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
           await app.client.chat.postMessage({
             channel: message.channel, text: buildSuccessMessage(data, {}),
@@ -466,9 +476,10 @@ Rules:
 
       // Save the clean task
       pending.delete(userId);
+      const title    = buildLearningTitle(saveAsText, state.originalText);
       const enriched = `${saveAsText} — ${state.originalText.slice(0, 120)}`;
       try {
-        const data = await callInbox({ text: enriched, source: 'slack', project: 'learning_tech' });
+        const data = await callInbox({ text: enriched, title, source: 'slack', project: 'learning_tech' });
         if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
         await app.client.chat.postMessage({
           channel: message.channel, text: buildSuccessMessage(data, {}),

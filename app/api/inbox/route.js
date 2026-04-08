@@ -151,7 +151,7 @@ function parseDeadlineDate(timeline) {
 }
 
 export async function POST(req) {
-  const { url, text, source, project: forcedProject, priority_tier, timeline } = await req.json();
+  const { url, text, source, project: forcedProject, priority_tier, timeline, title: forcedTitle } = await req.json();
 
   if (!url && !text) {
     return NextResponse.json({ error: 'url or text required' }, { status: 400 });
@@ -184,7 +184,7 @@ export async function POST(req) {
 
   // ── 2. Build a good item title ──────────────────────────────────────────────
   // For URL captures: fetch real page title. For text-only: use AI summary.
-  let itemTitle    = null;
+  let itemTitle    = forcedTitle?.trim().slice(0, 200) ?? null;   // caller-provided wins
   let itemDesc     = null;   // one-liner shown on the Kanban card
   let itemSubtitle = extractSubtitle(text);
 
