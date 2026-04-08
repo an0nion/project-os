@@ -318,35 +318,42 @@ app.message(async ({ message, say }) => {
     //   explanation of the topic, then ask again (max 1 exchange before forcing save)
     if (state.learningMode) {
       const step = state.step ?? 1;
-      let saveAsText  = null;   // AI-extracted actionable task
-      let chatReply   = null;   // explanation to send before asking again
+      let saveAsText = null;  // AI-extracted clean task — set ONLY on unambiguous action
+      let chatReply  = null;  // explanation to send — set when user still exploring
 
       try {
-        const result = await callModelWithFallback('gemini-flash', 'deepseek-chat', {
-          system: `You classify a conversational reply to help capture a personal learning task.
+        // Use deepseek-chat as primary here — it follows strict classification rules
+        // more reliably than Gemini Flash for ambiguous conversational inputs.
+        const result = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
+          system: `You are classifying a reply in a learning dialogue. Your job is to decide if the user has given a CLEAR TASK STATEMENT or is still exploring and needs more information.
 
-The user wants to learn about: "${state.originalText.slice(0, 200)}"
+Topic the user wants to learn: "${state.originalText.slice(0, 200)}"
 You asked: "what do you want to do with this — read, implement something, understand the theory, or write about it?"
 
 Return ONLY valid JSON (no markdown, no code fences):
 {
   "type": "action" | "chat",
-  "task": "verb-led task, max 80 chars (ONLY when type=action, e.g. 'implement a linear probe in PyTorch')",
-  "reply": "2-3 sentences explaining the topic + question nudging toward a specific intent (ONLY when type=chat)"
+  "task": "clean verb-led task, max 80 chars (ONLY when type=action)",
+  "reply": "2-3 sentences explaining the topic, end with: do you want to [implement / read / understand / write about] it? (ONLY when type=chat)"
 }
 
-type=action — ONLY when the reply is a complete, unconditional task statement:
-  EXAMPLES: "implement it from scratch" / "read the paper" / "understand the theory" / "write a summary" / "build a demo"
+DEFAULT TO type=chat. Only use type=action when the reply is a short, clean, unambiguous task and nothing else.
 
-type=chat — when the user wants explanation before committing, asks a question, or defers the decision:
-  EXAMPLES:
-  "tell me more about it, explain it and I'll tell you how I want to implement it" → chat (conditional: needs info FIRST)
-  "what is a linear probe?" → chat (question)
-  "I don't understand it yet" → chat (not ready)
-  "explain it then I'll decide" → chat (explicitly defers)
-  "how does it work?" → chat (question)
+type=action — the reply is ONLY a task. Nothing but the task. Examples:
+  "implement it from scratch" → action
+  "read the paper" → action
+  "understand the maths" → action
+  "write a summary" → action
 
-CRITICAL RULE: if the reply contains "after you explain", "I'll tell you", "once I understand", "then I'll decide", or ANY condition — it is type=chat regardless of whether it mentions implement/read/write. Only choose type=action when the entire reply is an unambiguous task with no conditions attached.`,
+type=chat — everything else. When in doubt, choose chat. Examples:
+  "I want to use it for AI safety but need to figure out a specific use case" → chat (uncertain, exploring)
+  "well I want to do X but I want to figure out Y first so can you tell me more" → chat (wants info first)
+  "tell me more about it" → chat
+  "can you explain how it works?" → chat
+  "I'll tell you how I want to use it after you explain" → chat (conditional)
+  "I'm not sure yet, what do people usually do with it?" → chat (question)
+
+RULE: if the reply mentions wanting to "figure out", asks a question, says they need more info, or is more than one sentence explaining their situation — it is type=chat. Only use type=action for a clean one-phrase task commitment.`,
           messages: [{ role: 'user', content: userText }],
           maxTokens: 220,
         });
@@ -359,25 +366,36 @@ CRITICAL RULE: if the reply contains "after you explain", "I'll tell you", "once
         if (parsed.type === 'action' && parsed.task) {
           saveAsText = parsed.task;
         } else if (parsed.type === 'chat' && parsed.reply && step < 2) {
-          // Only allow one explanation round — after that, force save whatever they say
           chatReply = parsed.reply;
+        } else if (parsed.type === 'chat' && step >= 2) {
+          // Step limit reached — save a generic exploratory task rather than raw text
+          saveAsText = `Explore and learn about ${state.originalText.slice(0, 60)}`;
         }
       } catch {
-        // Fallback: ≤8 words is probably a direct intent (implement, read, etc.)
-        if (userText.trim().split(/\s+/).filter(Boolean).length <= 8) saveAsText = userText;
+        // AI failed. At step 1: re-ask the question rather than saving garbage.
+        // At step 2: save a generic task so we don't loop forever.
+        if (step >= 2) {
+          saveAsText = `Explore and learn about ${state.originalText.slice(0, 60)}`;
+        }
       }
 
-      // Still wants to discuss → reply with context, keep state alive for one more turn
+      // User still exploring → respond with context, keep state alive for one more turn
       if (chatReply) {
         pending.set(userId, { ...state, step: step + 1 });
         await say(chatReply);
         return;
       }
 
-      // Save the task — use AI-cleaned text or raw reply as fallback
+      // No clear intent yet at step 1 (AI failed or unclear) → re-ask rather than save garbage
+      if (!saveAsText) {
+        // Keep pending state; re-prompt with clarification question
+        await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
+        return;
+      }
+
+      // Save the clean task
       pending.delete(userId);
-      const taskText = saveAsText ?? userText;
-      const enriched = `${taskText} — ${state.originalText.slice(0, 120)}`;
+      const enriched = `${saveAsText} — ${state.originalText.slice(0, 120)}`;
       try {
         const data = await callInbox({ text: enriched, source: 'slack', project: 'learning_tech' });
         if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });

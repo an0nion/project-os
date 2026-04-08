@@ -148,34 +148,38 @@ const TITLE_EXTRACTION_PROMPT = 'Extract the topic, concept, or event name from 
 
 /**
  * The exact system prompt sent to the AI when classifying a learning reply.
- * Tests verify this prompt's content to ensure it contains the right criteria.
  * MUST be kept in sync with bot.js learningMode handler.
  */
 const LEARNING_REPLY_SYSTEM_PROMPT = (originalText) =>
-`You classify a conversational reply to help capture a personal learning task.
+`You are classifying a reply in a learning dialogue. Your job is to decide if the user has given a CLEAR TASK STATEMENT or is still exploring and needs more information.
 
-The user wants to learn about: "${originalText.slice(0, 200)}"
+Topic the user wants to learn: "${originalText.slice(0, 200)}"
 You asked: "what do you want to do with this — read, implement something, understand the theory, or write about it?"
 
 Return ONLY valid JSON (no markdown, no code fences):
 {
   "type": "action" | "chat",
-  "task": "verb-led task, max 80 chars (ONLY when type=action, e.g. 'implement a linear probe in PyTorch')",
-  "reply": "2-3 sentences explaining the topic + question nudging toward a specific intent (ONLY when type=chat)"
+  "task": "clean verb-led task, max 80 chars (ONLY when type=action)",
+  "reply": "2-3 sentences explaining the topic, end with: do you want to [implement / read / understand / write about] it? (ONLY when type=chat)"
 }
 
-type=action — ONLY when the reply is a complete, unconditional task statement:
-  EXAMPLES: "implement it from scratch" / "read the paper" / "understand the theory" / "write a summary" / "build a demo"
+DEFAULT TO type=chat. Only use type=action when the reply is a short, clean, unambiguous task and nothing else.
 
-type=chat — when the user wants explanation before committing, asks a question, or defers the decision:
-  EXAMPLES:
-  "tell me more about it, explain it and I'll tell you how I want to implement it" → chat (conditional: needs info FIRST)
-  "what is a linear probe?" → chat (question)
-  "I don't understand it yet" → chat (not ready)
-  "explain it then I'll decide" → chat (explicitly defers)
-  "how does it work?" → chat (question)
+type=action — the reply is ONLY a task. Nothing but the task. Examples:
+  "implement it from scratch" → action
+  "read the paper" → action
+  "understand the maths" → action
+  "write a summary" → action
 
-CRITICAL RULE: if the reply contains "after you explain", "I'll tell you", "once I understand", "then I'll decide", or ANY condition — it is type=chat regardless of whether it mentions implement/read/write. Only choose type=action when the entire reply is an unambiguous task with no conditions attached.`;
+type=chat — everything else. When in doubt, choose chat. Examples:
+  "I want to use it for AI safety but need to figure out a specific use case" → chat (uncertain, exploring)
+  "well I want to do X but I want to figure out Y first so can you tell me more" → chat (wants info first)
+  "tell me more about it" → chat
+  "can you explain how it works?" → chat
+  "I'll tell you how I want to use it after you explain" → chat (conditional)
+  "I'm not sure yet, what do people usually do with it?" → chat (question)
+
+RULE: if the reply mentions wanting to "figure out", asks a question, says they need more info, or is more than one sentence explaining their situation — it is type=chat. Only use type=action for a clean one-phrase task commitment.`;
 
 /**
  * Decision logic: given a parsed AI JSON response and the current step,
@@ -194,12 +198,17 @@ function handleLearningReplyResult(parsed, step) {
 }
 
 /**
- * Fallback when AI call fails. Short replies (≤8 words) treated as direct intent.
- * Longer replies also saved via the `saveAsText ?? userText` chain in bot.js.
+ * Fallback when AI call fails.
+ * NEW behaviour (vs old): does NOT save raw userText at step=1.
+ * Instead returns null → bot re-asks the clarification question.
+ * At step=2, saves a generic "Explore and learn about [topic]" task.
  */
-function learningReplyFallback(userText) {
-  const words = userText.trim().split(/\s+/).filter(Boolean).length;
-  return { saveAsText: words <= 8 ? userText : null };
+function learningReplyFallback(userText, step, originalText) {
+  if (step >= 2) {
+    return { saveAsText: `Explore and learn about ${originalText.slice(0, 60)}` };
+  }
+  // step=1: return null → bot re-asks (does NOT save raw conversational text)
+  return { saveAsText: null };
 }
 
 /**
@@ -707,50 +716,44 @@ describe('Learning reply: step state machine', () => {
 
 describe('Learning reply: fallback when AI call fails', () => {
 
-  test('≤8-word reply → saveAsText = userText (treated as direct intent)', () => {
-    const { saveAsText } = learningReplyFallback('implement it from scratch');
-    assert.equal(saveAsText, 'implement it from scratch');
-  });
+  const topic = 'linear probes in neural networks';
 
-  test('exactly 8 words → saveAsText is set (boundary: 8 ≤ 8)', () => {
-    const msg = 'I want to implement this in PyTorch now';
-    const wordCount = msg.trim().split(/\s+/).filter(Boolean).length;
-    assert.equal(wordCount, 8); // exactly at boundary
-    const { saveAsText } = learningReplyFallback(msg);
-    assert.ok(saveAsText !== null);
-  });
-
-  test('8-word reply → sets saveAsText', () => {
-    const msg = 'implement the linear probe from scratch today';
-    const wordCount = msg.trim().split(/\s+/).filter(Boolean).length;
-    assert.equal(wordCount, 7); // 7 ≤ 8 → saves
-    const { saveAsText } = learningReplyFallback(msg);
-    assert.ok(saveAsText !== null);
-  });
-
-  test('>8-word reply → saveAsText is null (falls through to ?? userText)', () => {
-    const msg = 'tell me more about it explain it and then I will tell you how I want to implement it';
-    const wordCount = msg.trim().split(/\s+/).filter(Boolean).length;
-    assert.ok(wordCount > 8);
-    const { saveAsText } = learningReplyFallback(msg);
+  test('step=1 fallback → saveAsText is null (re-ask clarification, do not save)', () => {
+    const { saveAsText } = learningReplyFallback('implement it from scratch', 1, topic);
     assert.equal(saveAsText, null);
-    // In bot.js: taskText = saveAsText ?? userText → still saves raw text
   });
 
-  test('bot.js ?? chain: saveAsText=null falls back to userText', () => {
-    const userText = 'tell me more about linear probes and explain the math';
-    const saveAsText = null;
-    const taskText = saveAsText ?? userText;
-    assert.equal(taskText, userText); // always saves something
-  });
-
-  test('the exact failing message in fallback: >8 words → saveAsText null but still saves', () => {
-    const msg = 'tell me more about it, explain it and I\'ll tell u how I want to implement it';
-    const { saveAsText } = learningReplyFallback(msg);
+  test('step=1 fallback with long vague reply → still null (re-ask, never save garbage)', () => {
+    const msg = 'tell me more about it because I do not know what linear probes are yet';
+    const { saveAsText } = learningReplyFallback(msg, 1, topic);
     assert.equal(saveAsText, null);
-    // Falls back to userText via ?? — bot saves the raw text rather than crashing
-    const taskText = saveAsText ?? msg;
-    assert.ok(taskText.length > 0);
+  });
+
+  test('step=1 fallback with short clear reply → still null (AI handles action; fallback re-asks)', () => {
+    const { saveAsText } = learningReplyFallback('read the paper', 1, topic);
+    assert.equal(saveAsText, null);
+  });
+
+  test('step=2 fallback → saveAsText is generic "Explore and learn about [topic]"', () => {
+    const { saveAsText } = learningReplyFallback('still not sure', 2, topic);
+    assert.ok(saveAsText !== null);
+    assert.ok(saveAsText.startsWith('Explore and learn about'));
+    assert.ok(saveAsText.includes('linear probes'));
+  });
+
+  test('step=2 fallback uses originalText, not the current reply', () => {
+    const reply       = 'I still want to figure out what to do';
+    const originalTop = 'attention heads and induction circuits';
+    const { saveAsText } = learningReplyFallback(reply, 2, originalTop);
+    assert.ok(saveAsText.includes('attention heads'));
+    assert.ok(!saveAsText.includes('figure out what to do'));
+  });
+
+  test('step=2 fallback trims originalText to 60 chars', () => {
+    const longTopic = 'a'.repeat(80);
+    const { saveAsText } = learningReplyFallback('whatever', 2, longTopic);
+    // "Explore and learn about " (24 chars) + 60 chars of topic = max 84 chars
+    assert.ok(saveAsText.length <= 84);
   });
 });
 
@@ -817,46 +820,49 @@ describe('LEARNING_REPLY_SYSTEM_PROMPT — content validation', () => {
   });
 
   // ── type=chat criteria covers the exact failing scenario ──
-  test('prompt includes the exact failing message as a type=chat example', () => {
-    // This is the message that kept being saved incorrectly
-    assert.ok(prompt.includes("tell me more about it, explain it and I'll tell you how I want to implement it"));
-  });
-
-  test('prompt labels that message as → chat with the reason (conditional)', () => {
-    assert.ok(prompt.includes('conditional') || prompt.includes('needs info FIRST'));
-  });
-
-  test('prompt includes "what is a linear probe?" as chat example', () => {
-    assert.ok(prompt.includes('what is a linear probe'));
-  });
-
-  test('prompt includes "explain it then I\'ll decide" as chat example', () => {
-    assert.ok(prompt.includes("explain it then I'll decide"));
-  });
-
-  // ── CRITICAL conditional rule is present ──
-  test('prompt contains CRITICAL RULE about conditional phrasing', () => {
-    assert.ok(prompt.includes('CRITICAL RULE') || prompt.includes('CRITICAL:'));
-  });
-
-  test('prompt explicitly mentions "I\'ll tell you" as a condition → chat', () => {
+  test('prompt includes conditional phrasing ("I\'ll tell you") as a type=chat example', () => {
+    // "I'll tell you how I want to use it after you explain" is in the prompt
     assert.ok(prompt.includes("I'll tell you"));
   });
 
-  test('prompt explicitly mentions "once I understand" as a condition → chat', () => {
-    assert.ok(prompt.includes('once I understand'));
+  test('prompt labels conditional phrasing as → chat', () => {
+    assert.ok(prompt.includes('conditional') || prompt.includes('needs info FIRST'));
   });
 
-  test('prompt explicitly says type=action requires "no conditions"', () => {
-    assert.ok(prompt.includes('no conditions') || prompt.includes('unambiguous'));
+  test('prompt includes "can you explain how it works?" as chat example (question)', () => {
+    assert.ok(prompt.includes('explain how it works') || prompt.includes('can you explain'));
   });
 
-  test('prompt says mentioning implement/read/write inside a condition is still type=chat', () => {
-    // The key fix: "and I'll implement it" ≠ "implement it"
+  test('prompt includes "tell me more" phrasing as chat example', () => {
+    assert.ok(prompt.includes('tell me more'));
+  });
+
+  // ── Rule about conditional intent is present ──
+  test('prompt contains a RULE about conditional/exploratory phrasing → type=chat', () => {
+    assert.ok(prompt.includes('RULE') || prompt.includes('CRITICAL'));
+  });
+
+  test('prompt covers "figure out" intent → type=chat', () => {
+    assert.ok(prompt.includes('figure out'));
+  });
+
+  test('prompt covers "needs more info" intent → type=chat', () => {
     assert.ok(
-      prompt.includes('regardless of whether it mentions implement') ||
-      prompt.includes('regardless of whether')
+      prompt.includes('need more info') ||
+      prompt.includes('needs more info') ||
+      prompt.includes('needs information') ||
+      prompt.includes('need more information') ||
+      prompt.includes('more info')
     );
+  });
+
+  test('prompt explicitly says type=action requires unambiguous intent', () => {
+    assert.ok(prompt.includes('unambiguous'));
+  });
+
+  test('prompt requires type=action to be a clean, standalone task commitment', () => {
+    // Key rule: only a bare task phrase → action; everything else → chat
+    assert.ok(prompt.includes('clean') || prompt.includes('nothing but the task') || prompt.includes('only a task'));
   });
 });
 
@@ -939,11 +945,11 @@ describe('REGRESSION — "tell me more" must NOT save immediately', () => {
   // We verify by checking that the prompt's criteria text covers each case.
   const prompt = LEARNING_REPLY_SYSTEM_PROMPT('linear probes Neel Nanda safety');
 
-  test('Exact failing message is listed as type=chat example in prompt', () => {
-    // The prompt must contain this exact message as an example
-    assert.ok(
-      prompt.includes("tell me more about it, explain it and I'll tell you how I want to implement it")
-    );
+  test('Failing message pattern ("tell me more"+"I\'ll tell you") covered by type=chat criteria in prompt', () => {
+    // The prompt has "tell me more about it" and "I'll tell you how I want to use it after you explain"
+    // as separate type=chat examples — together they cover the failing pattern
+    assert.ok(prompt.includes('tell me more'));
+    assert.ok(prompt.includes("I'll tell you"));
   });
 
   test('"tell me more" phrasing is covered by type=chat criteria', () => {
@@ -1091,19 +1097,33 @@ describe('Full conversation simulation: topic → question → reply → [explai
     // In bot.js: taskText = saveAsText ?? userText → saves raw reply text
   });
 
-  test('FALLBACK PATH: AI fails → short reply saves, long reply also saves via ??', () => {
-    // Short reply fallback
-    const short = learningReplyFallback('implement it');
-    assert.ok(short.saveAsText !== null);
+  test('FALLBACK PATH: AI fails at step=1 → re-asks; at step=2 → saves generic task', () => {
+    const topic = 'linear probes in neural networks';
 
-    // Long reply fallback: saveAsText=null but bot.js uses ?? userText
-    const longMsg = 'tell me more about it because I do not understand what linear probes are yet';
-    const long = learningReplyFallback(longMsg);
-    assert.equal(long.saveAsText, null);
-    // ?? userText → taskText = long message itself
-    const taskText = long.saveAsText ?? longMsg;
-    assert.equal(taskText, longMsg);
-    assert.ok(taskText.length > 0);
+    // Step=1 fallback → null → bot re-asks (does NOT save garbage)
+    const step1 = learningReplyFallback('implement it', 1, topic);
+    assert.equal(step1.saveAsText, null);
+
+    // Step=2 fallback → saves generic "Explore and learn about [topic]"
+    const step2 = learningReplyFallback('still not sure', 2, topic);
+    assert.ok(step2.saveAsText !== null);
+    assert.ok(step2.saveAsText.startsWith('Explore and learn about'));
+    assert.ok(step2.saveAsText.includes('linear probes'));
+  });
+
+  test('STEP LIMIT: step=2 chat result → handleLearningReplyResult returns both null (bot.js adds generic inline)', () => {
+    // Pure function: type=chat at step=2 → chatReply blocked, saveAsText not set
+    // (bot.js inline sets saveAsText = "Explore and learn about..." directly)
+    const result = handleLearningReplyResult({ type: 'chat', reply: 'Still vague...' }, 2);
+    assert.equal(result.chatReply, null);
+    assert.equal(result.saveAsText, null);
+  });
+
+  test('FALLBACK: AI exception at step=2 → learningReplyFallback saves generic task', () => {
+    // learningReplyFallback is called when AI throws — step=2 → generic task
+    const fallback = learningReplyFallback('Still vague...', 2, 'linear probes');
+    assert.ok(fallback.saveAsText.startsWith('Explore and learn about'));
+    assert.ok(fallback.saveAsText.includes('linear probes'));
   });
 });
 
