@@ -370,16 +370,16 @@ type=chat: everything else — user wants more info, is exploring, asking questi
         // User gave a clear task — use their own words (enriched format adds topic context)
         saveAsText = userText.trim().slice(0, 60);
 
-      } else if (classifyType === 'chat' && step < 3) {
+      } else if (classifyType === 'chat' && step < 6) {
         // ── Call 2: generate plain-text explanation — no JSON, generous budget ──
         try {
           const explainResult = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
             system: `You are a helpful learning assistant. The user wants to learn about: "${state.originalText.slice(0, 150)}"
-Explain this topic in 2-3 sentences: what it is, why it matters, and how people typically use it.
-End with exactly one question: "Would you like to read about it, implement something, or understand the theory?"
+Answer the user's question or explore the topic with them. Be specific and informative.
+End with exactly one question to help them decide what to do next: "Would you like to read about it, implement something, or understand the theory?"
 Plain text only — no markdown, no lists, no bullet points.`,
             messages: [{ role: 'user', content: userText }],
-            maxTokens: 180,
+            maxTokens: 300,
           });
           logCostViaApi(explainResult.modelKey, explainResult.usage, 'learning_explain');
           chatReply = explainResult.text?.trim() ?? null;
@@ -387,11 +387,11 @@ Plain text only — no markdown, no lists, no bullet points.`,
           console.error('[learningMode] explain call failed:', err.message);
         }
 
-      } else if (classifyType === 'chat' && step >= 3) {
+      } else if (classifyType === 'chat' && step >= 6) {
         // Step limit — save generic task
         saveAsText = `Explore and learn about ${state.originalText.slice(0, 60)}`;
 
-      } else if (classifyType === null && step >= 2) {
+      } else if (classifyType === null && step >= 3) {
         // AI failed twice — save generic rather than loop forever
         saveAsText = `Explore and learn about ${state.originalText.slice(0, 60)}`;
       }
