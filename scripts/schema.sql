@@ -160,6 +160,26 @@ create trigger trg_batch_jobs_updated
   before update on batch_jobs
   for each row execute function update_timestamp();
 
+-- ── Generic items table (Kanban cards for all non-application projects) ────────
+-- One row per card. Status values are project-specific (defined in lib/projects.js columns).
+create table if not exists items (
+  id          uuid primary key default gen_random_uuid(),
+  project_key text not null,
+  title       text not null,
+  subtitle    text,              -- subject, author, org, etc.
+  status      text not null default 'backlog',
+  due_date    timestamptz,
+  url         text,
+  notes       text,
+  position    int not null default 0,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+create index if not exists idx_items_project on items(project_key, status, position);
+create trigger trg_items_updated
+  before update on items
+  for each row execute function update_timestamp();
+
 -- ── Disable Row Level Security (single-user app — RLS would return empty queries) ──
 -- If you ever add multi-user auth, re-enable RLS and add policies instead.
 alter table applications       disable row level security;
@@ -172,6 +192,7 @@ alter table messages           disable row level security;
 alter table profile            disable row level security;
 alter table cost_log           disable row level security;
 alter table batch_jobs         disable row level security;
+alter table items              disable row level security;
 
 -- ── Seed: default base answer categories (empty, user fills these in) ──
 insert into base_answers (category, content) values

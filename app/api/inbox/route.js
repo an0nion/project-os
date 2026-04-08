@@ -1,11 +1,19 @@
 /**
  * POST /api/inbox
  * Universal entry point for all captured items (Slack, bookmarklet, PWA share target).
- * Routes the item to a project via keyword match then AI fallback (free model).
+ * Routes the item to a project, then creates a Kanban card in the right table.
  *
- * Body: { url?, text?, source? }
- * Response: { project, projectLabel, confidence, summary, suggested_action, is_new_task,
- *             appId?, questionsCount?, deadline?, routedBy, routingCost }
+ * Body: { url?, text?, source?, project? }
+ *   project: optional forced project key (used by Slack bot after clarification)
+ *
+ * Behaviour by project type:
+ *   research_apps — scrapes URL, creates row in applications + questions tables
+ *   all others    — creates row in items table (generic Kanban card)
+ *   GitHub/GitLab — never scraped; always creates an item (not an application)
+ *
+ * Response: { project, projectLabel, confidence, summary, suggested_action,
+ *             is_new_task, itemId?, appId?, questionsCount?, deadline?,
+ *             routedBy, routingCost }
  */
 
 import { NextResponse }      from 'next/server';
@@ -21,16 +29,15 @@ export async function POST(req) {
     return NextResponse.json({ error: 'url or text required' }, { status: 400 });
   }
 
-  // ── Route to project ────────────────────────────────────────────────────────
-  // forcedProject: set by Slack bot after clarification flow (bypasses AI routing)
+  // ── 1. Route to project ─────────────────────────────────────────────────────
   let project, projectLabel, confidence, summary, suggested_action, is_new_task;
 
   if (forcedProject) {
-    const pDef   = PROJECTS.find(p => p.key === forcedProject);
+    const pDef       = PROJECTS.find(p => p.key === forcedProject);
     project          = forcedProject;
     projectLabel     = pDef?.label ?? forcedProject;
     confidence       = 1.0;
-    summary          = (text || url || '').slice(0, 80);
+    summary          = (text || url || '').slice(0, 120);
     suggested_action = 'Add to project';
     is_new_task      = true;
   } else {
@@ -38,7 +45,11 @@ export async function POST(req) {
     ({ project, projectLabel, confidence, summary, suggested_action, is_new_task } = await route(routeInput));
   }
 
-  // ── Scrape URL if provided (skip GitHub — it's not a job application) ──────
+  const projectDef = PROJECTS.find(p => p.key === project);
+  const firstCol   = projectDef?.columns?.[0]?.key ?? 'backlog';
+
+  // ── 2. Create a card ────────────────────────────────────────────────────────
+  let itemId         = null;
   let appId          = null;
   let questionsCount = 0;
   let deadline       = null;
@@ -46,18 +57,19 @@ export async function POST(req) {
 
   const isGitHub = url && (url.includes('github.com') || url.includes('gitlab.com'));
 
-  if (url && !isGitHub) {
+  if (project === 'research_apps' && url && !isGitHub) {
+    // research_apps: scrape URL → applications + questions tables
     const scraped = await scrapeApplication(url);
 
     if (!scraped.error) {
       const { data: app, error: appErr } = await supabase
         .from('applications')
         .insert({
-          name:          scraped.position || 'Untitled Application',
+          name:          scraped.position || summary || 'Untitled Application',
           org:           scraped.org      || 'Unknown',
           url,
           deadline:      scraped.deadline || null,
-          status:        'backlog',
+          status:        firstCol,
           project_key:   project,
           scrape_method: scraped.method,
         })
@@ -84,14 +96,33 @@ export async function POST(req) {
     } else {
       scrapeError = scraped.error;
     }
+  } else {
+    // All other projects (or research_apps without URL): items table
+    const title = summary || (url ? url.split('/').filter(Boolean).pop() : text?.slice(0, 80)) || 'Untitled';
+
+    try {
+      const { data: item } = await supabase
+        .from('items')
+        .insert({
+          project_key: project,
+          title:       title.slice(0, 200),
+          subtitle:    null,
+          status:      firstCol,
+          url:         url ?? null,
+          notes:       text && url ? text : null,   // keep original text as notes if we also have a url
+        })
+        .select()
+        .single();
+      if (item) itemId = item.id;
+    } catch { /* non-fatal — item creation failure shouldn't break inbox */ }
   }
 
-  // ── Audit log ───────────────────────────────────────────────────────────────
+  // ── 3. Audit log ────────────────────────────────────────────────────────────
   try {
     await supabase.from('inbox_log').insert({
-      source:  source ?? 'unknown',
-      url:     url    ?? null,
-      text:    text   ?? null,
+      source:  source  ?? 'unknown',
+      url:     url     ?? null,
+      text:    text    ?? null,
       project,
       summary,
     });
@@ -104,13 +135,13 @@ export async function POST(req) {
     summary,
     suggested_action,
     is_new_task,
+    itemId,
     appId,
     questionsCount,
     deadline,
-    routedBy:    'gemini-flash',
+    routedBy:    'router',
     routingCost: 0,
     source:      source ?? 'unknown',
-    ...(scrapeError ? { error: scrapeError } : {}),
+    ...(scrapeError ? { scrapeError } : {}),
   });
 }
-// cache bust Wed Apr  8 00:04:37 AUSEST 2026
