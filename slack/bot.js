@@ -11,7 +11,7 @@
 
 import 'dotenv/config';
 import bolt from '@slack/bolt';
-import { chatWithModel } from '../lib/multiModelClient.js';
+import { callModelWithFallback } from '../lib/multiModelClient.js';
 
 const { App } = bolt;
 
@@ -121,7 +121,8 @@ async function classifyIntent(text, urls) {
   const userContent = `Message: ${text || '(empty)'}${hasUrls ? `\nURLs: ${urlList}` : ''}`;
 
   try {
-    const result = await chatWithModel('gemini-flash', {
+    // Gemini primary, DeepSeek fallback — handles Gemini 429 rate limits automatically
+    const result = await callModelWithFallback('gemini-flash', 'deepseek-chat', {
       system:    INTENT_SYSTEM_PROMPT,
       messages:  [{ role: 'user', content: userContent }],
       maxTokens: 150,
@@ -328,6 +329,24 @@ app.message(async ({ message, say }) => {
 
     // New URL arrived → drop pending, fall through to fresh handling
     pending.delete(userId);
+  }
+
+  // ── Fast path: pure URL with no extra context → always a save, skip AI ──────
+  // The router classifies the URL content. No need to call Gemini just to
+  // confirm that a bare URL is a "save" intent.
+  const textWithoutUrls = urls.reduce((t, u) => t.replace(u, ''), userText).trim();
+  const isPureUrl = urls.length > 0 && textWithoutUrls.length < 20;
+
+  if (isPureUrl) {
+    const url = urls[0];
+    try {
+      const data = await callInbox({ url, source: 'slack' });
+      if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
+      await reply(message.channel, buildSuccessMessage(data, {}));
+    } catch {
+      await say("couldn't save that");
+    }
+    return;
   }
 
   // ── Fresh message — classify intent with AI ───────────────────────────────

@@ -26,7 +26,7 @@ import { route }                  from '../../../lib/router.js';
 import { scrapeApplication }      from '../../../scraper/index.js';
 import { supabase }               from '../../../lib/supabase.js';
 import { PROJECTS }               from '../../../lib/projects.js';
-import { chatWithModel }          from '../../../lib/multiModelClient.js';
+import { callModelWithFallback }  from '../../../lib/multiModelClient.js';
 import { logCost }                from '../../../lib/costTracker.js';
 
 // ── Fetch page HTML (title + body text for AI summary) ───────────────────────
@@ -76,7 +76,7 @@ async function generateDescription(title, bodyText, url) {
   if (!bodyText && !title) return null;
   const content = [title, bodyText].filter(Boolean).join('\n').slice(0, 1200);
   try {
-    const result = await chatWithModel('gemini-flash', {
+    const result = await callModelWithFallback('gemini-flash', 'deepseek-chat', {
       system:   'You write one-sentence descriptions of web pages. Be specific and factual — describe what it actually is and does, not marketing language. Max 20 words. No full stop at the end.',
       messages: [{ role: 'user', content: `URL: ${url}\n\n${content}` }],
       maxTokens: 60,
@@ -117,12 +117,8 @@ export async function POST(req) {
   let modelConfidence = null;
 
   if (forcedProject) {
-    // Bot forced routing after clarification — still run router to capture prediction
-    const routeInput = text || url;
-    const prediction = await route(routeInput).catch(() => null);
-    modelProject     = prediction?.project    ?? null;
-    modelConfidence  = prediction?.confidence ?? null;
-
+    // Bot already classified this — skip the router entirely.
+    // modelProject stays null: we don't have a meaningful prediction to log.
     const pDef       = PROJECTS.find(p => p.key === forcedProject);
     project          = forcedProject;
     projectLabel     = pDef?.label ?? forcedProject;
@@ -163,7 +159,7 @@ export async function POST(req) {
     } else if (text) {
       // For text-only: use AI to extract a clean short title (event/org name etc.)
       try {
-        const result = await chatWithModel('gemini-flash', {
+        const result = await callModelWithFallback('gemini-flash', 'deepseek-chat', {
           system:   'Extract the name of the event, program, or topic from this text. Return only the name — no explanation, no punctuation at the end. Max 8 words.',
           messages: [{ role: 'user', content: text.slice(0, 600) }],
           maxTokens: 30,
