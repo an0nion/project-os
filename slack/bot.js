@@ -132,6 +132,8 @@ async function classifyIntent(text, urls) {
       maxTokens: 150,
     });
 
+    logCostViaApi(result.modelKey, result.usage, 'intent_classification');
+
     const raw    = result.text?.trim() ?? '';
     const json   = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
     const parsed = JSON.parse(json);
@@ -158,6 +160,16 @@ async function classifyIntent(text, urls) {
       corrected_project: null, needs_clarification: false,
     };
   }
+}
+
+// ── Cost logging via API (avoids importing supabase on the VM) ────────────────
+function logCostViaApi(modelKey, usage, reason) {
+  if (!process.env.APP_URL || !usage) return;
+  fetch(`${process.env.APP_URL}/api/costs/log`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
+    body:    JSON.stringify({ modelKey, usage, reason }),
+  }).catch(() => {}); // fire-and-forget, non-fatal
 }
 
 // ── Correction API call ───────────────────────────────────────────────────────
