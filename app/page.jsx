@@ -85,7 +85,10 @@ export default function Dashboard() {
 
   return (
     <main style={styles.main}>
-      <h1 style={styles.heading}>Project OS</h1>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
+        <h1 style={{ ...styles.heading, marginBottom: 0 }}>Project OS</h1>
+        <a href="/costs" style={{ fontSize: '0.78rem', color: '#555', textDecoration: 'none' }}>costs</a>
+      </div>
 
       {/* ── Inbox capture bar ─────────────────────────────────────────── */}
       <form onSubmit={handleCapture} style={styles.inboxForm}>
@@ -175,10 +178,9 @@ const styles = {
     padding:   '2rem 1rem',
   },
   heading: {
-    fontSize:     '1.6rem',
-    fontWeight:   700,
-    marginBottom: '1.5rem',
-    color:        '#e8eaf0',
+    fontSize:  '1.6rem',
+    fontWeight: 700,
+    color:      '#e8eaf0',
   },
   inboxForm: {
     display:      'flex',
