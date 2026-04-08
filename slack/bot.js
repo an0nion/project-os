@@ -99,55 +99,38 @@ async function callInbox(body) {
   return JSON.parse(text);
 }
 
-// ── Natural response builder ──────────────────────────────────────────────────
+// ── Minimal success reply ─────────────────────────────────────────────────────
+// One line, embedded link, no buttons, no blocks.
+// Format: "saved to learning — <url|Title> · 1-2 months"
 function buildSuccessMessage(data, ctx) {
-  const title   = data.summary ?? 'Saved';
-  const project = data.projectLabel ?? data.project;
-  const appUrl  = `${process.env.APP_URL}/project/${data.project}`;
+  const title   = data.summary;
+  const url     = data.itemId || data.appId
+    ? `${process.env.APP_URL}/project/${data.project}`
+    : null;
 
-  let lead = '';
-  switch (data.project) {
-    case 'learning_tech':
-      lead = ctx.context === 'personal'
-        ? `Saved to your learning list 📚`
-        : `Saved to Learning & Tech 📚`;
-      break;
-    case 'work':
-      lead = ctx.urgency === 'urgent' ? `Added to work — flagged as urgent 💼` : `Added to your work list 💼`;
-      break;
-    case 'school':
-      lead = `Added to school 🎓`;
-      break;
-    case 'research_apps':
-      lead = `Saved to research applications 🔬`;
-      break;
-    default:
-      lead = `Saved to ${project}`;
-  }
+  const projectEmoji = {
+    learning_tech:  '📚',
+    work:           '💼',
+    school:         '🎓',
+    research_apps:  '🔬',
+    baking:         '🍞',
+    beadwork:       '📿',
+    art:            '🎨',
+    reading:        '📖',
+    exercise:       '💪',
+    circuitry:      '⚡',
+  }[data.project] ?? '📁';
 
-  // Build detail line
-  const details = [];
-  if (title && title !== data.url) details.push(`*${title}*`);
-  if (ctx.timeline) details.push(`~${ctx.timeline}`);
-  if (ctx.urgency === 'urgent') details.push('needs attention soon');
-  if (data.questionsCount > 0) details.push(`${data.questionsCount} questions extracted`);
+  const parts = [];
 
-  const text = [lead, details.join(' · ')].filter(Boolean).join('\n');
+  // Title as embedded link if we have a project URL
+  if (title && url) parts.push(`<${url}|${title}>`);
+  else if (title)   parts.push(title);
 
-  return {
-    text,
-    blocks: [
-      { type: 'section', text: { type: 'mrkdwn', text } },
-      {
-        type: 'actions',
-        elements: [{
-          type: 'button', style: 'primary', action_id: 'open_app',
-          text: { type: 'plain_text', text: 'Open in app' },
-          url:  appUrl,
-        }],
-      },
-    ],
-  };
+  if (ctx.timeline) parts.push(ctx.timeline);
+
+  const detail = parts.join(' · ');
+  return `${projectEmoji} ${detail || 'saved'}`;
 }
 
 // ── Parse clarification reply for both context + timeline ─────────────────────
@@ -186,7 +169,7 @@ app.message(async ({ message, say }) => {
       const reply = parseClarificationReply(userText);
 
       if (!reply.context) {
-        await say('Work or personal? Just those two words is fine.');
+        await say('work or personal?');
         return;
       }
 
@@ -203,8 +186,8 @@ app.message(async ({ message, say }) => {
       try {
         const data = await callInbox({ url: state.url, text: enrichedText, source: 'slack', project });
         await say(buildSuccessMessage(data, reply));
-      } catch (err) {
-        await say(`Couldn't save that: ${err.message}`);
+      } catch {
+        await say('couldn\'t save that');
       }
       return;
     }
@@ -227,15 +210,15 @@ app.message(async ({ message, say }) => {
           ...(project ? { project } : {}),
         });
         await say(buildSuccessMessage(data, ctx));
-      } catch (err) {
-        await say(`Couldn't save that — ${err.message}`);
+      } catch {
+        await say('couldn\'t save that');
       }
       return;
     }
 
-    // Ambiguous → ask one question
+    // Ambiguous → ask one short question
     pending.set(userId, { url, text: userText, step: 1 });
-    await say('Work or personal? And roughly when?');
+    await say('work or personal?');
     return;
   }
 
@@ -243,21 +226,21 @@ app.message(async ({ message, say }) => {
   if (userText.trim()) {
     if (isAmbiguous(userText, [], ctx)) {
       pending.set(userId, { url: null, text: userText, step: 1 });
-      await say('Work or personal? And roughly when?');
+      await say('work or personal?');
       return;
     }
 
     try {
       const data = await callInbox({ text: userText, source: 'slack' });
       await say(buildSuccessMessage(data, ctx));
-    } catch (err) {
-      await say(`Couldn't save that — ${err.message}`);
+    } catch {
+      await say('couldn\'t save that');
     }
     return;
   }
 
   // ── Empty / unrecognised ──────────────────────────────────────────────────
-  await say('Send me a link or tell me something and I\'ll file it away.');
+  await say('send me a link or a note');
 });
 
 // ── Build enriched text for routing context ───────────────────────────────────

@@ -27,23 +27,40 @@ import { scrapeApplication } from '../../../scraper/index.js';
 import { supabase }          from '../../../lib/supabase.js';
 import { PROJECTS }          from '../../../lib/projects.js';
 
-// ── Lightweight page title fetch (not a full scrape) ─────────────────────────
-async function fetchPageTitle(url) {
+// ── Fetch page title + meta description ──────────────────────────────────────
+function decodeHtmlEntities(str) {
+  return str
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .trim();
+}
+
+async function fetchPageMeta(url) {
   try {
-    const res = await fetch(url, {
-      signal:  AbortSignal.timeout(4000),
+    const res  = await fetch(url, {
+      signal:  AbortSignal.timeout(5000),
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProjectOS/1.0)' },
     });
-    const html  = await res.text();
-    // Grab <title> — usually in first 2 KB, no need for full parse
-    const match = html.match(/<title[^>]*>([^<]{1,200})<\/title>/i);
-    if (!match) return null;
-    return match[1]
-      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-      .replace(/&#x27;/g, "'").replace(/&quot;/g, '"')
-      .trim();
+    // Read only first 8 KB — title and meta are always in <head>
+    const reader = res.body.getReader();
+    let html = '';
+    while (html.length < 8000) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      html += new TextDecoder().decode(value);
+    }
+    reader.cancel();
+
+    const titleMatch = html.match(/<title[^>]*>([^<]{1,200})<\/title>/i);
+    const descMatch  = html.match(/<meta[^>]+(?:name=["']description["']|property=["']og:description["'])[^>]+content=["']([^"']{1,300})["']/i)
+                    ?? html.match(/<meta[^>]+content=["']([^"']{1,300})["'][^>]+(?:name=["']description["']|property=["']og:description["'])/i);
+
+    return {
+      title:       titleMatch ? decodeHtmlEntities(titleMatch[1]) : null,
+      description: descMatch  ? decodeHtmlEntities(descMatch[1])  : null,
+    };
   } catch {
-    return null;
+    return { title: null, description: null };
   }
 }
 
@@ -92,19 +109,19 @@ export async function POST(req) {
   // ── 2. Build a good item title ──────────────────────────────────────────────
   // For URL captures: fetch real page title. For text-only: use AI summary.
   let itemTitle    = null;
+  let itemDesc     = null;   // one-liner shown on the Kanban card
   let itemSubtitle = extractSubtitle(text);
 
   if (url) {
-    // Fetch real page title — much better than URL slug or truncated text
-    itemTitle = await fetchPageTitle(url);
+    const meta = await fetchPageMeta(url);
+    itemTitle = meta.title;
+    itemDesc  = meta.description;
   }
 
   if (!itemTitle) {
-    // Fall back to AI router summary, or last URL path segment
     if (summary && summary !== (text || url || '').slice(0, 80)) {
       itemTitle = summary;
     } else if (url) {
-      // e.g. github.com/google-research/timesfm → "timesfm"
       const slug = url.split('/').filter(Boolean).pop()?.replace(/[-_]/g, ' ') ?? '';
       const host = new URL(url).hostname.replace('www.', '');
       itemTitle = slug ? `${slug} — ${host}` : host;
@@ -179,8 +196,8 @@ export async function POST(req) {
           title:       itemTitle.slice(0, 200),
           subtitle:    itemSubtitle,
           status:      firstCol,
-          url:         url  ?? null,
-          notes:       text ?? null,
+          url:         url      ?? null,
+          notes:       itemDesc ?? null,   // one-liner description for card
         })
         .select()
         .single();
@@ -204,6 +221,7 @@ export async function POST(req) {
     projectLabel,
     confidence,
     summary:          itemTitle ?? summary,
+    description:      itemDesc  ?? null,
     suggested_action,
     is_new_task,
     itemId,

@@ -68,9 +68,14 @@ function ItemCard({ item, isActive, accentColor, onSelect, onStatusChange, colum
           {item.subtitle}
         </div>
       )}
-      <div style={{ fontSize: '0.88rem', fontWeight: 600, color: '#e8eaf0', marginBottom: '0.3rem', lineHeight: 1.3 }}>
+      <div style={{ fontSize: '0.88rem', fontWeight: 600, color: '#e8eaf0', marginBottom: '0.2rem', lineHeight: 1.3 }}>
         {item.title}
       </div>
+      {item.notes && (
+        <div style={{ fontSize: '0.75rem', color: '#6b7280', marginBottom: '0.25rem', lineHeight: 1.4 }}>
+          {item.notes.length > 100 ? item.notes.slice(0, 100) + '…' : item.notes}
+        </div>
+      )}
       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
         <DeadlineBadge date={item.due_date} />
         {item.extra?.questions?.length > 0 && (
