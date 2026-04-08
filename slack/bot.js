@@ -403,6 +403,63 @@ app.message(async ({ message, say }) => {
       return;
     }
 
+    // Reminder date prompt — user is answering "when is this?"
+    if (state.reminderMode) {
+      const lc = userText.toLowerCase().trim();
+      const isToDoReply = /^(to.?do|td|my list|add to list|no date|just add it|whenever)$/i.test(lc);
+
+      if (isToDoReply) {
+        // Save to personal Kanban, no calendar
+        pending.delete(userId);
+        try {
+          const data = await callInbox({
+            text:    state.reminderTitle,
+            title:   state.reminderTitle,
+            source:  'slack',
+            project: 'personal',
+          });
+          if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: state.reminderTitle });
+          await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${state.reminderTitle.slice(0, 60)}> · added to your to-do list`);
+        } catch { await say("couldn't save that"); }
+        return;
+      }
+
+      // User gave a date — parse it and route to calendar
+      const date = parseTimelineToDate(userText) ?? parseTimelineToDate(userText.replace(/^(on|at|by|this|next)\s+/i, ''));
+      if (!date) {
+        // Couldn't parse — re-ask once then save as to-do
+        const reask = (state.reminderReask ?? 0) + 1;
+        if (reask >= 2) {
+          pending.delete(userId);
+          try {
+            await callInbox({ text: state.reminderTitle, title: state.reminderTitle, source: 'slack', project: 'personal' });
+            await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${state.reminderTitle.slice(0, 60)}> · added to your to-do list`);
+          } catch { await say("couldn't save that"); }
+          return;
+        }
+        pending.set(userId, { ...state, reminderReask: reask });
+        await say(`didn't catch a date — try "this Saturday", "13th", "in 2 weeks", or say *to do* to add to your list`);
+        return;
+      }
+
+      // Got a valid date — create calendar event
+      pending.delete(userId);
+      const colorId = pickCalendarColor('personal', state.originalText);
+      let calCreated = false;
+      if (process.env.CALENDAR_ENABLED === 'true') {
+        try {
+          const calRes = await fetch(`${process.env.APP_URL}/api/calendar/event`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
+            body:    JSON.stringify({ title: state.reminderTitle, date, colorId, description: state.originalText }),
+          });
+          calCreated = calRes.ok;
+        } catch (err) { console.error('[calendar] event creation failed:', err.message); }
+      }
+      await say(`📅 ${state.reminderTitle} · ${userText.trim()}${calCreated ? ' · added to calendar' : ''}`);
+      return;
+    }
+
     // Learning clarification mode — two-call architecture:
     // Call 1: classify reply as "action" or "chat" — tiny JSON, 60 tokens, never truncates
     // Call 2: if chat, conversational response with full history — plain text, 500 tokens
@@ -718,10 +775,10 @@ Rules:
   }
 
   // Reminder intent:
-  //   Has date → calendar only (one-off, date is the point — no Kanban clutter)
-  //   No date  → personal Kanban only (ongoing reference, no date to anchor to)
+  //   Has date upfront → calendar immediately
+  //   No date → ask "when is this?" — user replies with date or "to do"
   if (cls.intent === 'reminder') {
-    // ── AI: extract clean actionable title, strip filler ─────────────────────
+    // ── AI: extract clean actionable title ───────────────────────────────────
     let reminderTitle = null;
     try {
       const tr = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
@@ -734,7 +791,6 @@ Rules:
     } catch { /* fallback below */ }
 
     if (!reminderTitle) {
-      // Simple regex fallback
       reminderTitle = userText
         .replace(/^(set (a )?reminder (for \S+ )?to|remind me to)\s*/i, '')
         .replace(/\s+(on|at|by|this|next)\s+\S.*$/i, '')
@@ -742,10 +798,8 @@ Rules:
       reminderTitle = reminderTitle.charAt(0).toUpperCase() + reminderTitle.slice(1);
     }
 
-    const hasDate = !!cls.timeline;
-
-    if (hasDate) {
-      // ── Date set → calendar only ────────────────────────────────────────────
+    if (cls.timeline) {
+      // ── Date provided upfront → calendar immediately ──────────────────────
       const date    = parseTimelineToDate(cls.timeline);
       const colorId = pickCalendarColor(cls.project_hint ?? 'personal', userText);
       let calCreated = false;
@@ -760,24 +814,12 @@ Rules:
           calCreated = calRes.ok;
         } catch (err) { console.error('[calendar] event creation failed:', err.message); }
       }
-
-      const dateLabel = cls.timeline ?? date ?? '';
-      await say(`📅 ${reminderTitle}${dateLabel ? ` · ${dateLabel}` : ''}${calCreated ? ' · added to calendar' : ''}`);
+      await say(`📅 ${reminderTitle} · ${cls.timeline}${calCreated ? ' · added to calendar' : ''}`);
 
     } else {
-      // ── No date → personal Kanban only ──────────────────────────────────────
-      try {
-        const data = await callInbox({
-          text:    userText,
-          title:   reminderTitle,
-          source:  'slack',
-          project: 'personal',
-        });
-        if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: reminderTitle });
-        await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${reminderTitle.slice(0, 60)}>`);
-      } catch {
-        await say("couldn't save that");
-      }
+      // ── No date → ask ─────────────────────────────────────────────────────
+      pending.set(userId, { reminderMode: true, reminderTitle, originalText: userText });
+      await say(`when is this? (or say *to do* to add to your list)`);
     }
     return;
   }
