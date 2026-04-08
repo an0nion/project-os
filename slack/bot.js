@@ -415,11 +415,11 @@ Topic the user is exploring: "${state.originalText.slice(0, 150)}"
 
 Rules:
 - Do NOT re-introduce or define the topic from scratch — respond directly to what the user just said.
-- Be specific: cite real papers, researchers, findings, and benchmarks by name when you know them. If something is a landmark result or recent breakthrough, say so naturally.
-- If you reference a paper or line of work worth following up on, note it in passing — e.g. "that's worth adding to a reading queue" or "the Marks et al. 2023 paper on this is surprisingly accessible".
-- Write like a colleague who knows this area deeply: skip "Great question!", no textbook openers, no bullet points, no headers.
-- End with something specific to the thread of this conversation — an observation or question that opens the next line of inquiry. Not a menu of options.
-- Plain text only. Around 4-5 sentences.`,
+- Match length to the user's question: short exploratory question → 2-3 sentences max. Detailed technical question → up to 5-6 sentences. Default to shorter.
+- Be specific: cite real papers, researchers, findings by name when you know them. Mention them naturally, not as a list.
+- Write like a colleague: no "Great question!", no textbook openers, no bullet points, no headers.
+- End with a specific observation or question that opens the next line of inquiry. Not a menu of options.
+- Plain text only.`,
             messages: [...history, { role: 'user', content: userText }],
             maxTokens: 500,
           });
