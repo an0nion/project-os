@@ -25,18 +25,18 @@ const app = new App({
 // colorId 1-11 per Google Calendar API. No calendar switching needed.
 function pickCalendarColor(project, text) {
   const t = (text ?? '').toLowerCase();
-  if (/\bfinal exam|finals\b/.test(t))                                      return '6';  // Tangerine — orange — Exam
-  if (/\bassignment|\bhomework\b|\bhw\b|due date|submit|graded\b/.test(t))  return '3';  // Grape     — purple — Graded
-  if (/\bbirthday|bday\b/.test(t))                                          return '5';  // Banana    — yellow — Birthdays
-  if (/\bdoctor|dentist|physio|\bgp\b|outing|catch.?up/.test(t))           return '7';  // Peacock   — teal   — Appointments
-  if (/\bcancel|subscription|renew|expires?|warning\b/.test(t))             return '11'; // Tomato    — red    — Warnings
-  if (/\bconference|neurips|icml|iclr|\bnips\b|symposium/.test(t))         return '1';  // Lavender          — Conference
-  if (/\bevent|talk\b|info session|optional|seminar/.test(t))              return '8';  // Graphite  — grey  — Unimportant
+  if (/\bfinal exam|finals\b/.test(t))                                       return '6';  // Tangerine  — orange        — Exam
+  if (/\bassignment|\bhomework\b|\bhw\b|due date|submit|graded\b/.test(t))   return '1';  // Lavender   — light purple  — Graded
+  if (/\bbirthday|bday\b/.test(t))                                           return '5';  // Banana     — yellow        — Birthdays
+  if (/\bdoctor|dentist|physio|\bgp\b|appointment|outing|catch.?up/.test(t)) return '3';  // Grape      — bright purple — Appointments
+  if (/\bcancel|subscription|renew|expires?|warning\b/.test(t))              return '11'; // Tomato     — red           — Warnings
+  if (/\bconference|neurips|icml|iclr|\bnips\b|symposium|seminar|talk\b|info session|event/.test(t)) return '4';  // Flamingo — salmon pink — Events + Conference
+  if (/\boptional/.test(t))                                                  return '8';  // Graphite  — grey        — Optional only
   switch (project) {
-    case 'work':          return '9';  // Blueberry — dark blue
-    case 'school':        return '10'; // Basil     — dark green
-    case 'personal':      return '2';  // Sage      — green
-    case 'research_apps': return '1';  // Lavender
+    case 'work':          return '9';  // Blueberry  — dark blue
+    case 'school':        return '10'; // Basil      — dark green
+    case 'personal':      return '2';  // Sage       — bright green
+    case 'research_apps': return '4';  // Flamingo   — salmon pink
     default:              return '2';
   }
 }
