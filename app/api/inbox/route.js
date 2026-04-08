@@ -160,7 +160,7 @@ export async function POST(req) {
       // For text-only: use AI to extract a clean short title (event/org name etc.)
       try {
         const result = await callModelWithFallback('gemini-flash', 'deepseek-chat', {
-          system:   'Extract the name of the event, program, or topic from this text. Return only the name — no explanation, no punctuation at the end. Max 8 words.',
+          system:   'Extract the topic, concept, or event name from this text. Return ONLY the name itself — never describe the message, never say "User is asking about". Examples: input "I want to learn linear probes" → output "linear probes". Input "tell me about toy models of superposition" → output "toy models of superposition". Input "apply to Meridian fellowship" → output "Meridian fellowship". Max 8 words, no punctuation.',
           messages: [{ role: 'user', content: text.slice(0, 600) }],
           maxTokens: 30,
         });

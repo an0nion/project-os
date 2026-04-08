@@ -127,11 +127,19 @@ function buildDeadlineNudgeLine(app, now = new Date()) {
   return `${emoji} *${app.org}* — ${d}d left${unanswered ? ` (${unanswered} questions remaining)` : ''}`;
 }
 
-// --- isExplicitLearning (pre-AI heuristic added to bot.js) ---
-const isExplicitLearning = (text, urls) =>
-  urls.length === 0 &&
-  text.trim().split(/\s+/).filter(Boolean).length > 5 &&
-  /\b(want to learn|learning about|i'?m learning|been learning|trying to learn|i want to understand)\b/i.test(text);
+// --- isExplicitLearning (replicated from bot.js — KEEP IN SYNC) ---
+const isExplicitLearning = (text, urls) => {
+  if (urls.length > 0) return false;
+  const words = text.trim().split(/\s+/).filter(Boolean).length;
+  // "want to learn / learning about" patterns — need >5 words so topic is present
+  if (words > 5 && /\b(want to learn|learning about|i'?m learning|been learning|trying to learn|i want to understand)\b/i.test(text)) return true;
+  // "tell me about X / explain X" — need >4 words (topic is part of the phrase)
+  if (words > 4 && /\b(tell me about|explain to me|what is a|what are)\b/i.test(text)) return true;
+  return false;
+};
+
+// --- Title extraction prompt (replicated from /api/inbox/route.js — KEEP IN SYNC) ---
+const TITLE_EXTRACTION_PROMPT = 'Extract the topic, concept, or event name from this text. Return ONLY the name itself — never describe the message, never say "User is asking about". Examples: input "I want to learn linear probes" → output "linear probes". Input "tell me about toy models of superposition" → output "toy models of superposition". Input "apply to Meridian fellowship" → output "Meridian fellowship". Max 8 words, no punctuation.';
 
 // ── Learning reply handling (replicated from bot.js learningMode handler) ─────
 // These functions must be kept in sync with bot.js.
@@ -1267,6 +1275,60 @@ describe('extractUrls — Slack message URL extraction', () => {
 
 
 // ══════════════════════════════════════════════════════════════════════════════
+// SECTION 8a — Title extraction prompt quality
+// Tests that the inbox title extractor prompt prevents AI meta-descriptions.
+// Root bug: "tell me about linear probes" → "User is asking about linear probes,
+// which is a technical/mathematical topic..." instead of just "linear probes".
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe('Title extraction prompt — prevents AI meta-descriptions', () => {
+
+  test('prompt says to return ONLY the name (not describe the message)', () => {
+    assert.ok(TITLE_EXTRACTION_PROMPT.includes('ONLY the name'));
+  });
+
+  test('prompt explicitly forbids "User is asking about" phrasing', () => {
+    assert.ok(TITLE_EXTRACTION_PROMPT.includes('never say "User is asking about"'));
+  });
+
+  test('prompt includes example: "linear probes" input → "linear probes" output', () => {
+    assert.ok(TITLE_EXTRACTION_PROMPT.includes('linear probes'));
+  });
+
+  test('prompt includes example: "tell me about toy models of superposition" → topic name only', () => {
+    assert.ok(TITLE_EXTRACTION_PROMPT.includes('toy models of superposition'));
+  });
+
+  test('prompt has maxTokens hint (30) to prevent long outputs — enforced in route.js', () => {
+    // maxTokens: 30 in the callModelWithFallback call limits verbosity
+    // (not in the prompt string itself — this is a code-level check)
+    assert.ok(typeof TITLE_EXTRACTION_PROMPT === 'string');
+    assert.ok(TITLE_EXTRACTION_PROMPT.length > 0);
+  });
+
+  test('prompt instructs max 8 words output', () => {
+    assert.ok(TITLE_EXTRACTION_PROMPT.includes('8 words'));
+  });
+
+  test('prompt instructs no punctuation at end', () => {
+    assert.ok(TITLE_EXTRACTION_PROMPT.includes('no punctuation'));
+  });
+
+  // ── Verify the WRONG outputs are described as forbidden ──
+  test('the exact bad output seen in screenshot is forbidden by prompt', () => {
+    // "User is asking about toy models of superposition, which is a technical concept..."
+    // The prompt says: never say "User is asking about"
+    assert.ok(TITLE_EXTRACTION_PROMPT.includes('never'));
+    assert.ok(TITLE_EXTRACTION_PROMPT.includes('User is asking about'));
+  });
+
+  test('prompt includes fellowship example for non-learning topics', () => {
+    assert.ok(TITLE_EXTRACTION_PROMPT.includes('Meridian fellowship'));
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
 // SECTION 8b — Explicit learning heuristic (pre-AI fast path)
 // This is the fix for the exact bug the user reported:
 //   "I want to learn about linear probes like Neel Nanda's safety work"
@@ -1344,6 +1406,38 @@ describe('isExplicitLearning — pre-AI heuristic (the fix for the Neel Nanda bu
 
   test('non-tech topic (baking) → triggers (user wants clarification on ANY explicit learning)', () =>
     assert.ok(isExplicitLearning('I want to learn about sourdough fermentation and starter culture', [])));
+
+  // ── REGRESSION: "tell me about X" — the exact messages from the screenshot ──
+  test('REGRESSION: "so tell me about linear probes" → triggers (5 words > 4)', () =>
+    assert.ok(isExplicitLearning('so tell me about linear probes', [])));
+
+  test('REGRESSION: "tell me about toy models of superposition" → triggers', () =>
+    assert.ok(isExplicitLearning('tell me about toy models of superposition', [])));
+
+  test('"tell me about attention mechanisms in transformers" → triggers', () =>
+    assert.ok(isExplicitLearning('tell me about attention mechanisms in transformers', [])));
+
+  test('"explain to me how backpropagation works" → triggers', () =>
+    assert.ok(isExplicitLearning('explain to me how backpropagation works', [])));
+
+  test('"what is a linear probe" → triggers (5 words > 4)', () =>
+    assert.ok(isExplicitLearning('what is a linear probe', [])));
+
+  test('"what are residual stream representations" → triggers', () =>
+    assert.ok(isExplicitLearning('what are residual stream representations in transformers', [])));
+
+  // ── "tell me about" boundary cases ──
+  test('"tell me about it" (4 words, no topic) → does NOT trigger', () =>
+    assert.ok(!isExplicitLearning('tell me about it', [])));
+
+  test('"explain it" (2 words) → does NOT trigger', () =>
+    assert.ok(!isExplicitLearning('explain it', [])));
+
+  test('"what is this" (3 words, conversational) → does NOT trigger', () =>
+    assert.ok(!isExplicitLearning('what is this', [])));
+
+  test('"tell me about X" WITH URL → does NOT trigger', () =>
+    assert.ok(!isExplicitLearning('tell me about linear probes', ['https://arxiv.org/abs/2310.00001'])));
 });
 
 

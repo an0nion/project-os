@@ -456,10 +456,16 @@ CRITICAL RULE: if the reply contains "after you explain", "I'll tell you", "once
   // straight to the clarification dialogue. This prevents misclassification when
   // Gemini returns project_hint:null instead of learning_tech for these patterns.
   // Requires >5 words so bare "want to learn" (no topic) doesn't trigger.
+  // "want to learn about X" patterns need > 5 words to ensure a topic is present
   const isExplicitLearning =
-    urls.length === 0 &&
-    userText.trim().split(/\s+/).filter(Boolean).length > 5 &&
-    /\b(want to learn|learning about|i'?m learning|been learning|trying to learn|i want to understand)\b/i.test(userText);
+    urls.length === 0 && (() => {
+      const words = userText.trim().split(/\s+/).filter(Boolean).length;
+      // "I want to learn / been learning about / trying to learn" — needs > 5 words (topic required)
+      if (words > 5 && /\b(want to learn|learning about|i'?m learning|been learning|trying to learn|i want to understand)\b/i.test(userText)) return true;
+      // "tell me about X" / "explain X" — needs > 4 words (topic is part of the phrase itself)
+      if (words > 4 && /\b(tell me about|explain to me|what is a|what are)\b/i.test(userText)) return true;
+      return false;
+    })();
 
   if (isExplicitLearning) {
     pending.set(userId, { learningMode: true, originalText: userText, step: 1 });
