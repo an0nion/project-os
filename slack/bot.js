@@ -68,23 +68,43 @@ function isAmbiguous(text, urls, ctx) {
   return isTechUrl || isTechText;
 }
 
-// ── URL extraction ────────────────────────────────────────────────────────────
+// ── URL extraction (http/https only — ignore mailto:, tel:, etc.) ────────────
 function extractUrls(message) {
   const urls = [];
   const urlRegex = /https?:\/\/[^\s<>|]+/g;
   if (message.text) urls.push(...(message.text.match(urlRegex) ?? []));
   if (message.blocks) {
-    const walk = els => { for (const el of els ?? []) { if (el.type === 'link') urls.push(el.url); if (el.elements) walk(el.elements); } };
+    const walk = els => {
+      for (const el of els ?? []) {
+        if (el.type === 'link' && el.url?.startsWith('http')) urls.push(el.url);
+        if (el.elements) walk(el.elements);
+      }
+    };
     message.blocks.forEach(b => walk(b.elements));
   }
   if (message.attachments) {
     for (const a of message.attachments) {
-      if (a.original_url) urls.push(a.original_url);
-      if (a.from_url)     urls.push(a.from_url);
-      if (a.title_link)   urls.push(a.title_link);
+      if (a.original_url?.startsWith('http')) urls.push(a.original_url);
+      if (a.from_url?.startsWith('http'))     urls.push(a.from_url);
+      if (a.title_link?.startsWith('http'))   urls.push(a.title_link);
     }
   }
-  return [...new Set(urls)].filter(u => !u.includes('slack.com') && !u.includes('slack-edge.com'));
+  return [...new Set(urls)].filter(u =>
+    !u.includes('slack.com') && !u.includes('slack-edge.com')
+  );
+}
+
+// ── Detect conversational messages directed at the bot ────────────────────────
+// These are feedback/questions about the bot's behaviour, not things to save.
+function isConversational(text) {
+  return /^(see|why|how|what|you |u |did you|didn't you|can you|could you|should you|that's|thats|lol|haha|nice|ok|okay|wait|no,|yes,|yeah|nope)/i.test(text.trim());
+}
+
+// ── Detect application text with no real URL ──────────────────────────────────
+// e.g. forwarded email/flyer about a program — has deadline/apply language but no link
+function hasNoUsableUrl(urls, text) {
+  if (urls.length > 0) return false;
+  return /\bapply\b|\bapplication\b|\bdeadline\b|\bfellowship\b|\bresidency\b|\binternship\b/i.test(text);
 }
 
 // ── API call ──────────────────────────────────────────────────────────────────
@@ -144,6 +164,11 @@ function parseClarificationReply(text) {
   return ctx;
 }
 
+// ── Post a clean one-liner (no link unfurls) ──────────────────────────────────
+async function reply(channel, text) {
+  await app.client.chat.postMessage({ channel, text, unfurl_links: false, unfurl_media: false });
+}
+
 // ── Main listener ─────────────────────────────────────────────────────────────
 app.message(async ({ message, say }) => {
   if (message.channel_type !== 'im') return;
@@ -156,6 +181,9 @@ app.message(async ({ message, say }) => {
   const userText = message.text ?? '';
   const ctx      = parseContext(userText);
 
+  // Ignore conversational feedback/questions directed at the bot
+  if (!pending.has(userId) && isConversational(userText) && urls.length === 0) return;
+
   // ── Pending clarification reply ───────────────────────────────────────────
   if (pending.has(userId)) {
     const state = pending.get(userId);
@@ -166,17 +194,35 @@ app.message(async ({ message, say }) => {
       pending.delete(userId);
       // fall through to normal handling
     } else {
-      const reply = parseClarificationReply(userText);
+      // Search mode: user said they want to apply but gave no link
+      if (state.searchMode) {
+        if (/^y/i.test(userText.trim())) {
+          pending.delete(userId);
+          // Save as text — router will classify as research_apps, no URL to scrape
+          try {
+            const data = await callInbox({ text: state.text, source: 'slack', project: 'research_apps' });
+            await reply(message.channel, buildSuccessMessage(data, {}));
+          } catch {
+            await say('couldn\'t save that');
+          }
+        } else {
+          pending.delete(userId);
+          await say('ok, ignored');
+        }
+        return;
+      }
 
-      if (!reply.context) {
+      const clarCtx = parseClarificationReply(userText);
+
+      if (!clarCtx.context) {
         await say('work or personal?');
         return;
       }
 
-      const project      = reply.context === 'work' ? 'work' : 'learning_tech';
-      const timeStr      = reply.timeline ?? reply.urgency ?? '';
+      const project      = clarCtx.context === 'work' ? 'work' : 'learning_tech';
+      const timeStr      = clarCtx.timeline ?? clarCtx.urgency ?? '';
       const enrichedText = [
-        reply.context === 'work' ? '[Work]' : '[Personal learning]',
+        clarCtx.context === 'work' ? '[Work]' : '[Personal learning]',
         state.text || state.url || '',
         timeStr ? `— ${timeStr}` : '',
       ].filter(Boolean).join(' ');
@@ -185,7 +231,7 @@ app.message(async ({ message, say }) => {
 
       try {
         const data = await callInbox({ url: state.url, text: enrichedText, source: 'slack', project });
-        await say(buildSuccessMessage(data, reply));
+        await reply(message.channel, buildSuccessMessage(data, clarCtx));
       } catch {
         await say('couldn\'t save that');
       }
@@ -209,7 +255,7 @@ app.message(async ({ message, say }) => {
           source:  'slack',
           ...(project ? { project } : {}),
         });
-        await say(buildSuccessMessage(data, ctx));
+        await reply(message.channel, buildSuccessMessage(data, ctx));
       } catch {
         await say('couldn\'t save that');
       }
@@ -224,6 +270,13 @@ app.message(async ({ message, say }) => {
 
   // ── Text-only message ─────────────────────────────────────────────────────
   if (userText.trim()) {
+    // Application/fellowship text with no link → ask to search
+    if (hasNoUsableUrl(urls, userText)) {
+      pending.set(userId, { url: null, text: userText, searchMode: true, step: 1 });
+      await say('no link — want me to search for the application page? (y/n)');
+      return;
+    }
+
     if (isAmbiguous(userText, [], ctx)) {
       pending.set(userId, { url: null, text: userText, step: 1 });
       await say('work or personal?');
@@ -232,7 +285,7 @@ app.message(async ({ message, say }) => {
 
     try {
       const data = await callInbox({ text: userText, source: 'slack' });
-      await say(buildSuccessMessage(data, ctx));
+      await reply(message.channel, buildSuccessMessage(data, ctx));
     } catch {
       await say('couldn\'t save that');
     }
