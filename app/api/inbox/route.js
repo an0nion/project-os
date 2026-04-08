@@ -27,6 +27,7 @@ import { scrapeApplication }      from '../../../scraper/index.js';
 import { supabase }               from '../../../lib/supabase.js';
 import { PROJECTS }               from '../../../lib/projects.js';
 import { chatWithModel }          from '../../../lib/multiModelClient.js';
+import { logCost }                from '../../../lib/costTracker.js';
 
 // ── Fetch page HTML (title + body text for AI summary) ───────────────────────
 function decodeHtmlEntities(str) {
@@ -80,6 +81,7 @@ async function generateDescription(title, bodyText, url) {
       messages: [{ role: 'user', content: `URL: ${url}\n\n${content}` }],
       maxTokens: 60,
     });
+    logCost(result.modelKey, result.usage, { reason: 'page_description' }).catch(() => {});
     return result.text?.trim().replace(/\.$/, '') ?? null;
   } catch {
     return null;
@@ -166,6 +168,7 @@ export async function POST(req) {
           messages: [{ role: 'user', content: text.slice(0, 600) }],
           maxTokens: 30,
         });
+        logCost(result.modelKey, result.usage, { reason: 'title_extraction' }).catch(() => {});
         itemTitle = result.text?.trim().replace(/\.$/, '') || text.slice(0, 80);
       } catch {
         itemTitle = text.slice(0, 80);
@@ -184,11 +187,13 @@ export async function POST(req) {
 
   const isGitHub = url && (url.includes('github.com') || url.includes('gitlab.com'));
 
-  if (project === 'research_apps' && url && !isGitHub) {
-    // research_apps: scrape URL → applications + questions tables
-    const scraped = await scrapeApplication(url);
+  if (project === 'research_apps' && !isGitHub) {
+    // research_apps always writes to applications table (never items).
+    // With URL: scrape for questions + deadline.
+    // Text-only: create a stub application from AI-extracted title.
+    const scraped = url ? await scrapeApplication(url) : { error: 'no_url' };
 
-    if (!scraped.error) {
+    if (url && !scraped.error) {
       const { data: app, error: appErr } = await supabase
         .from('applications')
         .insert({
@@ -206,7 +211,6 @@ export async function POST(req) {
       if (!appErr && app) {
         appId    = app.id;
         deadline = scraped.deadline;
-
         if (scraped.questions?.length) {
           await supabase.from('questions').insert(
             scraped.questions.map(q => ({
@@ -221,14 +225,22 @@ export async function POST(req) {
         }
       }
     } else {
-      scrapeError = scraped.error;
-      // Still create a plain item so nothing is lost
+      // No URL or scrape failed — stub application row so it appears in the board
+      scrapeError = url ? scraped.error : null;
       try {
-        const { data: item } = await supabase
-          .from('items')
-          .insert({ project_key: project, title: itemTitle.slice(0, 200), subtitle: itemSubtitle, status: firstCol, url: url ?? null, notes: text ?? null })
-          .select().single();
-        if (item) itemId = item.id;
+        const { data: app } = await supabase
+          .from('applications')
+          .insert({
+            name:        itemTitle.slice(0, 200),
+            org:         'Unknown',
+            url:         url ?? null,
+            deadline:    null,
+            status:      firstCol,
+            project_key: project,
+          })
+          .select()
+          .single();
+        if (app) appId = app.id;
       } catch { /* non-fatal */ }
     }
   } else {

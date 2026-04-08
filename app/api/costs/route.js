@@ -51,15 +51,14 @@ export async function GET(req) {
     return acc;
   }, {});
 
-  const round2 = n => Math.round(n * 100) / 100;
-
+  // Keep full precision — frontend formats with toFixed(4/6)
   return NextResponse.json({
     period,
     since:      since.toISOString(),
-    total:      round2(total),
-    byTier:     Object.fromEntries(Object.entries(byTier).map(([k, v]) => [k, round2(v)])),
-    byProvider: Object.fromEntries(Object.entries(byProvider).map(([k, v]) => [k, round2(v)])),
-    byProject:  Object.fromEntries(Object.entries(byProject).map(([k, v]) => [k, round2(v)])),
+    total,
+    byTier,
+    byProvider,
+    byProject,
     recent:     rows.slice(0, 20).map(r => ({
       model:       r.model,
       provider:    r.provider,
