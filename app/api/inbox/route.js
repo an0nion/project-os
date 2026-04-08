@@ -158,8 +158,20 @@ export async function POST(req) {
       const slug = url.split('/').filter(Boolean).pop()?.replace(/[-_]/g, ' ') ?? '';
       const host = new URL(url).hostname.replace('www.', '');
       itemTitle = slug ? `${slug} — ${host}` : host;
+    } else if (text) {
+      // For text-only: use AI to extract a clean short title (event/org name etc.)
+      try {
+        const result = await chatWithModel('gemini-flash', {
+          system:   'Extract the name of the event, program, or topic from this text. Return only the name — no explanation, no punctuation at the end. Max 8 words.',
+          messages: [{ role: 'user', content: text.slice(0, 600) }],
+          maxTokens: 30,
+        });
+        itemTitle = result.text?.trim().replace(/\.$/, '') || text.slice(0, 80);
+      } catch {
+        itemTitle = text.slice(0, 80);
+      }
     } else {
-      itemTitle = (text ?? '').slice(0, 120);
+      itemTitle = 'Untitled';
     }
   }
 

@@ -166,13 +166,8 @@ async function callInbox(body) {
 
 // ── Minimal success reply ─────────────────────────────────────────────────────
 // One line, embedded link, no buttons, no blocks.
-// Format: "saved to learning — <url|Title> · 1-2 months"
+// Format: "📚 <url|Title> · 1-2 months"
 function buildSuccessMessage(data, ctx) {
-  const title   = data.summary;
-  const url     = data.itemId || data.appId
-    ? `${process.env.APP_URL}/project/${data.project}`
-    : null;
-
   const projectEmoji = {
     learning_tech:  '📚',
     work:           '💼',
@@ -186,16 +181,23 @@ function buildSuccessMessage(data, ctx) {
     circuitry:      '⚡',
   }[data.project] ?? '📁';
 
+  const appUrl = `${process.env.APP_URL}/project/${data.project}`;
+
+  // Clean title: strip newlines, emoji, collapse whitespace, cap at 60 chars
+  const rawTitle = data.summary ?? '';
+  const cleanTitle = rawTitle
+    .replace(/\n|\r/g, ' ')
+    .replace(/:[a-z_]+:/g, '')          // remove :emoji_codes:
+    .replace(/[<>|]/g, '')              // remove chars that break Slack link syntax
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60);
+
   const parts = [];
+  if (cleanTitle) parts.push(`<${appUrl}|${cleanTitle}>`);
+  if (ctx?.timeline) parts.push(ctx.timeline);
 
-  // Title as embedded link if we have a project URL
-  if (title && url) parts.push(`<${url}|${title}>`);
-  else if (title)   parts.push(title);
-
-  if (ctx.timeline) parts.push(ctx.timeline);
-
-  const detail = parts.join(' · ');
-  return `${projectEmoji} ${detail || 'saved'}`;
+  return `${projectEmoji} ${parts.join(' · ') || 'saved'}`;
 }
 
 // ── Parse clarification reply for both context + timeline ─────────────────────
