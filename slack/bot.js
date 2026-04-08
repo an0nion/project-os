@@ -76,16 +76,18 @@ const INTENT_SYSTEM_PROMPT = `You are a message intent classifier for a personal
 
 Return ONLY valid JSON (no markdown, no explanation):
 {
-  "intent": "save" | "correct" | "converse" | "search_request" | "reminder",
+  "intent": "save" | "correct" | "converse" | "search_request" | "reminder" | "recall",
   "context": "work" | "personal" | null,
   "timeline": string or null,
   "project_hint": string or null,
   "corrected_project": string or null,
   "needs_clarification": boolean,
-  "priority_tier": 1 | 2 | 3 | 4 | null
+  "priority_tier": 1 | 2 | 3 | 4 | null,
+  "recall_topic": string or null
 }
 
 INTENT — pick exactly one:
+- "recall": user asking what they previously saved, asked about, or captured — "what did I ask about X?", "I remember asking about Y", "what did you save on Z?", "what do I have on X?"
 - "converse": ANY of these → greetings (hi, hello, hey), one-word reactions (ok, nice, thanks, lol, :(, yes, no), feedback about the bot ("did you save that?", "why did you do that?", "your formatting is bad"), questions about what was just saved. When in doubt about a short ambiguous message, choose converse.
 - "reminder": user wants to be reminded about something at a specific time/date ("remind me to...", "I have a [appointment/meeting/event] at [time]", "set a reminder for...")
 - "search_request": user wants to apply to a fellowship/program/internship but has given no URL
@@ -110,6 +112,8 @@ project_hint: one of ${PROJECT_KEYS.join(', ')} — only when clearly identifiab
 - circuitry: Arduino, electronics, PCB, hardware
 
 corrected_project: same enum — only set if intent=correct AND user named a project; null otherwise
+
+recall_topic: the specific topic/keyword the user is trying to recall — strip meta-query phrasing. E.g. "what did I ask about linear probes?" → "linear probes". Only set if intent=recall, else null.
 
 needs_clarification: true ONLY if intent=save AND context is null AND content is tech-related (GitHub, paper, tool) where work vs personal distinction matters for routing
 
@@ -147,7 +151,7 @@ async function classifyIntent(text, urls) {
     const parsed = JSON.parse(json);
 
     // Validate intent — unknown values default to save, not converse
-    const validIntents = ['save', 'correct', 'converse', 'search_request', 'reminder'];
+    const validIntents = ['save', 'correct', 'converse', 'search_request', 'reminder', 'recall'];
     const intent = validIntents.includes(parsed.intent) ? parsed.intent : 'save';
 
     return {
@@ -158,16 +162,16 @@ async function classifyIntent(text, urls) {
       corrected_project:   parsed.corrected_project   ?? null,
       needs_clarification: parsed.needs_clarification ?? false,
       priority_tier:       parsed.priority_tier       ?? null,
+      recall_topic:        parsed.recall_topic        ?? null,
     };
   } catch (err) {
     console.warn('[intent] classify failed:', err.message);
-    // Safe fallback: short messages go to converse, longer ones to save
     const isShort = words.length <= 5;
     return {
       intent: isShort ? 'converse' : 'save',
       context: null, timeline: null, project_hint: null,
       corrected_project: null, needs_clarification: false,
-      priority_tier: null,
+      priority_tier: null, recall_topic: null,
     };
   }
 }
@@ -333,22 +337,31 @@ app.message(async ({ message, say }) => {
     // Learning clarification mode — two-call architecture:
     // Call 1: classify reply as "action" or "chat" — tiny JSON, 60 tokens, never truncates
     // Call 2: if chat, conversational response with full history — plain text, 500 tokens
-    // Threading: all bot replies are threaded under the user's original message (threadTs).
     // History: each exchange is stored so Call 2 can answer follow-up questions correctly.
     // Step cap: 8 chat turns before a soft check-in ("want me to save something?")
     if (state.learningMode) {
-      const step     = state.step ?? 1;
-      const threadTs = state.threadTs ?? message.ts;
-      const history  = state.history ?? [];
+      const step    = state.step ?? 1;
+      const history = state.history ?? [];
       let saveAsText = null;
       let chatReply  = null;
 
       // ── Build a clean, action-led Kanban title from the learning dialogue ────
-      // Format: "Verb phrase · topic" capped at 80 chars.
+      // Format: "Implement linear probes for AI alignment" — sentence-case, natural English.
+      // Strips "I want to learn about / I want to" from the original topic.
       // Passed as forcedTitle to /api/inbox so the AI title extractor is bypassed.
       const buildLearningTitle = (action, topic) => {
-        const topicSlug = topic.replace(/^i (want to learn|am learning|want to understand)\s+(about\s+)?/i, '').trim();
-        return `${action} · ${topicSlug}`.slice(0, 80);
+        // Strip common filler openers from the topic
+        const topicSlug = topic
+          .replace(/^i (want to learn about|want to understand|am learning about|want to)\s*/i, '')
+          .replace(/^(learn about|tell me about|explain|what is|what are)\s*/i, '')
+          .trim();
+        // Normalise action: strip "it", "the paper", etc. to get a clean verb
+        const verb = action
+          .replace(/\s+(it|the paper|more|about it|everything)$/i, '')
+          .trim();
+        // Capitalise first letter
+        const title = `${verb.charAt(0).toUpperCase() + verb.slice(1)} ${topicSlug}`;
+        return title.slice(0, 80);
       };
 
       // ── Fast-path: bare action words need no AI ────────────────────────────
@@ -360,8 +373,8 @@ app.message(async ({ message, say }) => {
         const enriched = `${task} — ${state.originalText.slice(0, 120)}`;
         try {
           const data = await callInbox({ text: enriched, title, source: 'slack', project: 'learning_tech' });
-          await say({ text: buildSuccessMessage(data), thread_ts: threadTs });
-        } catch { await say({ text: 'saved ✓', thread_ts: threadTs }); }
+          await say(buildSuccessMessage(data));
+        } catch { await say('saved ✓'); }
         return;
       }
 
@@ -370,7 +383,7 @@ app.message(async ({ message, say }) => {
         const lc = userText.toLowerCase().trim();
         if (/^(no|nah|nope|not yet|keep going|continue|later)/.test(lc)) {
           pending.set(userId, { ...state, softCheckIn: false });
-          await say({ text: `all good — keep going`, thread_ts: threadTs });
+          await say(`all good — keep going`);
           return;
         }
         // User said what to save (or anything non-negative) — save it
@@ -381,11 +394,8 @@ app.message(async ({ message, say }) => {
         try {
           const data = await callInbox({ text: enriched, title, source: 'slack', project: 'learning_tech' });
           if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
-          await app.client.chat.postMessage({
-            channel: message.channel, text: buildSuccessMessage(data, {}),
-            thread_ts: threadTs, unfurl_links: false, unfurl_media: false,
-          });
-        } catch { await say({ text: "couldn't save that", thread_ts: threadTs }); }
+          await reply(message.channel, buildSuccessMessage(data, {}));
+        } catch { await say("couldn't save that"); }
         return;
       }
 
@@ -443,10 +453,7 @@ Rules:
         // Soft check-in: 8 turns is a solid conversation — offer to save without forcing
         const shortTopic = state.originalText.slice(0, 60);
         pending.set(userId, { ...state, softCheckIn: true });
-        await say({
-          text: `We've been deep in ${shortTopic} for a while — want me to save something specific to your Learning board so you can come back to it? If so, just say what you'd like to capture.`,
-          thread_ts: threadTs,
-        });
+        await say(`We've been deep in ${shortTopic} for a while — want me to save something specific to your Learning board so you can come back to it? If so, just say what you'd like to capture.`);
         return;
 
       } else if (classifyType === null && step >= 3) {
@@ -461,16 +468,13 @@ Rules:
           { role: 'assistant', content: chatReply },
         ];
         pending.set(userId, { ...state, step: step + 1, history: newHistory });
-        await say({ text: chatReply, thread_ts: threadTs });
+        await say(chatReply);
         return;
       }
 
       if (!saveAsText) {
         pending.set(userId, { ...state, step: step + 1 });
-        await say({
-          text: `what do you want to do with this — read, implement something, understand the theory, or write about it?`,
-          thread_ts: threadTs,
-        });
+        await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
         return;
       }
 
@@ -481,12 +485,9 @@ Rules:
       try {
         const data = await callInbox({ text: enriched, title, source: 'slack', project: 'learning_tech' });
         if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
-        await app.client.chat.postMessage({
-          channel: message.channel, text: buildSuccessMessage(data, {}),
-          thread_ts: threadTs, unfurl_links: false, unfurl_media: false,
-        });
+        await reply(message.channel, buildSuccessMessage(data, {}));
       } catch {
-        await say({ text: "couldn't save that", thread_ts: threadTs });
+        await say("couldn't save that");
       }
       return;
     }
@@ -583,8 +584,8 @@ Rules:
     })();
 
   if (isExplicitLearning) {
-    pending.set(userId, { learningMode: true, originalText: userText, step: 1, threadTs: message.ts, history: [] });
-    await say({ text: `what do you want to do with this — read, implement something, understand the theory, or write about it?`, thread_ts: message.ts });
+    pending.set(userId, { learningMode: true, originalText: userText, step: 1, history: [] });
+    await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
     return;
   }
 
@@ -612,6 +613,38 @@ Rules:
     await callCorrect(prev.logId, proj, userText);
     lastSaved.delete(userId);
     await say(`got it — logged as ${proj}`);
+    return;
+  }
+
+  // Recall: user wants to know what they previously saved/asked about a topic
+  if (cls.intent === 'recall') {
+    const topic = cls.recall_topic ?? userText;
+    try {
+      const res = await fetch(
+        `${process.env.APP_URL}/api/inbox/search?q=${encodeURIComponent(topic)}&limit=5`,
+        { headers: { 'x-api-secret': process.env.APP_SECRET } },
+      );
+      const { results } = await res.json();
+      if (!results?.length) {
+        await say(`nothing saved about "${topic}" yet`);
+        return;
+      }
+      const projectEmoji = {
+        personal: '🗓️', learning_tech: '📚', work: '💼', school: '🎓',
+        research_apps: '🔬', baking: '🍞', beadwork: '📿', art: '🎨',
+        reading: '📖', exercise: '💪', circuitry: '⚡',
+      };
+      const lines = results.map(r => {
+        const emoji   = projectEmoji[r.project] ?? '📁';
+        const dateStr = r.saved_at ? ` · ${new Date(r.saved_at).toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })}` : '';
+        const link    = r.url ? `<${r.url}|${r.title}>` : r.title;
+        return `${emoji} ${link}${dateStr}`;
+      });
+      await reply(message.channel, `here's what I have on "${topic}":\n${lines.join('\n')}`);
+    } catch (err) {
+      console.error('[recall] search failed:', err.message);
+      await say("couldn't search that");
+    }
     return;
   }
 
@@ -650,8 +683,8 @@ Rules:
   // "I want to learn about X" is not actionable. Ask what they actually want to do.
   const isVagueLearning = cls.project_hint === 'learning_tech' && urls.length === 0;
   if (isVagueLearning) {
-    pending.set(userId, { learningMode: true, originalText: userText, step: 1, threadTs: message.ts, history: [] });
-    await say({ text: `what do you want to do with this — read, implement something, understand the theory, or write about it?`, thread_ts: message.ts });
+    pending.set(userId, { learningMode: true, originalText: userText, step: 1, history: [] });
+    await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
     return;
   }
 
