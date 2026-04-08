@@ -67,18 +67,16 @@ function parseProjectFromText(text) {
 }
 
 // ── AI Intent Classifier ──────────────────────────────────────────────────────
-// Replaces: isConversational, isCorrection, isAmbiguous, hasNoUsableUrl, parseContext
-// Returns: { intent, context, timeline, project_hint, corrected_project, needs_clarification }
 const PROJECT_KEYS = [
-  'school', 'work', 'research_apps', 'learning_tech',
+  'personal', 'school', 'work', 'research_apps', 'learning_tech',
   'baking', 'beadwork', 'art', 'reading', 'exercise', 'circuitry',
 ];
 
-const INTENT_SYSTEM_PROMPT = `You are a message intent classifier for a personal project management Slack bot. The user sends short messages to save things or talk to you.
+const INTENT_SYSTEM_PROMPT = `You are a message intent classifier for a personal project management Slack bot.
 
-Return ONLY a valid JSON object with these exact fields (no markdown, no explanation):
+Return ONLY valid JSON (no markdown, no explanation):
 {
-  "intent": "save" | "correct" | "converse" | "search_request",
+  "intent": "save" | "correct" | "converse" | "search_request" | "reminder",
   "context": "work" | "personal" | null,
   "timeline": string or null,
   "project_hint": string or null,
@@ -86,42 +84,48 @@ Return ONLY a valid JSON object with these exact fields (no markdown, no explana
   "needs_clarification": boolean
 }
 
-Intent meanings:
-- "save": user wants to capture something — URL, note, resource, program to apply to, task, reminder
-- "correct": user says the bot routed the last item wrong ("wrong", "should be X", "→ school", "actually this is work", "no that's research")
-- "converse": casual message not about saving — feedback on bot behavior, questions ("did you save that?", "why did you do that?"), reactions ("nice", "ok", "lol", "your formatting is bad", "did u add that?", "what happened"), greetings
-- "search_request": user wants to apply to something (fellowship, program, internship) but gives no URL — implies they want help finding the link
+INTENT — pick exactly one:
+- "converse": ANY of these → greetings (hi, hello, hey), one-word reactions (ok, nice, thanks, lol, :(, yes, no), feedback about the bot ("did you save that?", "why did you do that?", "your formatting is bad"), questions about what was just saved. When in doubt about a short ambiguous message, choose converse.
+- "reminder": user wants to be reminded about something at a specific time/date ("remind me to...", "I have a [appointment/meeting/event] at [time]", "set a reminder for...")
+- "search_request": user wants to apply to a fellowship/program/internship but has given no URL
+- "correct": user says bot routed the last item wrong ("wrong", "should be X", "→ school", "actually this is work")
+- "save": user explicitly wants to save a URL, note, paper, task, resource, application — clear capture intent
 
-context: "work" if clearly professional/job-related, "personal" if clearly personal, null if can't tell
+context: "work" if clearly professional, "personal" if clearly personal, null if ambiguous
 
-timeline: extract any time reference and return concise string ("1-2 months", "by June", "this week", "ASAP") or null
+timeline: concise time string ("5:30pm Thursday", "by June", "this week") or null
 
-project_hint: one of ${PROJECT_KEYS.join(', ')} — only if clearly identifiable:
-- school: coursework, assignment, exam, essay, uni, lecture notes, academic submission
-- work: job tasks, sprint, ticket, meeting, client, professional deadline
-- research_apps: applying to fellowship/program/grant/PhD/internship/residency/competition
-- learning_tech: GitHub repos, papers, tutorials, tools to explore (personal, not work)
+project_hint: one of ${PROJECT_KEYS.join(', ')} — only when clearly identifiable, else null:
+- personal: appointments, errands, life admin, personal reminders, grooming
+- school: coursework, assignments, exams, uni deadlines
+- work: job tasks, sprint, tickets, professional deadlines
+- research_apps: applying to fellowship/program/grant/PhD/internship/residency
+- learning_tech: papers, GitHub repos, ML concepts, tutorials to explore (personal)
 - baking: recipes, bread, food, cooking
-- beadwork: beading, jewelry, craft beadwork
-- art: drawing, painting, pastels, sketching, visual art
-- reading: books, articles to read for pleasure
-- exercise: gym, fitness, workout, running, sport
-- circuitry: Arduino, electronics, PCB, circuits, hardware hacking
+- beadwork: beading, jewelry, craft
+- art: drawing, painting, pastels, sketching
+- reading: books, essays, philosophy to read
+- exercise: gym, fitness, workouts, sport
+- circuitry: Arduino, electronics, PCB, hardware
 
-corrected_project: same enum as project_hint — only set if intent is "correct" and user named a specific project; null otherwise
+corrected_project: same enum — only set if intent=correct AND user named a project; null otherwise
 
-needs_clarification: true ONLY when all three are true:
-1. intent is "save"
-2. context is null (genuinely ambiguous between work and personal)
-3. content is tech-related (GitHub, paper, tool, technical resource) where work vs personal routing matters`;
+needs_clarification: true ONLY if intent=save AND context is null AND content is tech-related (GitHub, paper, tool) where work vs personal distinction matters for routing`;
 
 async function classifyIntent(text, urls) {
+  const words = text.trim().split(/\s+/).filter(Boolean);
+
+  // Short messages with no URLs are conversational — never save "hi", "ok", ":("
+  // Avoids wasting an API call and prevents garbage saves on fallback errors
+  if (urls.length === 0 && words.length <= 3) {
+    return { intent: 'converse', context: null, timeline: null, project_hint: null, corrected_project: null, needs_clarification: false };
+  }
+
   const hasUrls = urls.length > 0;
   const urlList = urls.slice(0, 3).join(', ');
   const userContent = `Message: ${text || '(empty)'}${hasUrls ? `\nURLs: ${urlList}` : ''}`;
 
   try {
-    // Gemini primary, DeepSeek fallback — handles Gemini 429 rate limits automatically
     const result = await callModelWithFallback('gemini-flash', 'deepseek-chat', {
       system:    INTENT_SYSTEM_PROMPT,
       messages:  [{ role: 'user', content: userContent }],
@@ -132,8 +136,12 @@ async function classifyIntent(text, urls) {
     const json   = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
     const parsed = JSON.parse(json);
 
+    // Validate intent — unknown values default to save, not converse
+    const validIntents = ['save', 'correct', 'converse', 'search_request', 'reminder'];
+    const intent = validIntents.includes(parsed.intent) ? parsed.intent : 'save';
+
     return {
-      intent:              parsed.intent              ?? 'save',
+      intent,
       context:             parsed.context             ?? null,
       timeline:            parsed.timeline            ?? null,
       project_hint:        parsed.project_hint        ?? null,
@@ -142,8 +150,13 @@ async function classifyIntent(text, urls) {
     };
   } catch (err) {
     console.warn('[intent] classify failed:', err.message);
-    // Fallback: treat as a save — bot will still work, just without smart routing
-    return { intent: 'save', context: null, timeline: null, project_hint: null, corrected_project: null, needs_clarification: false };
+    // Safe fallback: short messages go to converse, longer ones to save
+    const isShort = words.length <= 5;
+    return {
+      intent: isShort ? 'converse' : 'save',
+      context: null, timeline: null, project_hint: null,
+      corrected_project: null, needs_clarification: false,
+    };
   }
 }
 
@@ -276,13 +289,28 @@ app.message(async ({ message, say }) => {
     if (state.correctionMode) {
       const proj = parseProjectFromText(userText);
       if (!proj) {
-        await say("didn't catch that — try: school, work, learning, research, art, baking, beads, circuits, reading, exercise");
+        await say("didn't catch that — try: school, work, learning, research, art, baking, beads, circuits, reading, exercise, personal");
         return;
       }
       pending.delete(userId);
       await callCorrect(state.logId, proj, userText);
       lastSaved.delete(userId);
       await say(`logged as ${proj}`);
+      return;
+    }
+
+    // Learning clarification mode: user answered "what do you want to do with this?"
+    if (state.learningMode) {
+      pending.delete(userId);
+      // Combine the clarification answer with the original topic for an actionable task
+      const enriched = `${userText} — ${state.originalText.slice(0, 120)}`;
+      try {
+        const data = await callInbox({ text: enriched, source: 'slack', project: 'learning_tech' });
+        if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
+        await reply(message.channel, buildSuccessMessage(data, {}));
+      } catch {
+        await say("couldn't save that");
+      }
       return;
     }
 
@@ -376,6 +404,23 @@ app.message(async ({ message, say }) => {
     return;
   }
 
+  // Reminder/appointment: save to personal project with time context
+  if (cls.intent === 'reminder') {
+    const timeNote = cls.timeline ? ` — ${cls.timeline}` : '';
+    try {
+      const data = await callInbox({
+        text:    userText + timeNote,
+        source:  'slack',
+        project: 'personal',
+      });
+      if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
+      await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${(data.summary ?? 'reminder').slice(0, 60)}>${timeNote ? ` · ${cls.timeline}` : ''}`);
+    } catch {
+      await say("couldn't save that");
+    }
+    return;
+  }
+
   // Search request: application text with no URL
   if (cls.intent === 'search_request') {
     pending.set(userId, { url: null, text: userText, searchMode: true, step: 1 });
@@ -387,6 +432,15 @@ app.message(async ({ message, say }) => {
   if (cls.needs_clarification) {
     pending.set(userId, { url: urls[0] ?? null, text: userText, step: 1 });
     await say('work or personal?');
+    return;
+  }
+
+  // Vague learning intent with no URL → clarify before saving
+  // "I want to learn about X" is not actionable. Ask what they actually want to do.
+  const isVagueLearning = cls.project_hint === 'learning_tech' && urls.length === 0;
+  if (isVagueLearning) {
+    pending.set(userId, { learningMode: true, originalText: userText, step: 1 });
+    await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
     return;
   }
 
