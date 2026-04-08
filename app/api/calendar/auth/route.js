@@ -1,41 +1,59 @@
 /**
- * Google Calendar OAuth scaffold
+ * GET /api/calendar/auth
+ * Starts Google Calendar OAuth. Visit this URL once in a browser to authorise.
  *
- * Required env vars (not yet set):
- *   GOOGLE_CLIENT_ID      — same as used for app login
- *   GOOGLE_CLIENT_SECRET  — same as used for app login
+ * Required env vars:
+ *   GOOGLE_CLIENT_ID      — same as app login
+ *   GOOGLE_CLIENT_SECRET  — same as app login
  *   GOOGLE_CALENDAR_REDIRECT_URI — e.g. https://project-os-beta.vercel.app/api/calendar/callback
  *
- * Required Supabase table (not yet created):
- *   calendar_tokens (
- *     user_id      uuid references users(id),
- *     access_token text,
- *     refresh_token text,
- *     expires_at   timestamptz,
- *     created_at   timestamptz default now()
- *   )
+ * Required Supabase table:
+ *   CREATE TABLE calendar_tokens (
+ *     user_id       text PRIMARY KEY,
+ *     access_token  text NOT NULL,
+ *     refresh_token text NOT NULL,
+ *     expires_at    timestamptz NOT NULL,
+ *     created_at    timestamptz DEFAULT now()
+ *   );
  *
- * OAuth scopes needed:
- *   https://www.googleapis.com/auth/calendar.events  — create/read events
- *
- * Flow:
- *   1. GET /api/calendar/auth      → redirects user to Google consent screen
- *   2. GET /api/calendar/callback  → exchanges code for tokens, stores in DB
- *   3. POST /api/calendar/event    → creates an event using stored refresh token
- *
- * Hook-in point in bot.js (reminder intent):
- *   When intent=reminder and CALENDAR_ENABLED=true, after saving to personal project,
- *   also POST /api/calendar/event with { title, datetime, userId }.
- *
- * TODO: implement when ready to connect calendar
+ * Setup steps:
+ *   1. Google Cloud Console → APIs & Services → Library → enable Google Calendar API
+ *   2. OAuth consent screen → Scopes → add https://www.googleapis.com/auth/calendar.events
+ *   3. Credentials → your OAuth client → add redirect URI:
+ *        https://project-os-beta.vercel.app/api/calendar/callback
+ *   4. Add GOOGLE_CALENDAR_REDIRECT_URI to Vercel env vars
+ *   5. Visit https://project-os-beta.vercel.app/api/calendar/auth in browser
+ *   6. Sign in with the Google account that owns the calendars
  */
 
 import { NextResponse } from 'next/server';
 
-// ── Placeholder: not yet implemented ─────────────────────────────────────────
+const SCOPES = [
+  'https://www.googleapis.com/auth/calendar.events',
+  'https://www.googleapis.com/auth/calendar.readonly',
+].join(' ');
+
 export async function GET() {
-  return NextResponse.json(
-    { error: 'Google Calendar integration not yet enabled. Set CALENDAR_ENABLED=true and complete OAuth setup.' },
-    { status: 501 },
+  const clientId    = process.env.GOOGLE_CLIENT_ID;
+  const redirectUri = process.env.GOOGLE_CALENDAR_REDIRECT_URI;
+
+  if (!clientId || !redirectUri) {
+    return NextResponse.json(
+      { error: 'GOOGLE_CLIENT_ID or GOOGLE_CALENDAR_REDIRECT_URI not set' },
+      { status: 500 },
+    );
+  }
+
+  const params = new URLSearchParams({
+    client_id:     clientId,
+    redirect_uri:  redirectUri,
+    response_type: 'code',
+    scope:         SCOPES,
+    access_type:   'offline',   // get refresh token
+    prompt:        'consent',   // always show consent so refresh token is issued
+  });
+
+  return NextResponse.redirect(
+    `https://accounts.google.com/o/oauth2/v2/auth?${params}`,
   );
 }

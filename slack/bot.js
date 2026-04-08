@@ -648,17 +648,40 @@ Rules:
     return;
   }
 
-  // Reminder/appointment: save to personal project with time context
+  // Reminder/appointment: save to personal project + create calendar event
   if (cls.intent === 'reminder') {
     const timeNote = cls.timeline ? ` — ${cls.timeline}` : '';
     try {
       const data = await callInbox({
-        text:    userText + timeNote,
-        source:  'slack',
-        project: 'personal',
+        text:          userText + timeNote,
+        source:        'slack',
+        project:       'personal',
+        priority_tier: cls.priority_tier ?? undefined,
+        timeline:      cls.timeline      ?? undefined,
       });
       if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
-      await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${(data.summary ?? 'reminder').slice(0, 60)}>${timeNote ? ` · ${cls.timeline}` : ''}`);
+
+      // ── Also create Google Calendar event (fire-and-forget, non-fatal) ───
+      if (process.env.CALENDAR_ENABLED === 'true' && data.deadline) {
+        const calendarName = (() => {
+          const t = userText.toLowerCase();
+          if (/\bdoctor|dentist|physio|gp\b|outing|catch.?up/.test(t)) return 'Appointments';
+          if (/\bexam|final/.test(t))                                   return 'Exam';
+          if (/\bassignment|homework|\bhw\b|submit|due/.test(t))        return 'Graded';
+          if (/\bbirthday|bday/.test(t))                                return 'Birthdays';
+          if (/\bcancel|subscription|warning/.test(t))                  return 'Warnings';
+          if (/\bconference|neurips|icml|iclr/.test(t))                 return 'Conference';
+          return 'To-Do';
+        })();
+        fetch(`${process.env.APP_URL}/api/calendar/event`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
+          body:    JSON.stringify({ title: data.summary, date: data.deadline, calendarName, description: userText }),
+        }).catch(err => console.error('[calendar] event creation failed:', err.message));
+      }
+
+      const calNote = process.env.CALENDAR_ENABLED === 'true' && data.deadline ? ' · added to calendar' : '';
+      await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${(data.summary ?? 'reminder').slice(0, 60)}>${timeNote ? ` · ${cls.timeline}` : ''}${calNote}`);
     } catch {
       await say("couldn't save that");
     }
