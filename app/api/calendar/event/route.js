@@ -2,11 +2,11 @@
  * POST /api/calendar/event
  * Creates a Google Calendar event. Called by the Slack bot for reminders/deadlines.
  *
- * Body: { title, date, calendarName, description? }
- *   title        — event title
- *   date         — 'YYYY-MM-DD' for all-day, ISO datetime for timed
- *   calendarName — must match a Google Calendar name exactly (see lib/calendar.js CAL)
- *   description  — optional notes shown in the event
+ * Body: { title, date, colorId, description? }
+ *   title       — event title
+ *   date        — 'YYYY-MM-DD' for all-day, ISO datetime for timed
+ *   colorId     — Google colorId 1-11 (see lib/calendar.js COLOR map)
+ *   description — optional notes shown in the event
  *
  * Returns: { ok, eventId, htmlLink }
  */
@@ -20,13 +20,13 @@ export async function POST(req) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const { title, date, calendarName, description } = await req.json();
-  if (!title || !date || !calendarName) {
-    return NextResponse.json({ error: 'title, date, calendarName required' }, { status: 400 });
+  const { title, date, colorId, description } = await req.json();
+  if (!title || !date) {
+    return NextResponse.json({ error: 'title and date required' }, { status: 400 });
   }
 
   try {
-    const event = await createCalendarEvent({ title, date, calendarName, description });
+    const event = await createCalendarEvent({ title, date, colorId, description });
     return NextResponse.json({ ok: true, eventId: event.id, htmlLink: event.htmlLink });
   } catch (err) {
     console.error('[calendar/event]', err.message);

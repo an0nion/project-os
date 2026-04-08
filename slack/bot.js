@@ -21,6 +21,26 @@ const app = new App({
   socketMode: true,
 });
 
+// ── Google Calendar colorId routing (single-calendar, per-event colours) ──────
+// colorId 1-11 per Google Calendar API. No calendar switching needed.
+function pickCalendarColor(project, text) {
+  const t = (text ?? '').toLowerCase();
+  if (/\bfinal exam|finals\b/.test(t))                                      return '6';  // Tangerine — orange — Exam
+  if (/\bassignment|\bhomework\b|\bhw\b|due date|submit|graded\b/.test(t))  return '3';  // Grape     — purple — Graded
+  if (/\bbirthday|bday\b/.test(t))                                          return '5';  // Banana    — yellow — Birthdays
+  if (/\bdoctor|dentist|physio|\bgp\b|outing|catch.?up/.test(t))           return '7';  // Peacock   — teal   — Appointments
+  if (/\bcancel|subscription|renew|expires?|warning\b/.test(t))             return '11'; // Tomato    — red    — Warnings
+  if (/\bconference|neurips|icml|iclr|\bnips\b|symposium/.test(t))         return '1';  // Lavender          — Conference
+  if (/\bevent|talk\b|info session|optional|seminar/.test(t))              return '8';  // Graphite  — grey  — Unimportant
+  switch (project) {
+    case 'work':          return '9';  // Blueberry — dark blue
+    case 'school':        return '10'; // Basil     — dark green
+    case 'personal':      return '2';  // Sage      — green
+    case 'research_apps': return '1';  // Lavender
+    default:              return '2';
+  }
+}
+
 // ── Deduplication ─────────────────────────────────────────────────────────────
 const _seen = new Set();
 function isDuplicate(message) {
@@ -663,20 +683,11 @@ Rules:
 
       // ── Also create Google Calendar event (fire-and-forget, non-fatal) ───
       if (process.env.CALENDAR_ENABLED === 'true' && data.deadline) {
-        const calendarName = (() => {
-          const t = userText.toLowerCase();
-          if (/\bdoctor|dentist|physio|gp\b|outing|catch.?up/.test(t)) return 'Appointments';
-          if (/\bexam|final/.test(t))                                   return 'Exam';
-          if (/\bassignment|homework|\bhw\b|submit|due/.test(t))        return 'Graded';
-          if (/\bbirthday|bday/.test(t))                                return 'Birthdays';
-          if (/\bcancel|subscription|warning/.test(t))                  return 'Warnings';
-          if (/\bconference|neurips|icml|iclr/.test(t))                 return 'Conference';
-          return 'To-Do';
-        })();
+        const colorId = pickCalendarColor(cls.project_hint ?? 'personal', userText);
         fetch(`${process.env.APP_URL}/api/calendar/event`, {
           method:  'POST',
           headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
-          body:    JSON.stringify({ title: data.summary, date: data.deadline, calendarName, description: userText }),
+          body:    JSON.stringify({ title: data.summary, date: data.deadline, colorId, description: userText }),
         }).catch(err => console.error('[calendar] event creation failed:', err.message));
       }
 
