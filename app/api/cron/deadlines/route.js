@@ -54,16 +54,19 @@ export async function GET(req) {
   // ── Web Push ─────────────────────────────────────────────────────────────────
   const { data: subs } = await db.from('push_subscriptions').select('id, subscription');
   if (subs?.length) {
-    for (const app of apps) {
-      for (const sub of subs) {
-        try {
-          await pushDeadlineAlert(sub.subscription, app);
-        } catch (err) {
-          if (err.message === 'push_subscription_expired') {
-            await db.from('push_subscriptions').delete().eq('id', sub.id);
-          }
-        }
-      }
+    const expiredIds = [];
+    await Promise.allSettled(
+      subs.flatMap(sub =>
+        apps.map(app =>
+          pushDeadlineAlert(sub.subscription, app).catch(err => {
+            if (err.message === 'push_subscription_expired') expiredIds.push(sub.id);
+          })
+        )
+      )
+    );
+    // Batch-delete all expired subscriptions in one query
+    if (expiredIds.length) {
+      await db.from('push_subscriptions').delete().in('id', [...new Set(expiredIds)]);
     }
   }
 
