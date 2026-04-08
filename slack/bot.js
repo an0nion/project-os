@@ -225,6 +225,7 @@ function extractUrls(message) {
 // Format: "📚 <url|Title> · 1-2 months"
 function buildSuccessMessage(data, cls) {
   const projectEmoji = {
+    personal:      '🗓️',
     learning_tech: '📚',
     work:          '💼',
     school:        '🎓',
@@ -386,6 +387,22 @@ app.message(async ({ message, say }) => {
     } catch {
       await say("couldn't save that");
     }
+    return;
+  }
+
+  // ── Pre-AI fast path: explicit learning intent with no URL ──────────────────
+  // "I want to learn about X" is unambiguous — skip the AI call entirely and go
+  // straight to the clarification dialogue. This prevents misclassification when
+  // Gemini returns project_hint:null instead of learning_tech for these patterns.
+  // Requires >5 words so bare "want to learn" (no topic) doesn't trigger.
+  const isExplicitLearning =
+    urls.length === 0 &&
+    userText.trim().split(/\s+/).filter(Boolean).length > 5 &&
+    /\b(want to learn|learning about|i'?m learning|been learning|trying to learn|i want to understand)\b/i.test(userText);
+
+  if (isExplicitLearning) {
+    pending.set(userId, { learningMode: true, originalText: userText, step: 1 });
+    await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
     return;
   }
 
