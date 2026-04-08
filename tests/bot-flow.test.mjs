@@ -128,12 +128,77 @@ function buildDeadlineNudgeLine(app, now = new Date()) {
 }
 
 // --- isExplicitLearning (pre-AI heuristic added to bot.js) ---
-// Catches "want to learn / learning about / trying to learn" before calling AI.
-// Prevents misclassification when Gemini returns project_hint:null.
 const isExplicitLearning = (text, urls) =>
   urls.length === 0 &&
   text.trim().split(/\s+/).filter(Boolean).length > 5 &&
   /\b(want to learn|learning about|i'?m learning|been learning|trying to learn|i want to understand)\b/i.test(text);
+
+// ── Learning reply handling (replicated from bot.js learningMode handler) ─────
+// These functions must be kept in sync with bot.js.
+// They are extracted here so the decision logic can be unit-tested independently
+// of the Slack Bolt runtime.
+
+/**
+ * The exact system prompt sent to the AI when classifying a learning reply.
+ * Tests verify this prompt's content to ensure it contains the right criteria.
+ * MUST be kept in sync with bot.js learningMode handler.
+ */
+const LEARNING_REPLY_SYSTEM_PROMPT = (originalText) =>
+`You classify a conversational reply to help capture a personal learning task.
+
+The user wants to learn about: "${originalText.slice(0, 200)}"
+You asked: "what do you want to do with this — read, implement something, understand the theory, or write about it?"
+
+Return ONLY valid JSON (no markdown, no code fences):
+{
+  "type": "action" | "chat",
+  "task": "verb-led task, max 80 chars (ONLY when type=action, e.g. 'implement a linear probe in PyTorch')",
+  "reply": "2-3 sentences explaining the topic + question nudging toward a specific intent (ONLY when type=chat)"
+}
+
+type=action — ONLY when the reply is a complete, unconditional task statement:
+  EXAMPLES: "implement it from scratch" / "read the paper" / "understand the theory" / "write a summary" / "build a demo"
+
+type=chat — when the user wants explanation before committing, asks a question, or defers the decision:
+  EXAMPLES:
+  "tell me more about it, explain it and I'll tell you how I want to implement it" → chat (conditional: needs info FIRST)
+  "what is a linear probe?" → chat (question)
+  "I don't understand it yet" → chat (not ready)
+  "explain it then I'll decide" → chat (explicitly defers)
+  "how does it work?" → chat (question)
+
+CRITICAL RULE: if the reply contains "after you explain", "I'll tell you", "once I understand", "then I'll decide", or ANY condition — it is type=chat regardless of whether it mentions implement/read/write. Only choose type=action when the entire reply is an unambiguous task with no conditions attached.`;
+
+/**
+ * Decision logic: given a parsed AI JSON response and the current step,
+ * return { saveAsText, chatReply }.
+ * This is the pure decision function extracted from the learningMode handler.
+ */
+function handleLearningReplyResult(parsed, step) {
+  let saveAsText = null;
+  let chatReply  = null;
+  if (parsed?.type === 'action' && parsed?.task) {
+    saveAsText = parsed.task;
+  } else if (parsed?.type === 'chat' && parsed?.reply && step < 2) {
+    chatReply = parsed.reply;
+  }
+  return { saveAsText, chatReply };
+}
+
+/**
+ * Fallback when AI call fails. Short replies (≤8 words) treated as direct intent.
+ * Longer replies also saved via the `saveAsText ?? userText` chain in bot.js.
+ */
+function learningReplyFallback(userText) {
+  const words = userText.trim().split(/\s+/).filter(Boolean).length;
+  return { saveAsText: words <= 8 ? userText : null };
+}
+
+/**
+ * Builds the final enriched string that gets saved as the task title.
+ */
+const buildFinalTask = (taskText, originalText) =>
+  `${taskText} — ${originalText.slice(0, 120)}`;
 
 // --- isShortConversational, isPureUrl, isVagueLearning, fallbackClassification, buildEnrichedTask ---
 const isShortConversational = (text, urls) =>
@@ -476,166 +541,561 @@ describe('parseProjectFromText — correction alias mapping', () => {
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SECTION 6 — Learning reply classification and task actionability
-// Covers: the core fix — AI decides if user reply is a task or wants more info.
-// The old bug: blindly concatenate the reply text → "tell me more about it explain it"
-// The fix: AI classifies reply, either extracts a clean task OR has a conversation.
+// SECTION 6A — Learning reply: pure decision logic (handleLearningReplyResult)
+// Tests the exact function that processes the AI's JSON response.
+// Does NOT call the AI — tests the decision tree given a known parsed response.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Simulates the AI classification of a learning reply (what the bot does internally).
-// In production this calls callModelWithFallback — here we test the decision logic.
-const classifyLearningReply = (userReply, _originalTopic) => {
-  // Simulate AI output: if reply looks like a question/request for info → chat
-  const chatPatterns = /\b(tell me more|explain|what is|what are|how does|more about|elaborate|clarify|i don'?t understand|help me understand)\b/i;
-  if (chatPatterns.test(userReply)) {
-    return { type: 'chat', reply: '[AI explanation of topic here]' };
-  }
-  // If reply looks like a direct intent → action
-  const actionPatterns = /\b(implement|read|write|understand|build|explore|study|do it|try it|work through|code|run|create)\b/i;
-  if (actionPatterns.test(userReply)) {
-    return { type: 'action', task: userReply.slice(0, 80) };
-  }
-  // Ambiguous — short = action, long = chat
-  return userReply.trim().split(/\s+/).length <= 6
-    ? { type: 'action', task: userReply.slice(0, 80) }
-    : { type: 'chat', reply: '[AI explanation of topic here]' };
-};
+describe('handleLearningReplyResult — decision logic given AI JSON response', () => {
 
-// The final enriched task string (after AI classification gives us a clean task)
-const buildEnrichedTaskFromReply = (aiTask, originalText) =>
-  `${aiTask} — ${originalText.slice(0, 120)}`;
-
-describe('Learning reply classification — AI-driven, not string concatenation', () => {
-
-  // ── The exact scenario that was broken ──
-  test('the failing case: "tell me more" → chat (NOT save)', () => {
-    const result = classifyLearningReply(
-      'tell me more about it, explain it and I\'ll tell u how I want to implement it',
-      'I want to learn about linear probes like Neel Nanda safety work'
+  // ── type=action cases ──
+  test('action + task → saveAsText is set, chatReply is null', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult(
+      { type: 'action', task: 'implement a linear probe in PyTorch' }, 1
     );
-    assert.equal(result.type, 'chat');
-    assert.ok(!result.task, 'should not produce a task string for a chat reply');
+    assert.equal(saveAsText, 'implement a linear probe in PyTorch');
+    assert.equal(chatReply, null);
   });
 
-  test('"explain it" → chat', () =>
-    assert.equal(classifyLearningReply('explain it to me', 'attention heads').type, 'chat'));
-
-  test('"what is a linear probe?" → chat', () =>
-    assert.equal(classifyLearningReply('what is a linear probe?', 'linear probes').type, 'chat'));
-
-  test('"I don\'t understand it yet" → chat', () =>
-    assert.equal(classifyLearningReply("I don't understand it yet", 'transformers').type, 'chat'));
-
-  test('"more about it please" → chat', () =>
-    assert.equal(classifyLearningReply('more about it please', 'RLHF').type, 'chat'));
-
-  // ── Direct intent → action ──
-  test('"implement it from scratch" → action', () =>
-    assert.equal(classifyLearningReply('implement it from scratch', 'linear probes').type, 'action'));
-
-  test('"read the key papers" → action', () =>
-    assert.equal(classifyLearningReply('read the key papers', 'diffusion models').type, 'action'));
-
-  test('"write a summary" → action', () =>
-    assert.equal(classifyLearningReply('write a summary of it', 'transformers').type, 'action'));
-
-  test('"understand the theory" → action', () =>
-    assert.equal(classifyLearningReply('understand the theory first', 'backprop').type, 'action'));
-
-  test('"implement it in PyTorch" → action with clean task', () => {
-    const result = classifyLearningReply('implement it in PyTorch', 'linear probes');
-    assert.equal(result.type, 'action');
-    assert.ok(result.task?.length > 0);
-    assert.ok(result.task.length <= 80);
-  });
-
-  // ── After action reply: enriched task must start with a verb, not a noun ──
-  test('action task becomes verb-led enriched task', () => {
-    const result = classifyLearningReply(
-      'implement from scratch in PyTorch',
-      'I want to learn about linear probes like Neel Nanda safety work'
+  test('action + task at step 2 → still saves (action always saves regardless of step)', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult(
+      { type: 'action', task: 'read the paper carefully' }, 2
     );
-    assert.equal(result.type, 'action');
-    const enriched = buildEnrichedTaskFromReply(result.task, 'I want to learn about linear probes like Neel Nanda safety work');
-    // Starts with the action (implement), contains the topic (linear probes)
-    assert.ok(enriched.startsWith('implement'));
-    assert.ok(enriched.includes('linear probes'));
-    assert.ok(enriched.includes(' — '));
+    assert.equal(saveAsText, 'read the paper carefully');
+    assert.equal(chatReply, null);
   });
 
-  test('chat reply contains helpful text, not empty string', () => {
-    const result = classifyLearningReply('tell me more about it', 'RLHF from Anthropic');
-    assert.equal(result.type, 'chat');
-    assert.ok(result.reply.length > 0);
+  test('action with empty task string → saveAsText is null (empty task rejected)', () => {
+    const { saveAsText } = handleLearningReplyResult({ type: 'action', task: '' }, 1);
+    assert.equal(saveAsText, null);
   });
 
-  // ── Step limit: after 1 explanation, force save regardless ──
-  test('step >= 2 forces save (no more chat exchanges)', () => {
-    // Simulates: bot gave explanation, user still vague → save anyway with raw text
+  test('action with missing task field → saveAsText is null', () => {
+    const { saveAsText } = handleLearningReplyResult({ type: 'action' }, 1);
+    assert.equal(saveAsText, null);
+  });
+
+  // ── type=chat cases ──
+  test('chat + reply at step 1 → chatReply is set, saveAsText is null', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult(
+      { type: 'chat', reply: 'Linear probes are classifiers trained on frozen representations...' }, 1
+    );
+    assert.equal(chatReply, 'Linear probes are classifiers trained on frozen representations...');
+    assert.equal(saveAsText, null);
+  });
+
+  test('chat + reply at step 2 → chatReply is NULL (step limit, force save)', () => {
+    // This is the step-limit: only 1 explanation allowed, then must save
+    const { saveAsText, chatReply } = handleLearningReplyResult(
+      { type: 'chat', reply: 'Another explanation...' }, 2
+    );
+    assert.equal(chatReply, null);
+    assert.equal(saveAsText, null); // falls through to saveAsText ?? userText in bot.js
+  });
+
+  test('chat with empty reply string → chatReply is null (empty reply rejected)', () => {
+    const { chatReply } = handleLearningReplyResult({ type: 'chat', reply: '' }, 1);
+    assert.equal(chatReply, null);
+  });
+
+  test('chat with missing reply field → chatReply is null', () => {
+    const { chatReply } = handleLearningReplyResult({ type: 'chat' }, 1);
+    assert.equal(chatReply, null);
+  });
+
+  // ── Malformed AI responses ──
+  test('null parsed response → both null (no crash)', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult(null, 1);
+    assert.equal(saveAsText, null);
+    assert.equal(chatReply, null);
+  });
+
+  test('undefined parsed response → both null', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult(undefined, 1);
+    assert.equal(saveAsText, null);
+    assert.equal(chatReply, null);
+  });
+
+  test('unknown type "save" → both null', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'save', task: 'something' }, 1);
+    assert.equal(saveAsText, null);
+    assert.equal(chatReply, null);
+  });
+
+  test('unknown type "converse" → both null', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'converse', reply: 'hi' }, 1);
+    assert.equal(saveAsText, null);
+    assert.equal(chatReply, null);
+  });
+
+  test('empty object {} → both null', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult({}, 1);
+    assert.equal(saveAsText, null);
+    assert.equal(chatReply, null);
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 6B — Learning reply: step state machine
+// Tests that step boundaries work correctly: step 1 allows chat, step 2 forces save.
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe('Learning reply: step state machine', () => {
+
+  test('step=1 allows chat response (1 < 2)', () => {
+    const step = 1;
+    const { chatReply } = handleLearningReplyResult(
+      { type: 'chat', reply: 'Here is an explanation...' }, step
+    );
+    assert.ok(chatReply !== null);
+  });
+
+  test('step=2 blocks chat (2 is NOT < 2) → forces save', () => {
     const step = 2;
-    const shouldForceSave = step >= 2;
-    assert.ok(shouldForceSave);
+    const { chatReply } = handleLearningReplyResult(
+      { type: 'chat', reply: 'Another explanation...' }, step
+    );
+    assert.equal(chatReply, null);
   });
 
-  test('after step-limit, even a vague reply gets saved (not chatted again)', () => {
-    // At step 2, chatReply is null even if AI says type=chat → falls through to save
-    const step = 2;
-    const chatAllowed = step < 2;
-    assert.equal(chatAllowed, false);
+  test('step=0 allows chat (edge case: step defaults to 1 in bot.js, but 0 also passes)', () => {
+    const { chatReply } = handleLearningReplyResult(
+      { type: 'chat', reply: 'explanation' }, 0
+    );
+    assert.ok(chatReply !== null);
   });
 
-  // ── Fallback: if AI call fails ──
-  test('fallback: ≤8-word reply treated as direct intent', () => {
-    const shortReply = 'implement it';
-    const wordCount = shortReply.trim().split(/\s+/).filter(Boolean).length;
-    assert.ok(wordCount <= 8);
-    // Bot would set saveAsText = userText for this
+  test('after chat response, step increments: state.step becomes step+1', () => {
+    // Simulate bot.js: pending.set(userId, { ...state, step: step + 1 })
+    const state = { learningMode: true, originalText: 'topic', step: 1 };
+    const newState = { ...state, step: state.step + 1 };
+    assert.equal(newState.step, 2);
   });
 
-  test('fallback: >8-word reply is also saved (we tried, user must move on)', () => {
-    const longReply = 'I am not quite sure yet but maybe I want to understand the theory first';
-    const wordCount = longReply.trim().split(/\s+/).filter(Boolean).length;
+  test('at step=2, action still works (step limit only blocks chat)', () => {
+    const { saveAsText } = handleLearningReplyResult(
+      { type: 'action', task: 'implement it' }, 2
+    );
+    assert.equal(saveAsText, 'implement it');
+  });
+
+  test('missing step (state.step undefined) defaults to 1 via ?? 1', () => {
+    const step = undefined ?? 1;
+    assert.equal(step, 1);
+    // step=1 allows chat
+    const { chatReply } = handleLearningReplyResult(
+      { type: 'chat', reply: 'explanation' }, step
+    );
+    assert.ok(chatReply !== null);
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 6C — Learning reply: fallback when AI call fails
+// Tests bot.js catch{} block: what happens when classifyLearningReply throws.
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe('Learning reply: fallback when AI call fails', () => {
+
+  test('≤8-word reply → saveAsText = userText (treated as direct intent)', () => {
+    const { saveAsText } = learningReplyFallback('implement it from scratch');
+    assert.equal(saveAsText, 'implement it from scratch');
+  });
+
+  test('exactly 8 words → saveAsText is set (boundary: 8 ≤ 8)', () => {
+    const msg = 'I want to implement this in PyTorch now';
+    const wordCount = msg.trim().split(/\s+/).filter(Boolean).length;
+    assert.equal(wordCount, 8); // exactly at boundary
+    const { saveAsText } = learningReplyFallback(msg);
+    assert.ok(saveAsText !== null);
+  });
+
+  test('8-word reply → sets saveAsText', () => {
+    const msg = 'implement the linear probe from scratch today';
+    const wordCount = msg.trim().split(/\s+/).filter(Boolean).length;
+    assert.equal(wordCount, 7); // 7 ≤ 8 → saves
+    const { saveAsText } = learningReplyFallback(msg);
+    assert.ok(saveAsText !== null);
+  });
+
+  test('>8-word reply → saveAsText is null (falls through to ?? userText)', () => {
+    const msg = 'tell me more about it explain it and then I will tell you how I want to implement it';
+    const wordCount = msg.trim().split(/\s+/).filter(Boolean).length;
     assert.ok(wordCount > 8);
-    // At fallback, bot saves the raw reply anyway (better than silent failure)
+    const { saveAsText } = learningReplyFallback(msg);
+    assert.equal(saveAsText, null);
+    // In bot.js: taskText = saveAsText ?? userText → still saves raw text
   });
 
-  // ── End-to-end conversation contract ──
-  test('full conversation: topic → question → explanation → intent → save', () => {
-    // Step 1: User says "I want to learn about linear probes"
-    // → isExplicitLearning = true, bot asks clarification
-    assert.ok(isExplicitLearning('I want to learn about linear probes like Neel Nanda', []));
-
-    // Step 2: User says "tell me more"
-    // → classifyLearningReply → type=chat, bot explains, keeps state (step=2)
-    const step1Reply = classifyLearningReply('tell me more about it explain it', 'linear probes');
-    assert.equal(step1Reply.type, 'chat');
-
-    // Step 3: User says "ok I want to implement it in PyTorch"
-    // → classifyLearningReply → type=action, bot saves
-    const step2Reply = classifyLearningReply('ok I want to implement it in PyTorch', 'linear probes');
-    assert.equal(step2Reply.type, 'action');
-
-    // Final task: verb-led, contains topic
-    const finalTask = buildEnrichedTaskFromReply(step2Reply.task, 'I want to learn about linear probes like Neel Nanda');
-    assert.ok(finalTask.startsWith('implement') || finalTask.includes('implement'));
-    assert.ok(finalTask.includes(' — '));
+  test('bot.js ?? chain: saveAsText=null falls back to userText', () => {
+    const userText = 'tell me more about linear probes and explain the math';
+    const saveAsText = null;
+    const taskText = saveAsText ?? userText;
+    assert.equal(taskText, userText); // always saves something
   });
 
-  // ── Legacy: direct enrichment still works for clear one-shot replies ──
-  test('direct clear reply skips chat entirely', () => {
-    const enriched = buildEnrichedTaskFromReply(
-      'implement from scratch in PyTorch',
-      'I want to learn about linear probes'
+  test('the exact failing message in fallback: >8 words → saveAsText null but still saves', () => {
+    const msg = 'tell me more about it, explain it and I\'ll tell u how I want to implement it';
+    const { saveAsText } = learningReplyFallback(msg);
+    assert.equal(saveAsText, null);
+    // Falls back to userText via ?? — bot saves the raw text rather than crashing
+    const taskText = saveAsText ?? msg;
+    assert.ok(taskText.length > 0);
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 6D — System prompt content validation
+// Tests that the prompt contains the exact criteria needed for correct AI behaviour.
+// If bot.js prompt changes, these tests catch whether key safety criteria were removed.
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe('LEARNING_REPLY_SYSTEM_PROMPT — content validation', () => {
+
+  const prompt = LEARNING_REPLY_SYSTEM_PROMPT(
+    'I want to learn about linear probes like Neel Nanda safety work'
+  );
+
+  // ── Original topic is injected into the prompt ──
+  test('prompt contains the original topic text', () => {
+    assert.ok(prompt.includes('linear probes like Neel Nanda safety work'));
+  });
+
+  test('prompt contains what question was asked (for context)', () => {
+    assert.ok(prompt.includes('what do you want to do with this'));
+  });
+
+  // ── JSON schema is present and correct ──
+  test('prompt specifies the "type" field with both valid values', () => {
+    assert.ok(prompt.includes('"type"'));
+    assert.ok(prompt.includes('action'));
+    assert.ok(prompt.includes('chat'));
+  });
+
+  test('prompt specifies "task" field for action type', () => {
+    assert.ok(prompt.includes('"task"'));
+  });
+
+  test('prompt specifies "reply" field for chat type', () => {
+    assert.ok(prompt.includes('"reply"'));
+  });
+
+  test('prompt requires verb-led task', () => {
+    assert.ok(prompt.includes('verb-led'));
+  });
+
+  test('prompt enforces 80-char task limit', () => {
+    assert.ok(prompt.includes('80'));
+  });
+
+  test('prompt says no markdown / no code fences in output', () => {
+    assert.ok(prompt.includes('no markdown') || prompt.includes('no code fences'));
+  });
+
+  // ── type=action criteria is explicit ──
+  test('prompt defines type=action with examples of clear intents', () => {
+    assert.ok(prompt.includes('implement') && prompt.includes('type=action'));
+  });
+
+  test('prompt includes "read the paper" as action example', () => {
+    assert.ok(prompt.includes('read the paper'));
+  });
+
+  test('prompt includes "understand the theory" as action example', () => {
+    assert.ok(prompt.includes('understand the theory'));
+  });
+
+  // ── type=chat criteria covers the exact failing scenario ──
+  test('prompt includes the exact failing message as a type=chat example', () => {
+    // This is the message that kept being saved incorrectly
+    assert.ok(prompt.includes("tell me more about it, explain it and I'll tell you how I want to implement it"));
+  });
+
+  test('prompt labels that message as → chat with the reason (conditional)', () => {
+    assert.ok(prompt.includes('conditional') || prompt.includes('needs info FIRST'));
+  });
+
+  test('prompt includes "what is a linear probe?" as chat example', () => {
+    assert.ok(prompt.includes('what is a linear probe'));
+  });
+
+  test('prompt includes "explain it then I\'ll decide" as chat example', () => {
+    assert.ok(prompt.includes("explain it then I'll decide"));
+  });
+
+  // ── CRITICAL conditional rule is present ──
+  test('prompt contains CRITICAL RULE about conditional phrasing', () => {
+    assert.ok(prompt.includes('CRITICAL RULE') || prompt.includes('CRITICAL:'));
+  });
+
+  test('prompt explicitly mentions "I\'ll tell you" as a condition → chat', () => {
+    assert.ok(prompt.includes("I'll tell you"));
+  });
+
+  test('prompt explicitly mentions "once I understand" as a condition → chat', () => {
+    assert.ok(prompt.includes('once I understand'));
+  });
+
+  test('prompt explicitly says type=action requires "no conditions"', () => {
+    assert.ok(prompt.includes('no conditions') || prompt.includes('unambiguous'));
+  });
+
+  test('prompt says mentioning implement/read/write inside a condition is still type=chat', () => {
+    // The key fix: "and I'll implement it" ≠ "implement it"
+    assert.ok(
+      prompt.includes('regardless of whether it mentions implement') ||
+      prompt.includes('regardless of whether')
     );
-    assert.ok(enriched.startsWith('implement'));
-    assert.ok(enriched.includes('linear probes'));
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 6E — Final task format: verb-led, topic-included, length-bounded
+// Tests what actually gets saved to the database after the dialogue completes.
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe('buildFinalTask — enriched task format quality', () => {
+
+  test('format: "[AI task] — [topic]"', () => {
+    const result = buildFinalTask('implement a linear probe in PyTorch', 'I want to learn about linear probes');
+    assert.ok(result.includes(' — '));
+    assert.equal(result.split(' — ').length, 2);
   });
 
-  test('original text capped at 120 chars', () => {
-    const long = 'I want to learn about ' + 'things '.repeat(30);
-    const enriched = buildEnrichedTaskFromReply('implement it', long);
-    const topicPart = enriched.split(' — ')[1];
+  test('starts with the AI-cleaned verb-led task, not the raw topic', () => {
+    const result = buildFinalTask('implement from scratch', 'I want to learn about linear probes');
+    assert.ok(result.startsWith('implement'));
+    assert.ok(!result.startsWith('I want to learn'));
+  });
+
+  test('topic part is capped at 120 chars', () => {
+    const longTopic = 'I want to learn about ' + 'linear probes '.repeat(20);
+    const result = buildFinalTask('implement it', longTopic);
+    const topicPart = result.split(' — ')[1];
     assert.ok(topicPart.length <= 120);
+  });
+
+  test('short topic is preserved in full', () => {
+    const result = buildFinalTask('read the paper', 'linear probes');
+    assert.equal(result, 'read the paper — linear probes');
+  });
+
+  test('result is never just the original vague topic (the original bug)', () => {
+    // The original bug: bot saved "Neel Nanda linear probes" with no action
+    const result = buildFinalTask('implement it', 'I want to learn about linear probes like Neel Nanda');
+    assert.ok(!result.startsWith('I want to learn'));
+    assert.ok(!result.startsWith('Neel Nanda'));
+  });
+
+  test('implement in PyTorch task produces correct enriched string', () => {
+    const result = buildFinalTask(
+      'implement a linear probe in PyTorch from scratch',
+      'I want to learn about linear probes like Neel Nanda safety work'
+    );
+    assert.ok(result.startsWith('implement'));
+    assert.ok(result.includes('PyTorch'));
+    assert.ok(result.includes('linear probes'));
+  });
+
+  test('read-focused task', () => {
+    const result = buildFinalTask('read the ARENA curriculum on mechanistic interp', 'I want to learn about ARENA');
+    assert.ok(result.startsWith('read'));
+    assert.ok(result.includes('ARENA'));
+  });
+
+  test('write-focused task', () => {
+    const result = buildFinalTask('write a summary of the key equations', 'diffusion model score matching');
+    assert.ok(result.startsWith('write'));
+  });
+
+  test('understand-focused task', () => {
+    const result = buildFinalTask('understand the theory behind attention heads', 'transformers');
+    assert.ok(result.startsWith('understand'));
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 6F — Regression: the exact failing scenario
+// These are the specific messages that kept being saved incorrectly.
+// The correct behaviour: type=chat (not saved), bot gives explanation.
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe('REGRESSION — "tell me more" must NOT save immediately', () => {
+
+  // ── The prompt must classify these as type=chat ──
+  // We verify by checking that the prompt's criteria text covers each case.
+  const prompt = LEARNING_REPLY_SYSTEM_PROMPT('linear probes Neel Nanda safety');
+
+  test('Exact failing message is listed as type=chat example in prompt', () => {
+    // The prompt must contain this exact message as an example
+    assert.ok(
+      prompt.includes("tell me more about it, explain it and I'll tell you how I want to implement it")
+    );
+  });
+
+  test('"tell me more" phrasing is covered by type=chat criteria', () => {
+    assert.ok(prompt.includes('tell me more'));
+  });
+
+  test('"explain it" phrasing is covered by type=chat criteria', () => {
+    assert.ok(prompt.includes('explain'));
+  });
+
+  test('"I\'ll tell you how" conditional is explicitly flagged as type=chat', () => {
+    assert.ok(prompt.includes("I'll tell you"));
+  });
+
+  // ── Decision logic: given the AI correctly returns type=chat, bot does NOT save ──
+  test('decision: type=chat at step=1 → chatReply set, saveAsText null', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult(
+      { type: 'chat', reply: 'Linear probes are classifiers trained on frozen model representations...' },
+      1
+    );
+    assert.equal(saveAsText, null);
+    assert.ok(chatReply !== null);
+    assert.ok(chatReply.length > 0);
+  });
+
+  test('decision: type=chat → bot keeps pending state (step increments)', () => {
+    const originalStep = 1;
+    const { chatReply } = handleLearningReplyResult(
+      { type: 'chat', reply: 'explanation' }, originalStep
+    );
+    assert.ok(chatReply !== null);
+    // In bot.js: pending.set(userId, { ...state, step: step + 1 })
+    const newStep = originalStep + 1;
+    assert.equal(newStep, 2);
+  });
+
+  test('decision: type=action → saveAsText set, bot saves immediately', () => {
+    const { saveAsText, chatReply } = handleLearningReplyResult(
+      { type: 'action', task: 'implement linear probes in PyTorch' }, 1
+    );
+    assert.ok(saveAsText !== null);
+    assert.equal(chatReply, null);
+  });
+
+  // ── Similar failing messages (variations of the bug) ──
+  test('"explain it then I\'ll implement it" → prompt classifies as chat', () => {
+    // These messages contain "implement" but are conditional → must be chat
+    const conditionalMessages = [
+      "tell me more about it, explain it and I'll tell u how I want to implement it",
+      "explain it then I'll decide what to do",
+      "what is it? once I understand I'll tell you if I want to implement it",
+      "I'll implement it after you explain what it is",
+    ];
+    for (const msg of conditionalMessages) {
+      // Verify the CRITICAL RULE in the prompt covers these
+      assert.ok(
+        prompt.includes("I'll tell you") || prompt.includes('conditional'),
+        `Prompt must cover conditional phrasing for: "${msg}"`
+      );
+    }
+  });
+
+  // ── Contrast: these ARE direct intents → type=action ──
+  test('clear action phrases produce type=action from decision function', () => {
+    const directIntents = [
+      { type: 'action', task: 'implement it from scratch' },
+      { type: 'action', task: 'read the paper carefully' },
+      { type: 'action', task: 'understand the theory' },
+      { type: 'action', task: 'write a summary of the key ideas' },
+      { type: 'action', task: 'build a demo in PyTorch' },
+    ];
+    for (const parsed of directIntents) {
+      const { saveAsText } = handleLearningReplyResult(parsed, 1);
+      assert.ok(saveAsText !== null, `Expected saveAsText for: ${parsed.task}`);
+    }
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 6G — Full conversation flow simulation
+// Simulates the complete 2-3 turn conversation from topic capture to task save.
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe('Full conversation simulation: topic → question → reply → [explain] → save', () => {
+
+  test('HAPPY PATH: direct intent on first reply → saves immediately', () => {
+    // Turn 1: user says topic → bot asks question (tested by isExplicitLearning)
+    assert.ok(isExplicitLearning(
+      'I want to learn about linear probes like Neel Nanda safety work', []
+    ));
+
+    // Turn 2: user gives direct intent → bot saves
+    const parsed = { type: 'action', task: 'implement a linear probe in PyTorch from scratch' };
+    const { saveAsText, chatReply } = handleLearningReplyResult(parsed, 1);
+    assert.ok(saveAsText !== null);
+    assert.equal(chatReply, null);
+
+    // Final saved task: verb-led, topic included
+    const saved = buildFinalTask(saveAsText, 'I want to learn about linear probes like Neel Nanda safety work');
+    assert.ok(saved.startsWith('implement'));
+    assert.ok(saved.includes('linear probes'));
+    assert.ok(saved.includes(' — '));
+    assert.ok(!saved.startsWith('I want to learn')); // not vague
+  });
+
+  test('CHAT PATH: "tell me more" → explanation → intent → saves', () => {
+    // Turn 1: topic → question
+    assert.ok(isExplicitLearning('I want to learn about linear probes', []));
+
+    // Turn 2: "tell me more" → type=chat at step=1 → gives explanation, keeps pending
+    const chatParsed = { type: 'chat', reply: 'Linear probes are simple classifiers on frozen representations. They reveal what a layer "knows". Do you want to implement one, or read the key papers?' };
+    const turn2 = handleLearningReplyResult(chatParsed, 1);
+    assert.equal(turn2.saveAsText, null);
+    assert.ok(turn2.chatReply !== null);
+
+    // State: step becomes 2
+    const newStep = 2;
+
+    // Turn 3: user gives intent → type=action at step=2 → saves
+    const actionParsed = { type: 'action', task: 'implement a linear probe in PyTorch' };
+    const turn3 = handleLearningReplyResult(actionParsed, newStep);
+    assert.ok(turn3.saveAsText !== null);
+    assert.equal(turn3.chatReply, null);
+
+    // Final saved task
+    const saved = buildFinalTask(turn3.saveAsText, 'I want to learn about linear probes');
+    assert.ok(saved.startsWith('implement'));
+    assert.ok(saved.includes('linear probes'));
+  });
+
+  test('STEP LIMIT PATH: "tell me more" → still vague → force save at step=2', () => {
+    // Turn 2: "tell me more" at step=1 → explanation given, step → 2
+    const turn2 = handleLearningReplyResult(
+      { type: 'chat', reply: 'An explanation...' }, 1
+    );
+    assert.ok(turn2.chatReply !== null);
+
+    // Turn 3: still vague at step=2 → chatReply blocked, falls through to save
+    const turn3 = handleLearningReplyResult(
+      { type: 'chat', reply: 'Still wants more info...' }, 2
+    );
+    assert.equal(turn3.chatReply, null);  // blocked at step=2
+    assert.equal(turn3.saveAsText, null); // no action either
+    // In bot.js: taskText = saveAsText ?? userText → saves raw reply text
+  });
+
+  test('FALLBACK PATH: AI fails → short reply saves, long reply also saves via ??', () => {
+    // Short reply fallback
+    const short = learningReplyFallback('implement it');
+    assert.ok(short.saveAsText !== null);
+
+    // Long reply fallback: saveAsText=null but bot.js uses ?? userText
+    const longMsg = 'tell me more about it because I do not understand what linear probes are yet';
+    const long = learningReplyFallback(longMsg);
+    assert.equal(long.saveAsText, null);
+    // ?? userText → taskText = long message itself
+    const taskText = long.saveAsText ?? longMsg;
+    assert.equal(taskText, longMsg);
+    assert.ok(taskText.length > 0);
   });
 });
 

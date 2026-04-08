@@ -323,20 +323,30 @@ app.message(async ({ message, say }) => {
 
       try {
         const result = await callModelWithFallback('gemini-flash', 'deepseek-chat', {
-          system: `You help capture personal learning tasks from conversational messages.
+          system: `You classify a conversational reply to help capture a personal learning task.
 
-The user said they want to learn: "${state.originalText.slice(0, 200)}"
+The user wants to learn about: "${state.originalText.slice(0, 200)}"
 You asked: "what do you want to do with this — read, implement something, understand the theory, or write about it?"
 
-Classify their reply and return ONLY valid JSON (no markdown):
+Return ONLY valid JSON (no markdown, no code fences):
 {
   "type": "action" | "chat",
-  "task": "verb-led actionable task, max 80 chars (only when type=action)",
-  "reply": "2-3 plain sentences explaining the topic concisely, ending with a specific question like 'do you want to implement it, read the key papers, or understand the theory?' (only when type=chat)"
+  "task": "verb-led task, max 80 chars (ONLY when type=action, e.g. 'implement a linear probe in PyTorch')",
+  "reply": "2-3 sentences explaining the topic + question nudging toward a specific intent (ONLY when type=chat)"
 }
 
-type=action: reply describes a clear intent — implement, read, write, understand, build, explore, do X with it
-type=chat: reply asks for more info, wants explanation first, or is vague/conversational ("tell me more", "what is that", "explain it")`,
+type=action — ONLY when the reply is a complete, unconditional task statement:
+  EXAMPLES: "implement it from scratch" / "read the paper" / "understand the theory" / "write a summary" / "build a demo"
+
+type=chat — when the user wants explanation before committing, asks a question, or defers the decision:
+  EXAMPLES:
+  "tell me more about it, explain it and I'll tell you how I want to implement it" → chat (conditional: needs info FIRST)
+  "what is a linear probe?" → chat (question)
+  "I don't understand it yet" → chat (not ready)
+  "explain it then I'll decide" → chat (explicitly defers)
+  "how does it work?" → chat (question)
+
+CRITICAL RULE: if the reply contains "after you explain", "I'll tell you", "once I understand", "then I'll decide", or ANY condition — it is type=chat regardless of whether it mentions implement/read/write. Only choose type=action when the entire reply is an unambiguous task with no conditions attached.`,
           messages: [{ role: 'user', content: userText }],
           maxTokens: 220,
         });
