@@ -21,13 +21,14 @@
  *             routedBy, routingCost }
  */
 
-import { NextResponse }      from 'next/server';
-import { route }             from '../../../lib/router.js';
-import { scrapeApplication } from '../../../scraper/index.js';
-import { supabase }          from '../../../lib/supabase.js';
-import { PROJECTS }          from '../../../lib/projects.js';
+import { NextResponse }           from 'next/server';
+import { route }                  from '../../../lib/router.js';
+import { scrapeApplication }      from '../../../scraper/index.js';
+import { supabase }               from '../../../lib/supabase.js';
+import { PROJECTS }               from '../../../lib/projects.js';
+import { chatWithModel }          from '../../../lib/multiModelClient.js';
 
-// ── Fetch page title + meta description ──────────────────────────────────────
+// ── Fetch page HTML (title + body text for AI summary) ───────────────────────
 function decodeHtmlEntities(str) {
   return str
     .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
@@ -37,14 +38,14 @@ function decodeHtmlEntities(str) {
 
 async function fetchPageMeta(url) {
   try {
-    const res  = await fetch(url, {
+    const res    = await fetch(url, {
       signal:  AbortSignal.timeout(5000),
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProjectOS/1.0)' },
     });
-    // Read only first 8 KB — title and meta are always in <head>
     const reader = res.body.getReader();
     let html = '';
-    while (html.length < 8000) {
+    // Read up to 20 KB — enough for <head> + first few paragraphs of body
+    while (html.length < 20000) {
       const { done, value } = await reader.read();
       if (done) break;
       html += new TextDecoder().decode(value);
@@ -52,15 +53,36 @@ async function fetchPageMeta(url) {
     reader.cancel();
 
     const titleMatch = html.match(/<title[^>]*>([^<]{1,200})<\/title>/i);
-    const descMatch  = html.match(/<meta[^>]+(?:name=["']description["']|property=["']og:description["'])[^>]+content=["']([^"']{1,300})["']/i)
-                    ?? html.match(/<meta[^>]+content=["']([^"']{1,300})["'][^>]+(?:name=["']description["']|property=["']og:description["'])/i);
+    const title      = titleMatch ? decodeHtmlEntities(titleMatch[1]) : null;
 
-    return {
-      title:       titleMatch ? decodeHtmlEntities(titleMatch[1]) : null,
-      description: descMatch  ? decodeHtmlEntities(descMatch[1])  : null,
-    };
+    // Strip all tags, collapse whitespace → readable plain text for AI
+    const bodyText = html
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 1500);   // first ~1500 chars of readable content
+
+    return { title, bodyText };
   } catch {
-    return { title: null, description: null };
+    return { title: null, bodyText: null };
+  }
+}
+
+// ── AI one-liner: factual, specific, no marketing ────────────────────────────
+async function generateDescription(title, bodyText, url) {
+  if (!bodyText && !title) return null;
+  const content = [title, bodyText].filter(Boolean).join('\n').slice(0, 1200);
+  try {
+    const result = await chatWithModel('gemini-flash', {
+      system:   'You write one-sentence descriptions of web pages. Be specific and factual — describe what it actually is and does, not marketing language. Max 20 words. No full stop at the end.',
+      messages: [{ role: 'user', content: `URL: ${url}\n\n${content}` }],
+      maxTokens: 60,
+    });
+    return result.text?.trim().replace(/\.$/, '') ?? null;
+  } catch {
+    return null;
   }
 }
 
@@ -115,7 +137,8 @@ export async function POST(req) {
   if (url) {
     const meta = await fetchPageMeta(url);
     itemTitle = meta.title;
-    itemDesc  = meta.description;
+    // AI generates a factual one-liner, not meta marketing copy
+    itemDesc  = await generateDescription(meta.title, meta.bodyText, url);
   }
 
   if (!itemTitle) {
