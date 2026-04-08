@@ -302,13 +302,21 @@ app.message(async ({ message, say }) => {
     if (state.correctionMode) {
       const proj = parseProjectFromText(userText);
       if (!proj) {
+        const reaskCount = (state.correctionStep ?? 0) + 1;
+        if (reaskCount >= 2) {
+          // Gave up — just confirm it stays where it is
+          pending.delete(userId);
+          await say(`ok, keeping it as-is`);
+          return;
+        }
+        pending.set(userId, { ...state, correctionStep: reaskCount });
         await say("didn't catch that — try: school, work, learning, research, art, baking, beads, circuits, reading, exercise, personal");
         return;
       }
       pending.delete(userId);
       await callCorrect(state.logId, proj, userText);
       lastSaved.delete(userId);
-      await say(`logged as ${proj}`);
+      await say(`moved to ${proj} ✓`);
       return;
     }
 
@@ -453,6 +461,18 @@ RULE: if the reply mentions wanting to "figure out", asks a question, says they 
     if (!isNewUrl) {
       const context = parseClarificationContext(userText);
       if (!context) {
+        const reaskCount = (state.clarStep ?? 0) + 1;
+        if (reaskCount >= 2) {
+          // Can't determine context — save without forcing work/personal
+          pending.delete(userId);
+          try {
+            const data = await callInbox({ url: state.url ?? undefined, text: state.text, source: 'slack' });
+            if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
+            await reply(message.channel, buildSuccessMessage(data, {}));
+          } catch { await say('saved ✓'); }
+          return;
+        }
+        pending.set(userId, { ...state, clarStep: reaskCount });
         await say('work or personal?');
         return;
       }

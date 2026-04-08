@@ -759,6 +759,87 @@ describe('Learning reply: fallback when AI call fails', () => {
 
 
 // ══════════════════════════════════════════════════════════════════════════════
+// SECTION 6C2 — bareAction fast-path regex
+// Tests the regex that lets "read", "implement", etc. skip AI and save immediately.
+// Must stay in sync with bot.js learningMode bareAction regex.
+// ══════════════════════════════════════════════════════════════════════════════
+
+const bareActionRegex = /^(read|implement|write|understand|learn|theory|both|all)(\s+(it|the paper|more|about it|everything))?$/i;
+
+describe('bareAction fast-path — saves without AI call', () => {
+
+  test('"read" alone → matches (single word action)', () => {
+    assert.ok(bareActionRegex.test('read'));
+  });
+
+  test('"implement" → matches', () => {
+    assert.ok(bareActionRegex.test('implement'));
+  });
+
+  test('"write" → matches', () => {
+    assert.ok(bareActionRegex.test('write'));
+  });
+
+  test('"understand" → matches', () => {
+    assert.ok(bareActionRegex.test('understand'));
+  });
+
+  test('"learn" → matches', () => {
+    assert.ok(bareActionRegex.test('learn'));
+  });
+
+  test('"theory" → matches', () => {
+    assert.ok(bareActionRegex.test('theory'));
+  });
+
+  test('"both" → matches (user wants multiple options)', () => {
+    assert.ok(bareActionRegex.test('both'));
+  });
+
+  test('"all" → matches', () => {
+    assert.ok(bareActionRegex.test('all'));
+  });
+
+  test('"read it" → matches (verb + pronoun)', () => {
+    assert.ok(bareActionRegex.test('read it'));
+  });
+
+  test('"read the paper" → matches', () => {
+    assert.ok(bareActionRegex.test('read the paper'));
+  });
+
+  test('"implement it" → matches', () => {
+    assert.ok(bareActionRegex.test('implement it'));
+  });
+
+  test('"understand the theory" → does NOT match (bareAction handles "understand" not "understand the theory")', () => {
+    // "understand" alone matches, "understand the theory" is 3 words — suffix group is: it|the paper|more|about it|everything
+    // "the theory" is not in the suffix group → does not match
+    assert.ok(!bareActionRegex.test('understand the theory'));
+  });
+
+  test('"tell me more" → does NOT match (not an action word)', () => {
+    assert.ok(!bareActionRegex.test('tell me more'));
+  });
+
+  test('"I want to read it" → does NOT match (has prefix words)', () => {
+    assert.ok(!bareActionRegex.test('I want to read it'));
+  });
+
+  test('"implement it from scratch" → does NOT match (too long for fast-path)', () => {
+    assert.ok(!bareActionRegex.test('implement it from scratch'));
+  });
+
+  test('REGRESSION: "read" should save without infinite loop', () => {
+    // This was the exact failing case — user said "read" and got looped
+    assert.ok(bareActionRegex.test('read'));
+    assert.ok(bareActionRegex.test('Read'));  // case-insensitive
+    assert.ok(bareActionRegex.test('READ'));
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
 // SECTION 6D — System prompt content validation
 // Tests that the prompt contains the exact criteria needed for correct AI behaviour.
 // If bot.js prompt changes, these tests catch whether key safety criteria were removed.
@@ -1094,7 +1175,7 @@ describe('Full conversation simulation: topic → question → reply → [explai
     );
     assert.equal(turn3.chatReply, null);  // blocked at step=2
     assert.equal(turn3.saveAsText, null); // no action either
-    // In bot.js: taskText = saveAsText ?? userText → saves raw reply text
+    // In bot.js: else if (type=chat && step>=2) → saves "Explore and learn about [topic]"
   });
 
   test('FALLBACK PATH: AI fails at step=1 → re-asks; at step=2 → saves generic task', () => {
