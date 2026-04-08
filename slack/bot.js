@@ -321,6 +321,19 @@ app.message(async ({ message, say }) => {
       let saveAsText = null;  // AI-extracted clean task — set ONLY on unambiguous action
       let chatReply  = null;  // explanation to send — set when user still exploring
 
+      // ── Fast-path: bare action words need no AI ────────────────────────────
+      const bareAction = /^(read|implement|write|understand|learn|theory|both|all)(\s+(it|the paper|more|about it|everything))?$/i.test(userText.trim());
+      if (bareAction) {
+        pending.delete(userId);
+        const task     = userText.trim().toLowerCase();
+        const enriched = `${task} — ${state.originalText.slice(0, 120)}`;
+        try {
+          const data = await callInbox({ text: enriched, source: 'slack', project: 'learning_tech' });
+          await say(buildSuccessMessage(data));
+        } catch { await say('saved ✓'); }
+        return;
+      }
+
       try {
         // Use deepseek-chat as primary here — it follows strict classification rules
         // more reliably than Gemini Flash for ambiguous conversational inputs.
@@ -386,9 +399,20 @@ RULE: if the reply mentions wanting to "figure out", asks a question, says they 
         return;
       }
 
-      // No clear intent yet at step 1 (AI failed or unclear) → re-ask rather than save garbage
+      // No clear intent yet — re-ask once, then force-save to prevent infinite loop
       if (!saveAsText) {
-        // Keep pending state; re-prompt with clarification question
+        if (step >= 2) {
+          // Already re-asked — save generic task rather than looping forever
+          pending.delete(userId);
+          const enriched = `Explore and learn about ${state.originalText.slice(0, 60)} — ${state.originalText.slice(0, 120)}`;
+          try {
+            const data = await callInbox({ text: enriched, source: 'slack', project: 'learning_tech' });
+            await say(buildSuccessMessage(data));
+          } catch { await say('saved to Learning & Tech ✓'); }
+          return;
+        }
+        // Increment step so the next re-ask breaks the loop
+        pending.set(userId, { ...state, step: step + 1 });
         await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
         return;
       }
