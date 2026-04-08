@@ -164,10 +164,16 @@ type=action: reply is a short unambiguous task commitment. Examples:
 type=chat: everything else — user wants more info, is exploring, asking questions, or hasn't decided. When in doubt: chat.`;
 
 const LEARNING_EXPLAIN_PROMPT = (originalText) =>
-`You are a helpful learning assistant. The user wants to learn about: "${originalText.slice(0, 150)}"
-Explain this topic in 2-3 sentences: what it is, why it matters, and how people typically use it.
-End with exactly one question: "Would you like to read about it, implement something, or understand the theory?"
-Plain text only — no markdown, no lists, no bullet points.`;
+`You are a knowledgeable research companion in an ongoing Slack conversation.
+Topic the user is exploring: "${originalText.slice(0, 150)}"
+
+Rules:
+- Do NOT re-introduce or define the topic from scratch — respond directly to what the user just said.
+- Be specific: cite real papers, researchers, findings, and benchmarks by name when you know them. If something is a landmark result or recent breakthrough, say so naturally.
+- If you reference a paper or line of work worth following up on, note it in passing — e.g. "that's worth adding to a reading queue" or "the Marks et al. 2023 paper on this is surprisingly accessible".
+- Write like a colleague who knows this area deeply: skip "Great question!", no textbook openers, no bullet points, no headers.
+- End with something specific to the thread of this conversation — an observation or question that opens the next line of inquiry. Not a menu of options.
+- Plain text only. Around 4-5 sentences.`;
 
 /**
  * Decision logic: given the parsed Call 1 JSON (only has {type}) and the current step,
@@ -181,23 +187,24 @@ function handleLearningReplyResult(parsed, step) {
   if (parsed?.type === 'action') {
     // bot.js uses userText.trim().slice(0, 60) as saveAsText — simulate with a placeholder
     saveAsText = 'action-task';
-  } else if (parsed?.type === 'chat' && step < 3) {
+  } else if (parsed?.type === 'chat' && step < 8) {
     // chatReply is set by Call 2 (explain call) — from test perspective, mark as "would explain"
+    // Step cap is 8: at step=8 bot sends a soft check-in instead (handled inline in bot.js)
     chatReply = 'would-explain';
   }
   return { saveAsText, chatReply };
 }
 
 /**
- * Fallback when AI call fails.
- * step=1: return null → bot re-asks.
- * step>=2: saves generic "Explore and learn about [topic]" task.
+ * Fallback when AI classify call fails.
+ * step<3: return null → bot re-asks (too early to give up).
+ * step>=3: saves generic "Explore and learn about [topic]" task.
  */
 function learningReplyFallback(userText, step, originalText) {
-  if (step >= 2) {
+  if (step >= 3) {
     return { saveAsText: `Explore and learn about ${originalText.slice(0, 60)}` };
   }
-  // step=1: return null → bot re-asks (does NOT save raw conversational text)
+  // step<3: return null → bot re-asks (does NOT save raw conversational text)
   return { saveAsText: null };
 }
 
@@ -583,17 +590,23 @@ describe('handleLearningReplyResult — decision logic given Call 1 JSON (type o
     assert.equal(saveAsText, null);
   });
 
-  test('chat at step 2 → chatReply set (step cap is now 3)', () => {
+  test('chat at step 2 → chatReply set (step cap is now 8)', () => {
     const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'chat' }, 2);
     assert.ok(chatReply !== null);
     assert.equal(saveAsText, null);
   });
 
-  test('chat at step 3 → chatReply is NULL (step limit reached, force save)', () => {
-    // Step cap is 3 — at step=3 the bot force-saves instead of explaining again
+  test('chat at step 3 → chatReply set (step 3 still within cap of 8)', () => {
     const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'chat' }, 3);
+    assert.ok(chatReply !== null);
+    assert.equal(saveAsText, null);
+  });
+
+  test('chat at step 8 → chatReply is NULL (step limit reached, bot sends soft check-in)', () => {
+    // At step=8 bot.js sends a soft check-in instead of explaining again
+    const { saveAsText, chatReply } = handleLearningReplyResult({ type: 'chat' }, 8);
     assert.equal(chatReply, null);
-    assert.equal(saveAsText, null); // bot.js sets generic task inline at this point
+    assert.equal(saveAsText, null); // bot.js handles soft check-in inline
   });
 
   // ── Malformed AI responses ──
@@ -641,13 +654,23 @@ describe('Learning reply: step state machine', () => {
     assert.ok(chatReply !== null);
   });
 
-  test('step=2 still allows chat (2 < 3) — second explanation permitted', () => {
+  test('step=2 still allows chat (2 < 8)', () => {
     const { chatReply } = handleLearningReplyResult({ type: 'chat' }, 2);
     assert.ok(chatReply !== null);
   });
 
-  test('step=3 blocks chat (3 is NOT < 3) → both null, bot force-saves inline', () => {
-    const { chatReply, saveAsText } = handleLearningReplyResult({ type: 'chat' }, 3);
+  test('step=3 still allows chat (3 < 8)', () => {
+    const { chatReply } = handleLearningReplyResult({ type: 'chat' }, 3);
+    assert.ok(chatReply !== null);
+  });
+
+  test('step=7 still allows chat (7 < 8) — last exchange before soft check-in', () => {
+    const { chatReply } = handleLearningReplyResult({ type: 'chat' }, 7);
+    assert.ok(chatReply !== null);
+  });
+
+  test('step=8 blocks chat (8 is NOT < 8) → both null, bot sends soft check-in inline', () => {
+    const { chatReply, saveAsText } = handleLearningReplyResult({ type: 'chat' }, 8);
     assert.equal(chatReply, null);
     assert.equal(saveAsText, null);
   });
@@ -702,24 +725,29 @@ describe('Learning reply: fallback when AI call fails', () => {
     assert.equal(saveAsText, null);
   });
 
-  test('step=2 fallback → saveAsText is generic "Explore and learn about [topic]"', () => {
+  test('step=2 fallback → null (re-ask; threshold is step>=3, still too early to give up)', () => {
     const { saveAsText } = learningReplyFallback('still not sure', 2, topic);
+    assert.equal(saveAsText, null);
+  });
+
+  test('step=3 fallback → saveAsText is generic "Explore and learn about [topic]"', () => {
+    const { saveAsText } = learningReplyFallback('still not sure', 3, topic);
     assert.ok(saveAsText !== null);
     assert.ok(saveAsText.startsWith('Explore and learn about'));
     assert.ok(saveAsText.includes('linear probes'));
   });
 
-  test('step=2 fallback uses originalText, not the current reply', () => {
+  test('step=3 fallback uses originalText, not the current reply', () => {
     const reply       = 'I still want to figure out what to do';
     const originalTop = 'attention heads and induction circuits';
-    const { saveAsText } = learningReplyFallback(reply, 2, originalTop);
+    const { saveAsText } = learningReplyFallback(reply, 3, originalTop);
     assert.ok(saveAsText.includes('attention heads'));
     assert.ok(!saveAsText.includes('figure out what to do'));
   });
 
-  test('step=2 fallback trims originalText to 60 chars', () => {
+  test('step=3 fallback trims originalText to 60 chars', () => {
     const longTopic = 'a'.repeat(80);
-    const { saveAsText } = learningReplyFallback('whatever', 2, longTopic);
+    const { saveAsText } = learningReplyFallback('whatever', 3, longTopic);
     // "Explore and learn about " (24 chars) + 60 chars of topic = max 84 chars
     assert.ok(saveAsText.length <= 84);
   });
@@ -870,8 +898,8 @@ describe('LEARNING_EXPLAIN_PROMPT — Call 2 content validation', () => {
     assert.ok(prompt.includes('linear probes like Neel Nanda safety work'));
   });
 
-  test('prompt asks for 2-3 sentences of explanation', () => {
-    assert.ok(prompt.includes('2-3 sentences') || prompt.includes('2–3 sentences'));
+  test('prompt asks for around 4-5 sentences', () => {
+    assert.ok(prompt.includes('4-5 sentences') || prompt.includes('4–5 sentences'));
   });
 
   test('prompt requires plain text — explicitly forbids markdown', () => {
@@ -884,17 +912,20 @@ describe('LEARNING_EXPLAIN_PROMPT — Call 2 content validation', () => {
     assert.ok(!prompt.includes('JSON'));
   });
 
-  test('prompt asks the explanation to end with a specific question', () => {
-    assert.ok(prompt.includes('Would you like to read') || prompt.includes('implement something'));
+  test('prompt instructs model to end with something specific to conversation, not a menu', () => {
+    assert.ok(prompt.includes('Not a menu') || prompt.includes('thread of this conversation') || prompt.includes('next line of inquiry'));
   });
 
-  test('prompt covers what makes a good explanation (what it is, why it matters, use cases)', () => {
+  test('prompt encourages citing real papers and researchers by name', () => {
     assert.ok(
-      prompt.includes('what it is') ||
-      prompt.includes('why it matters') ||
-      prompt.includes('use it') ||
-      prompt.includes('typically use')
+      prompt.includes('papers') ||
+      prompt.includes('researchers') ||
+      prompt.includes('cite')
     );
+  });
+
+  test('prompt tells model NOT to re-introduce the topic from scratch', () => {
+    assert.ok(prompt.includes('NOT re-introduce') || prompt.includes('Do NOT re-introduce'));
   });
 });
 
@@ -1083,43 +1114,44 @@ describe('Full conversation simulation: topic → question → reply → [explai
     assert.equal(turn3.chatReply, null);
   });
 
-  test('STEP LIMIT PATH: vague → explain → vague → explain → vague → force save at step=3', () => {
-    // Step 1: chat → explain (step → 2)
-    const turn2 = handleLearningReplyResult({ type: 'chat' }, 1);
-    assert.ok(turn2.chatReply !== null);
+  test('STEP LIMIT PATH: 8 chat turns allowed; at step=8 bot sends soft check-in instead', () => {
+    // Steps 1-7: all allow chat (step < 8)
+    for (let s = 1; s <= 7; s++) {
+      const turn = handleLearningReplyResult({ type: 'chat' }, s);
+      assert.ok(turn.chatReply !== null, `step=${s} should still allow chat`);
+    }
 
-    // Step 2: still chat → explain again (step → 3)
-    const turn3 = handleLearningReplyResult({ type: 'chat' }, 2);
-    assert.ok(turn3.chatReply !== null);
-
-    // Step 3: still chat → BLOCKED (step >= 3), bot.js saves generic inline
-    const turn4 = handleLearningReplyResult({ type: 'chat' }, 3);
-    assert.equal(turn4.chatReply, null);
-    assert.equal(turn4.saveAsText, null); // bot.js sets generic task inline
+    // Step 8: BLOCKED — bot.js sends soft check-in inline (both null from helper)
+    const turn9 = handleLearningReplyResult({ type: 'chat' }, 8);
+    assert.equal(turn9.chatReply, null);
+    assert.equal(turn9.saveAsText, null);
   });
 
-  test('FALLBACK PATH: AI classify fails at step=1 → re-asks; at step=2 → saves generic task', () => {
+  test('FALLBACK PATH: AI classify fails at step=1,2 → re-asks; at step=3 → saves generic task', () => {
     const topic = 'linear probes in neural networks';
 
-    // Step=1 classify failure → null → bot re-asks
+    // Step=1,2 classify failure → null → bot re-asks (threshold is step>=3)
     const step1 = learningReplyFallback('tell me more', 1, topic);
     assert.equal(step1.saveAsText, null);
 
-    // Step=2 classify failure → saves generic
     const step2 = learningReplyFallback('still not sure', 2, topic);
-    assert.ok(step2.saveAsText !== null);
-    assert.ok(step2.saveAsText.startsWith('Explore and learn about'));
-    assert.ok(step2.saveAsText.includes('linear probes'));
+    assert.equal(step2.saveAsText, null);
+
+    // Step=3 classify failure → saves generic
+    const step3 = learningReplyFallback('still not sure', 3, topic);
+    assert.ok(step3.saveAsText !== null);
+    assert.ok(step3.saveAsText.startsWith('Explore and learn about'));
+    assert.ok(step3.saveAsText.includes('linear probes'));
   });
 
-  test('STEP LIMIT: step=3 chat → handleLearningReplyResult returns both null (bot.js adds generic inline)', () => {
-    const result = handleLearningReplyResult({ type: 'chat' }, 3);
+  test('STEP LIMIT: step=8 chat → handleLearningReplyResult returns both null (bot.js sends soft check-in)', () => {
+    const result = handleLearningReplyResult({ type: 'chat' }, 8);
     assert.equal(result.chatReply, null);
     assert.equal(result.saveAsText, null);
   });
 
-  test('FALLBACK: AI exception at step=2 → learningReplyFallback saves generic task', () => {
-    const fallback = learningReplyFallback('Still vague...', 2, 'linear probes');
+  test('FALLBACK: AI exception at step=3 → learningReplyFallback saves generic task', () => {
+    const fallback = learningReplyFallback('Still vague...', 3, 'linear probes');
     assert.ok(fallback.saveAsText.startsWith('Explore and learn about'));
     assert.ok(fallback.saveAsText.includes('linear probes'));
   });

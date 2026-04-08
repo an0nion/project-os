@@ -81,7 +81,8 @@ Return ONLY valid JSON (no markdown, no explanation):
   "timeline": string or null,
   "project_hint": string or null,
   "corrected_project": string or null,
-  "needs_clarification": boolean
+  "needs_clarification": boolean,
+  "priority_tier": 1 | 2 | 3 | 4 | null
 }
 
 INTENT — pick exactly one:
@@ -110,7 +111,14 @@ project_hint: one of ${PROJECT_KEYS.join(', ')} — only when clearly identifiab
 
 corrected_project: same enum — only set if intent=correct AND user named a project; null otherwise
 
-needs_clarification: true ONLY if intent=save AND context is null AND content is tech-related (GitHub, paper, tool) where work vs personal distinction matters for routing`;
+needs_clarification: true ONLY if intent=save AND context is null AND content is tech-related (GitHub, paper, tool) where work vs personal distinction matters for routing
+
+priority_tier: urgency and importance tier for task prioritisation:
+  1 = hard deadline — specific date/time, exam, submission, interview; must happen by then
+  2 = medium deadline — school/work/research task within weeks; time-bound but flexible
+  3 = medium goal — personal learning, longer-term project, no firm deadline
+  4 = hobby/interest — baking, art, reading, exercise, beadwork; whenever you get to it
+  null = unclear from this message`;
 
 async function classifyIntent(text, urls) {
   const words = text.trim().split(/\s+/).filter(Boolean);
@@ -149,6 +157,7 @@ async function classifyIntent(text, urls) {
       project_hint:        parsed.project_hint        ?? null,
       corrected_project:   parsed.corrected_project   ?? null,
       needs_clarification: parsed.needs_clarification ?? false,
+      priority_tier:       parsed.priority_tier       ?? null,
     };
   } catch (err) {
     console.warn('[intent] classify failed:', err.message);
@@ -158,6 +167,7 @@ async function classifyIntent(text, urls) {
       intent: isShort ? 'converse' : 'save',
       context: null, timeline: null, project_hint: null,
       corrected_project: null, needs_clarification: false,
+      priority_tier: null,
     };
   }
 }
@@ -321,11 +331,15 @@ app.message(async ({ message, say }) => {
     }
 
     // Learning clarification mode — two-call architecture:
-    // Call 1: classify reply as "action" (has clear intent) or "chat" (wants more info) — tiny JSON, 60 tokens
-    // Call 2: if chat, generate plain-text explanation of the topic — no JSON, 180 tokens
-    // This split avoids the fragile single-call pattern where JSON truncation silently broke classification.
+    // Call 1: classify reply as "action" or "chat" — tiny JSON, 60 tokens, never truncates
+    // Call 2: if chat, conversational response with full history — plain text, 500 tokens
+    // Threading: all bot replies are threaded under the user's original message (threadTs).
+    // History: each exchange is stored so Call 2 can answer follow-up questions correctly.
+    // Step cap: 8 chat turns before a soft check-in ("want me to save something?")
     if (state.learningMode) {
-      const step = state.step ?? 1;
+      const step     = state.step ?? 1;
+      const threadTs = state.threadTs ?? message.ts;
+      const history  = state.history ?? [];
       let saveAsText = null;
       let chatReply  = null;
 
@@ -337,8 +351,31 @@ app.message(async ({ message, say }) => {
         const enriched = `${task} — ${state.originalText.slice(0, 120)}`;
         try {
           const data = await callInbox({ text: enriched, source: 'slack', project: 'learning_tech' });
-          await say(buildSuccessMessage(data));
-        } catch { await say('saved ✓'); }
+          await say({ text: buildSuccessMessage(data), thread_ts: threadTs });
+        } catch { await say({ text: 'saved ✓', thread_ts: threadTs }); }
+        return;
+      }
+
+      // ── Soft check-in response: user replied to "shall I save?" prompt ─────
+      if (state.softCheckIn) {
+        const lc = userText.toLowerCase().trim();
+        if (/^(no|nah|nope|not yet|keep going|continue|later)/.test(lc)) {
+          pending.set(userId, { ...state, softCheckIn: false });
+          await say({ text: `all good — keep going`, thread_ts: threadTs });
+          return;
+        }
+        // User said what to save (or anything non-negative) — save it
+        pending.delete(userId);
+        const saveText = userText.trim().slice(0, 60) || `Explore ${state.originalText.slice(0, 60)}`;
+        const enriched = `${saveText} — ${state.originalText.slice(0, 120)}`;
+        try {
+          const data = await callInbox({ text: enriched, source: 'slack', project: 'learning_tech' });
+          if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
+          await app.client.chat.postMessage({
+            channel: message.channel, text: buildSuccessMessage(data, {}),
+            thread_ts: threadTs, unfurl_links: false, unfurl_media: false,
+          });
+        } catch { await say({ text: "couldn't save that", thread_ts: threadTs }); }
         return;
       }
 
@@ -367,19 +404,24 @@ type=chat: everything else — user wants more info, is exploring, asking questi
 
       // ── Decide based on classification ────────────────────────────────────
       if (classifyType === 'action') {
-        // User gave a clear task — use their own words (enriched format adds topic context)
         saveAsText = userText.trim().slice(0, 60);
 
-      } else if (classifyType === 'chat' && step < 6) {
-        // ── Call 2: generate plain-text explanation — no JSON, generous budget ──
+      } else if (classifyType === 'chat' && step < 8) {
+        // ── Call 2: conversational response with full conversation history ────
         try {
           const explainResult = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
-            system: `You are a helpful learning assistant. The user wants to learn about: "${state.originalText.slice(0, 150)}"
-Answer the user's question or explore the topic with them. Be specific and informative.
-End with exactly one question to help them decide what to do next: "Would you like to read about it, implement something, or understand the theory?"
-Plain text only — no markdown, no lists, no bullet points.`,
-            messages: [{ role: 'user', content: userText }],
-            maxTokens: 300,
+            system: `You are a knowledgeable research companion in an ongoing Slack conversation.
+Topic the user is exploring: "${state.originalText.slice(0, 150)}"
+
+Rules:
+- Do NOT re-introduce or define the topic from scratch — respond directly to what the user just said.
+- Be specific: cite real papers, researchers, findings, and benchmarks by name when you know them. If something is a landmark result or recent breakthrough, say so naturally.
+- If you reference a paper or line of work worth following up on, note it in passing — e.g. "that's worth adding to a reading queue" or "the Marks et al. 2023 paper on this is surprisingly accessible".
+- Write like a colleague who knows this area deeply: skip "Great question!", no textbook openers, no bullet points, no headers.
+- End with something specific to the thread of this conversation — an observation or question that opens the next line of inquiry. Not a menu of options.
+- Plain text only. Around 4-5 sentences.`,
+            messages: [...history, { role: 'user', content: userText }],
+            maxTokens: 500,
           });
           logCostViaApi(explainResult.modelKey, explainResult.usage, 'learning_explain');
           chatReply = explainResult.text?.trim() ?? null;
@@ -387,24 +429,38 @@ Plain text only — no markdown, no lists, no bullet points.`,
           console.error('[learningMode] explain call failed:', err.message);
         }
 
-      } else if (classifyType === 'chat' && step >= 6) {
-        // Step limit — save generic task
-        saveAsText = `Explore and learn about ${state.originalText.slice(0, 60)}`;
+      } else if (classifyType === 'chat' && step >= 8) {
+        // Soft check-in: 8 turns is a solid conversation — offer to save without forcing
+        const shortTopic = state.originalText.slice(0, 60);
+        pending.set(userId, { ...state, softCheckIn: true });
+        await say({
+          text: `We've been deep in ${shortTopic} for a while — want me to save something specific to your Learning board so you can come back to it? If so, just say what you'd like to capture.`,
+          thread_ts: threadTs,
+        });
+        return;
 
       } else if (classifyType === null && step >= 3) {
-        // AI failed twice — save generic rather than loop forever
+        // AI failed multiple times — save generic rather than loop forever
         saveAsText = `Explore and learn about ${state.originalText.slice(0, 60)}`;
       }
 
       if (chatReply) {
-        pending.set(userId, { ...state, step: step + 1 });
-        await say(chatReply);
+        const newHistory = [
+          ...history,
+          { role: 'user', content: userText },
+          { role: 'assistant', content: chatReply },
+        ];
+        pending.set(userId, { ...state, step: step + 1, history: newHistory });
+        await say({ text: chatReply, thread_ts: threadTs });
         return;
       }
 
       if (!saveAsText) {
         pending.set(userId, { ...state, step: step + 1 });
-        await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
+        await say({
+          text: `what do you want to do with this — read, implement something, understand the theory, or write about it?`,
+          thread_ts: threadTs,
+        });
         return;
       }
 
@@ -414,9 +470,12 @@ Plain text only — no markdown, no lists, no bullet points.`,
       try {
         const data = await callInbox({ text: enriched, source: 'slack', project: 'learning_tech' });
         if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
-        await reply(message.channel, buildSuccessMessage(data, {}));
+        await app.client.chat.postMessage({
+          channel: message.channel, text: buildSuccessMessage(data, {}),
+          thread_ts: threadTs, unfurl_links: false, unfurl_media: false,
+        });
       } catch {
-        await say("couldn't save that");
+        await say({ text: "couldn't save that", thread_ts: threadTs });
       }
       return;
     }
@@ -513,8 +572,8 @@ Plain text only — no markdown, no lists, no bullet points.`,
     })();
 
   if (isExplicitLearning) {
-    pending.set(userId, { learningMode: true, originalText: userText, step: 1 });
-    await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
+    pending.set(userId, { learningMode: true, originalText: userText, step: 1, threadTs: message.ts, history: [] });
+    await say({ text: `what do you want to do with this — read, implement something, understand the theory, or write about it?`, thread_ts: message.ts });
     return;
   }
 
@@ -580,8 +639,8 @@ Plain text only — no markdown, no lists, no bullet points.`,
   // "I want to learn about X" is not actionable. Ask what they actually want to do.
   const isVagueLearning = cls.project_hint === 'learning_tech' && urls.length === 0;
   if (isVagueLearning) {
-    pending.set(userId, { learningMode: true, originalText: userText, step: 1 });
-    await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
+    pending.set(userId, { learningMode: true, originalText: userText, step: 1, threadTs: message.ts, history: [] });
+    await say({ text: `what do you want to do with this — read, implement something, understand the theory, or write about it?`, thread_ts: message.ts });
     return;
   }
 
