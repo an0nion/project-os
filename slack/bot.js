@@ -592,6 +592,27 @@ app.message(async ({ message, say }) => {
     // History: each exchange is stored so Call 2 can answer follow-up questions correctly.
     // Step cap: 8 chat turns before a soft check-in ("want me to save something?")
     if (state.learningMode) {
+      // Escape: user is asking about an event date — completely unrelated to learning mode.
+      // Clear pending and do a web search instead of routing to the research companion.
+      const normalised     = userText.replace(/[\u2018\u2019\u201A\u201B\u2032]/g, "'");
+      const wantsEventDate = /\b(what'?s the date|whats the date|when is|find the date|date of)\b/i.test(normalised)
+        && /\b(event|conference|luma|meetup|talk|workshop|hackathon)\b/i.test(normalised);
+      if (wantsEventDate) {
+        pending.delete(userId);
+        const searchQuery = normalised.replace(/^there'?s?\s+(a\s+)?/i, '').replace(/\bin melbourne\b/i, '').trim();
+        const searchData  = await webSearch(searchQuery);
+        if (searchData?.answer) {
+          await say(searchData.answer.slice(0, 500));
+        } else if (searchData?.results?.length) {
+          const top = searchData.results[0];
+          const snippet = (top.content ?? '').slice(0, 300).trim();
+          await say(`*${top.title}*\n${snippet}${top.url ? `\n${top.url}` : ''}`);
+        } else {
+          await say(`couldn't find the date — search the event name on lu.ma`);
+        }
+        return;
+      }
+
       const step    = state.step ?? 1;
       const history = state.history ?? [];
       let saveAsText = null;
@@ -789,7 +810,8 @@ Rules:
       pending.delete(userId);
 
       // Check if user added a research/lookup request alongside the context answer
-      const hasResearchAsk = /\b(find|look up|lookup|search|research|get|what('?s| is) the date|when is)\b/i.test(userText);
+      const normalisedText  = userText.replace(/[\u2018\u2019\u201A\u201B\u2032]/g, "'");
+      const hasResearchAsk = /\b(find|look up|lookup|search|research|get|what'?s the date|what is the date|when is)\b/i.test(normalisedText);
 
       if (hasResearchAsk) {
         // Save silently in background — user wants the search result, not the app link
