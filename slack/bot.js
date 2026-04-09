@@ -920,7 +920,33 @@ Rules:
           { headers: { 'x-api-secret': process.env.APP_SECRET } },
         );
         const { results } = await res.json();
-        if (!results?.length) { await say(`nothing saved about "${topic}" yet`); continue; }
+        if (!results?.length) {
+          // If the user was asking for a date/location of an event, try a web search
+          const wantsEventDate = /\b(what'?s the date|when is|find the date|date of|where is|what time)\b/i.test(userText);
+          if (wantsEventDate) {
+            const searchData = await webSearch(topic);
+            if (searchData?.answer) {
+              await say(searchData.answer.slice(0, 500));
+            } else if (searchData?.results?.length) {
+              const snippets = searchData.results.slice(0, 3)
+                .map(r => `${r.title}: ${(r.content ?? '').slice(0, 200)}`).join('\n\n');
+              try {
+                const aiRes = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
+                  system: `Based on these search results, answer in 1-2 sentences: when and where exactly is this event? Include the date, time, and location if present. If not found, say "couldn't find the date."`,
+                  messages: [{ role: 'user', content: `Event: ${topic}\n\nSearch results:\n${snippets}` }],
+                  maxTokens: 150,
+                });
+                logCostViaApi(aiRes.modelKey, aiRes.usage, 'event_lookup');
+                await say(aiRes.text?.trim() || `couldn't find the date — try searching on lu.ma`);
+              } catch { await say(`couldn't find the date — try searching on lu.ma`); }
+            } else {
+              await say(`couldn't find anything about "${topic}" — try searching on lu.ma`);
+            }
+            continue;
+          }
+          await say(`nothing saved about "${topic}" yet`);
+          continue;
+        }
         const projectEmoji = {
           personal: '🗓️', learning_tech: '📚', work: '💼', school: '🎓',
           research_apps: '🔬', baking: '🍞', beadwork: '📿', art: '🎨',
