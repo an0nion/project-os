@@ -21,26 +21,33 @@ const app = new App({
   socketMode: true,
 });
 
-// ── Parse a natural-language timeline into YYYY-MM-DD (runs in bot process) ───
-function parseTimelineToDate(timeline) {
+// ── Regex fallback for timeline parsing (used if AI call fails) ───────────────
+// Returns YYYY-MM-DD string or null. No time support — all-day events only.
+function parseTimelineToDateFallback(timeline) {
   if (!timeline) return null;
   const now = new Date();
   const low = timeline.toLowerCase().trim();
 
-  if (/\b(today|tonight|now|asap)\b/.test(low)) return now.toISOString().slice(0, 10);
+  if (/\b(today|tonight|now|asap)\b/.test(low)) {
+    // Use local Melbourne date, not UTC
+    const mel = new Date(now.toLocaleString('en-US', { timeZone: 'Australia/Melbourne' }));
+    return `${mel.getFullYear()}-${String(mel.getMonth()+1).padStart(2,'0')}-${String(mel.getDate()).padStart(2,'0')}`;
+  }
 
   if (/\btomorrow\b/.test(low)) {
-    const d = new Date(now); d.setDate(d.getDate() + 1); return d.toISOString().slice(0, 10);
+    const mel = new Date(now.toLocaleString('en-US', { timeZone: 'Australia/Melbourne' }));
+    mel.setDate(mel.getDate() + 1);
+    return `${mel.getFullYear()}-${String(mel.getMonth()+1).padStart(2,'0')}-${String(mel.getDate()).padStart(2,'0')}`;
   }
 
   // Day-of-week: "this Saturday", "next Monday", bare "Saturday"
   const DOW = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
   for (let i = 0; i < DOW.length; i++) {
     if (new RegExp(`\\b${DOW[i]}\\b`).test(low)) {
-      const d = new Date(now);
-      const diff = (i - d.getDay() + 7) % 7 || 7;
-      d.setDate(d.getDate() + diff);
-      return d.toISOString().slice(0, 10);
+      const mel = new Date(now.toLocaleString('en-US', { timeZone: 'Australia/Melbourne' }));
+      const diff = (i - mel.getDay() + 7) % 7 || 7;
+      mel.setDate(mel.getDate() + diff);
+      return `${mel.getFullYear()}-${String(mel.getMonth()+1).padStart(2,'0')}-${String(mel.getDate()).padStart(2,'0')}`;
     }
   }
 
@@ -49,25 +56,90 @@ function parseTimelineToDate(timeline) {
   if (ordM) {
     const day = parseInt(ordM[1], 10);
     if (day >= 1 && day <= 31) {
-      const d = new Date(now.getFullYear(), now.getMonth(), day);
-      if (d <= now) d.setMonth(d.getMonth() + 1);
-      return d.toISOString().slice(0, 10);
+      const mel = new Date(now.toLocaleString('en-US', { timeZone: 'Australia/Melbourne' }));
+      const d = new Date(mel.getFullYear(), mel.getMonth(), day);
+      if (d <= mel) d.setMonth(d.getMonth() + 1);
+      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
     }
   }
 
   // "in X weeks" / "in X days"
   const wk = low.match(/in (\d+) week/);
-  if (wk) { const d = new Date(now); d.setDate(d.getDate() + parseInt(wk[1]) * 7); return d.toISOString().slice(0, 10); }
+  if (wk) {
+    const d = new Date(now); d.setDate(d.getDate() + parseInt(wk[1]) * 7);
+    return d.toISOString().slice(0, 10);
+  }
   const dy = low.match(/in (\d+) day/);
-  if (dy) { const d = new Date(now); d.setDate(d.getDate() + parseInt(dy[1])); return d.toISOString().slice(0, 10); }
+  if (dy) {
+    const d = new Date(now); d.setDate(d.getDate() + parseInt(dy[1]));
+    return d.toISOString().slice(0, 10);
+  }
 
-  // Native parse fallback: "June 13", "13 June"
-  const stripped = low.replace(/^(by|on|at)\s+/, '');
+  // Native parse fallback: "June 13", "13 June", "April 13, 2026"
+  // Preserve original case (not `low`) so month names parse correctly via new Date()
+  const stripped = timeline.trim().replace(/^(by|on|at)\s+/i, '');
   const parsed   = new Date(stripped);
   if (!isNaN(parsed.getTime()) && parsed.getFullYear() >= now.getFullYear()) {
     return parsed.toISOString().slice(0, 10);
   }
   return null;
+}
+
+// ── AI-powered timeline parser — returns YYYY-MM-DD or full ISO datetime ───────
+// Primary: DeepSeek for structured date/time extraction.
+// Fallback: regex parser above (handles simple cases without API call).
+// Returns: "YYYY-MM-DD" for all-day, "YYYY-MM-DDTHH:MM:00" for timed events, or null.
+async function parseTimelineToDate(timeline) {
+  if (!timeline) return null;
+
+  const TZ = 'Australia/Melbourne';
+  // Compute current Melbourne local time for AI context
+  const mel = new Date(new Date().toLocaleString('en-US', { timeZone: TZ }));
+  const nowStr = `${mel.getFullYear()}-${String(mel.getMonth()+1).padStart(2,'0')}-${String(mel.getDate()).padStart(2,'0')} ${String(mel.getHours()).padStart(2,'0')}:${String(mel.getMinutes()).padStart(2,'0')} (${TZ})`;
+
+  try {
+    const result = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
+      system: `You are a precise date/time parser. Extract the date and optional time from the user's text.
+Current date and time: ${nowStr}
+
+Return ONLY valid JSON, nothing else:
+- All-day (no specific time given): {"date": "YYYY-MM-DD"}
+- Timed event (specific time given): {"datetime": "YYYY-MM-DDTHH:MM:00"}
+- Cannot parse: {"error": "unparseable"}
+
+Rules:
+- All times are in ${TZ}
+- "today" means the current date above
+- "tomorrow" means the next calendar day
+- Ordinal days ("13th") refer to this month if not yet passed, otherwise next month
+- Use 24-hour format for datetime output
+- Dot notation times: "5.20pm" = "17:20"
+
+Examples given current date ${nowStr.split(' ')[0]}:
+"tomorrow" → {"date": "${(() => { const d = new Date(mel); d.setDate(d.getDate()+1); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; })()}"}
+"today at 5.20pm" → {"datetime": "${mel.getFullYear()}-${String(mel.getMonth()+1).padStart(2,'0')}-${String(mel.getDate()).padStart(2,'0')}T17:20:00"}
+"this Saturday at 2pm" → (compute next Saturday date with T14:00:00)
+"13th" → (compute correct month's 13th)
+"in 2 weeks" → {"date": "(date + 14 days)"}
+"next month" → {"error": "unparseable"}`,
+      messages: [{ role: 'user', content: timeline }],
+      maxTokens: 60,
+    });
+    logCostViaApi(result.modelKey, result.usage, 'timeline_parse');
+
+    const raw    = result.text?.trim() ?? '';
+    const json   = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
+    const parsed = JSON.parse(json);
+
+    if (parsed.error)    return null;
+    if (parsed.datetime) return parsed.datetime;  // ISO datetime — timed calendar event
+    if (parsed.date)     return parsed.date;       // date-only — all-day event
+    return null;
+
+  } catch (err) {
+    console.warn('[parseTimelineToDate] AI parse failed:', err.message, '— falling back to regex');
+    return parseTimelineToDateFallback(timeline);
+  }
 }
 
 // ── Google Calendar colorId routing (single-calendar, per-event colours) ──────
@@ -115,6 +187,7 @@ function setLastSaved(userId, data) {
 
 // ── Project name → key map (for correction fallback parsing) ──────────────────
 const PROJECT_ALIASES = {
+  'personal':      'personal',
   'school':        'school',        'uni': 'school',      'university': 'school',
   'work':          'work',          'job': 'work',
   'research':      'research_apps', 'applications': 'research_apps', 'apps': 'research_apps',
@@ -141,76 +214,95 @@ const PROJECT_KEYS = [
   'baking', 'beadwork', 'art', 'reading', 'exercise', 'circuitry',
 ];
 
-const INTENT_SYSTEM_PROMPT = `You are a message intent classifier for a personal project management Slack bot.
+const VALID_INTENTS = ['save', 'correct', 'converse', 'search_request', 'reminder', 'recall'];
 
-Return ONLY valid JSON (no markdown, no explanation):
+const INTENT_SYSTEM_PROMPT = `You are an intent classifier for a personal project management Slack bot.
+
+The user may send ONE task or MULTIPLE tasks in a single message (e.g. "remind me to X, also add Y").
+Always return an array of tasks — even if there is only one.
+
+Return ONLY valid JSON (no markdown):
 {
-  "intent": "save" | "correct" | "converse" | "search_request" | "reminder" | "recall",
-  "context": "work" | "personal" | null,
-  "timeline": string or null,
-  "project_hint": string or null,
-  "corrected_project": string or null,
-  "needs_clarification": boolean,
-  "priority_tier": 1 | 2 | 3 | 4 | null,
-  "recall_topic": string or null
+  "tasks": [
+    {
+      "intent": "save" | "reminder" | "recall" | "correct" | "search_request" | "converse",
+      "title": string,
+      "timeline": string or null,
+      "context": "work" | "personal" | null,
+      "project_hint": string or null,
+      "priority_tier": 1 | 2 | 3 | 4 | null,
+      "needs_clarification": boolean,
+      "corrected_project": string or null,
+      "recall_topic": string or null
+    }
+  ]
 }
 
-INTENT — pick exactly one:
-- "recall": user asking what they previously saved, asked about, or captured — "what did I ask about X?", "I remember asking about Y", "what did you save on Z?", "what do I have on X?"
-- "converse": ANY of these → greetings (hi, hello, hey), one-word reactions (ok, nice, thanks, lol, :(, yes, no), feedback about the bot ("did you save that?", "why did you do that?", "your formatting is bad"), questions about what was just saved. When in doubt about a short ambiguous message, choose converse.
-- "reminder": user wants to be reminded about something at a specific time/date ("remind me to...", "I have a [appointment/meeting/event] at [time]", "set a reminder for...")
-- "search_request": user wants to apply to a fellowship/program/internship but has given no URL
-- "correct": user says bot routed the last item wrong ("wrong", "should be X", "→ school", "actually this is work")
-- "save": user explicitly wants to save a URL, note, paper, task, resource, application — clear capture intent
+INTENT:
+- "reminder": user wants to be reminded / notified / has an appointment or deadline
+- "recall": asking what was previously saved — "what did I save about X?", "what do I have on Y?"
+- "converse": greetings, one-word reactions, meta-questions about the bot
+- "correct": user says last save was routed wrong
+- "search_request": wants to apply to a program/fellowship but gave no URL
+- "save": everything else — save a URL, paper, task, note, resource
 
-context: "work" if clearly professional, "personal" if clearly personal, null if ambiguous
+title: clean, actionable task name. Strip filler: "remind me to", "set a reminder", "set a notification", "also", dates, time phrases. Capitalise first word. Max 8 words.
+  Examples:
+    "set a reminder for this Saturday to buy cleansing oil" → "Buy cleansing oil"
+    "set an assignment notification for the 13th for linear algebra Assignment 2" → "Linear Algebra Assignment 2"
+    "I want to save this arxiv paper on diffusion" → "Diffusion paper (arxiv)"
 
-timeline: concise time string ("5:30pm Thursday", "by June", "this week") or null
+timeline: the specific date/time string for this task only, as the user said it. null if none.
+  Examples: "this Saturday", "13th of this month", "by June 30", "5:30pm Thursday"
 
-project_hint: one of ${PROJECT_KEYS.join(', ')} — only when clearly identifiable, else null:
-- personal: appointments, errands, life admin, personal reminders, grooming
-- school: coursework, assignments, exams, uni deadlines
-- work: job tasks, sprint, tickets, professional deadlines
-- research_apps: applying to fellowship/program/grant/PhD/internship/residency
-- learning_tech: papers, GitHub repos, ML concepts, tutorials to explore (personal)
-- baking: recipes, bread, food, cooking
-- beadwork: beading, jewelry, craft
-- art: drawing, painting, pastels, sketching
-- reading: books, essays, philosophy to read
-- exercise: gym, fitness, workouts, sport
-- circuitry: Arduino, electronics, PCB, hardware
+project_hint: one of ${PROJECT_KEYS.join(', ')} or null:
+  personal=appointments/errands/life admin, school=coursework/exams/uni,
+  work=job tasks/sprint/tickets, research_apps=fellowships/grants/PhD,
+  learning_tech=papers/ML/repos, baking=recipes/bread, beadwork=jewelry/craft,
+  art=drawing/pastels, reading=books/essays, exercise=gym/sport, circuitry=Arduino/PCB
 
-corrected_project: same enum — only set if intent=correct AND user named a project; null otherwise
+priority_tier:
+  1=hard deadline (specific date, exam, submission)
+  2=medium deadline (school/work task, weeks away)
+  3=medium goal (personal learning, no firm date)
+  4=hobby/interest (baking/art/reading/exercise)
+  null=unclear
 
-recall_topic: the specific topic/keyword the user is trying to recall — strip meta-query phrasing. E.g. "what did I ask about linear probes?" → "linear probes". Only set if intent=recall, else null.
+needs_clarification: true only if intent=save AND context null AND tech content (work vs personal unclear)
+corrected_project: only if intent=correct AND user named a project
+recall_topic: only if intent=recall — the topic to search for, stripped of meta-phrasing`;
 
-needs_clarification: true ONLY if intent=save AND context is null AND content is tech-related (GitHub, paper, tool) where work vs personal distinction matters for routing
+function normaliseTask(t) {
+  return {
+    intent:              VALID_INTENTS.includes(t.intent) ? t.intent : 'save',
+    title:               t.title               ?? null,
+    timeline:            t.timeline            ?? null,
+    context:             t.context             ?? null,
+    project_hint:        t.project_hint        ?? null,
+    priority_tier:       t.priority_tier       ?? null,
+    needs_clarification: t.needs_clarification ?? false,
+    corrected_project:   t.corrected_project   ?? null,
+    recall_topic:        t.recall_topic        ?? null,
+  };
+}
 
-priority_tier: urgency and importance tier for task prioritisation:
-  1 = hard deadline — specific date/time, exam, submission, interview; must happen by then
-  2 = medium deadline — school/work/research task within weeks; time-bound but flexible
-  3 = medium goal — personal learning, longer-term project, no firm deadline
-  4 = hobby/interest — baking, art, reading, exercise, beadwork; whenever you get to it
-  null = unclear from this message`;
-
+// Returns an array of task objects — always at least one.
 async function classifyIntent(text, urls) {
   const words = text.trim().split(/\s+/).filter(Boolean);
 
-  // Short messages with no URLs are conversational — never save "hi", "ok", ":("
-  // Avoids wasting an API call and prevents garbage saves on fallback errors
+  // Very short messages with no URLs are always conversational
   if (urls.length === 0 && words.length <= 3) {
-    return { intent: 'converse', context: null, timeline: null, project_hint: null, corrected_project: null, needs_clarification: false };
+    return [normaliseTask({ intent: 'converse' })];
   }
 
-  const hasUrls = urls.length > 0;
-  const urlList = urls.slice(0, 3).join(', ');
-  const userContent = `Message: ${text || '(empty)'}${hasUrls ? `\nURLs: ${urlList}` : ''}`;
+  const hasUrls    = urls.length > 0;
+  const userContent = `Message: ${text || '(empty)'}${hasUrls ? `\nURLs: ${urls.slice(0, 3).join(', ')}` : ''}`;
 
   try {
     const result = await callModelWithFallback('gemini-flash', 'deepseek-chat', {
       system:    INTENT_SYSTEM_PROMPT,
       messages:  [{ role: 'user', content: userContent }],
-      maxTokens: 150,
+      maxTokens: 300,
     });
 
     logCostViaApi(result.modelKey, result.usage, 'intent_classification');
@@ -219,29 +311,12 @@ async function classifyIntent(text, urls) {
     const json   = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
     const parsed = JSON.parse(json);
 
-    // Validate intent — unknown values default to save, not converse
-    const validIntents = ['save', 'correct', 'converse', 'search_request', 'reminder', 'recall'];
-    const intent = validIntents.includes(parsed.intent) ? parsed.intent : 'save';
+    const tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [parsed];
+    return tasks.map(normaliseTask);
 
-    return {
-      intent,
-      context:             parsed.context             ?? null,
-      timeline:            parsed.timeline            ?? null,
-      project_hint:        parsed.project_hint        ?? null,
-      corrected_project:   parsed.corrected_project   ?? null,
-      needs_clarification: parsed.needs_clarification ?? false,
-      priority_tier:       parsed.priority_tier       ?? null,
-      recall_topic:        parsed.recall_topic        ?? null,
-    };
   } catch (err) {
     console.warn('[intent] classify failed:', err.message);
-    const isShort = words.length <= 5;
-    return {
-      intent: isShort ? 'converse' : 'save',
-      context: null, timeline: null, project_hint: null,
-      corrected_project: null, needs_clarification: false,
-      priority_tier: null, recall_topic: null,
-    };
+    return [normaliseTask({ intent: words.length <= 5 ? 'converse' : 'save' })];
   }
 }
 
@@ -365,6 +440,36 @@ async function reply(channel, text) {
   await app.client.chat.postMessage({ channel, text, unfurl_links: false, unfurl_media: false });
 }
 
+// ── Process a single reminder task ───────────────────────────────────────────
+// cls.title is the AI-extracted clean title from classifyIntent — no extra call needed.
+// If timeline is present → create calendar event immediately.
+// If no timeline → ask "when is X?" and wait for reminderMode reply.
+async function processReminderTask(cls, channel, userId, say) {
+  const reminderTitle = (cls.title ?? '').trim().slice(0, 60) || 'Reminder';
+
+  if (cls.timeline) {
+    const date    = await parseTimelineToDate(cls.timeline);
+    const colorId = pickCalendarColor(cls.project_hint ?? 'personal', reminderTitle);
+    let calCreated = false;
+
+    if (process.env.CALENDAR_ENABLED === 'true' && date) {
+      try {
+        const calRes = await fetch(`${process.env.APP_URL}/api/calendar/event`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
+          body:    JSON.stringify({ title: reminderTitle, date, colorId, description: cls.title ?? reminderTitle }),
+        });
+        calCreated = calRes.ok;
+      } catch (err) { console.error('[calendar] event creation failed:', err.message); }
+    }
+    await reply(channel, `📅 ${reminderTitle} · ${cls.timeline}${calCreated ? ' · added to calendar' : ''}`);
+
+  } else {
+    pending.set(userId, { reminderMode: true, reminderTitle, originalText: cls.title ?? reminderTitle });
+    await say(`when is "${reminderTitle}"? (or say *to do* to add to your list)`);
+  }
+}
+
 // ── Main listener ─────────────────────────────────────────────────────────────
 app.message(async ({ message, say }) => {
   if (message.channel_type !== 'im') return;
@@ -425,7 +530,7 @@ app.message(async ({ message, say }) => {
       }
 
       // User gave a date — parse it and route to calendar
-      const date = parseTimelineToDate(userText) ?? parseTimelineToDate(userText.replace(/^(on|at|by|this|next)\s+/i, ''));
+      const date = await parseTimelineToDate(userText) ?? await parseTimelineToDate(userText.replace(/^(on|at|by|this|next)\s+/i, ''));
       if (!date) {
         // Couldn't parse — re-ask once then save as to-do
         const reask = (state.reminderReask ?? 0) + 1;
@@ -484,9 +589,9 @@ app.message(async ({ message, say }) => {
         // Normalise action: strip "it", "the paper", etc. to get a clean verb
         const verb = action
           .replace(/\s+(it|the paper|more|about it|everything)$/i, '')
-          .trim();
-        // Capitalise first letter
-        const title = `${verb.charAt(0).toUpperCase() + verb.slice(1)} ${topicSlug}`;
+          .trim() || 'Explore';
+        // Capitalise first letter; trim ensures no trailing space when topicSlug is empty
+        const title = `${verb.charAt(0).toUpperCase() + verb.slice(1)}${topicSlug ? ` ${topicSlug}` : ''}`;
         return title.slice(0, 80);
       };
 
@@ -508,7 +613,8 @@ app.message(async ({ message, say }) => {
       if (state.softCheckIn) {
         const lc = userText.toLowerCase().trim();
         if (/^(no|nah|nope|not yet|keep going|continue|later)/.test(lc)) {
-          pending.set(userId, { ...state, softCheckIn: false });
+          // Reset step to 5 so the next 3 turns allow chat before triggering check-in again at step=8
+          pending.set(userId, { ...state, softCheckIn: false, step: 5 });
           await say(`all good — keep going`);
           return;
         }
@@ -702,10 +808,12 @@ Rules:
   const isExplicitLearning =
     urls.length === 0 && (() => {
       const words = userText.trim().split(/\s+/).filter(Boolean).length;
-      // "I want to learn / been learning about / trying to learn" — needs > 5 words (topic required)
-      if (words > 5 && /\b(want to learn|learning about|i'?m learning|been learning|trying to learn|i want to understand)\b/i.test(userText)) return true;
-      // "tell me about X" / "explain X" — needs > 4 words (topic is part of the phrase itself)
-      if (words > 4 && /\b(tell me about|explain to me|what is a|what are)\b/i.test(userText)) return true;
+      // "I want to learn / been learning about / trying to learn / need to understand" — needs > 5 words (topic required)
+      if (words > 5 && /\b(want to learn|learning about|i'?m learning|been learning|trying to learn|i want to understand|i need to understand|need to learn)\b/i.test(userText)) return true;
+      // "tell me about X" / "what is the X" / "what are X" — needs > 4 words
+      if (words > 4 && /\b(tell me about|explain to me|what is a|what is the|what is an|what are)\b/i.test(userText)) return true;
+      // "explain X to me" — model-agnostic catch for explain...to me patterns
+      if (words > 3 && /\bexplain\b.+\bto me\b/i.test(userText)) return true;
       return false;
     })();
 
@@ -715,155 +823,100 @@ Rules:
     return;
   }
 
-  // ── Fresh message — classify intent with AI ───────────────────────────────
-  const cls = await classifyIntent(userText, urls);
+  // ── Classify intent — returns array (handles multi-task messages natively) ───
+  const tasks = await classifyIntent(userText, urls);
+  // Process all tasks; for multi-task we loop. For single-task the array has one element.
+  // Pending state (reminderMode, learningMode) is only set for the last unresolved task.
+  for (const cls of tasks) {
+    if (cls.intent === 'converse') continue;
 
-  // Conversational: ignore silently
-  if (cls.intent === 'converse') return;
-
-  // Correction: update the training log
-  if (cls.intent === 'correct') {
-    const prev = lastSaved.get(userId);
-    if (!prev) {
-      await say('nothing recent to correct');
-      return;
-    }
-
-    const proj = cls.corrected_project ?? parseProjectFromText(userText);
-    if (!proj) {
-      pending.set(userId, { ...prev, correctionMode: true });
-      await say('which project? (school / work / learning / research / art / baking / beads / circuits / reading / exercise)');
-      return;
-    }
-
-    await callCorrect(prev.logId, proj, userText);
-    lastSaved.delete(userId);
-    await say(`got it — logged as ${proj}`);
-    return;
-  }
-
-  // Recall: user wants to know what they previously saved/asked about a topic
-  if (cls.intent === 'recall') {
-    const topic = cls.recall_topic ?? userText;
-    try {
-      const res = await fetch(
-        `${process.env.APP_URL}/api/inbox/search?q=${encodeURIComponent(topic)}&limit=5`,
-        { headers: { 'x-api-secret': process.env.APP_SECRET } },
-      );
-      const { results } = await res.json();
-      if (!results?.length) {
-        await say(`nothing saved about "${topic}" yet`);
-        return;
+    if (cls.intent === 'correct') {
+      const prev = lastSaved.get(userId);
+      if (!prev) { await say('nothing recent to correct'); continue; }
+      const proj = cls.corrected_project ?? parseProjectFromText(userText);
+      if (!proj) {
+        pending.set(userId, { ...prev, correctionMode: true });
+        await say('which project? (school / work / learning / research / art / baking / beads / circuits / reading / exercise)');
+        continue;
       }
-      const projectEmoji = {
-        personal: '🗓️', learning_tech: '📚', work: '💼', school: '🎓',
-        research_apps: '🔬', baking: '🍞', beadwork: '📿', art: '🎨',
-        reading: '📖', exercise: '💪', circuitry: '⚡',
-      };
-      const lines = results.map(r => {
-        const emoji   = projectEmoji[r.project] ?? '📁';
-        const dateStr = r.saved_at ? ` · ${new Date(r.saved_at).toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })}` : '';
-        const link    = r.url ? `<${r.url}|${r.title}>` : r.title;
-        return `${emoji} ${link}${dateStr}`;
-      });
-      await reply(message.channel, `here's what I have on "${topic}":\n${lines.join('\n')}`);
-    } catch (err) {
-      console.error('[recall] search failed:', err.message);
-      await say("couldn't search that");
-    }
-    return;
-  }
-
-  // Reminder intent:
-  //   Has date upfront → calendar immediately
-  //   No date → ask "when is this?" — user replies with date or "to do"
-  if (cls.intent === 'reminder') {
-    // ── AI: extract clean actionable title ───────────────────────────────────
-    let reminderTitle = null;
-    try {
-      const tr = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
-        system: 'Extract the task or event name. Strip "remind me to", "set a reminder", dates, and time words. Capitalise first word only. Max 8 words. Examples: "remind me to buy cleansing oil on Saturday" → "Buy cleansing oil". "assignment notification for linear algebra Assignment 2 due 13th" → "Linear Algebra Assignment 2 due".',
-        messages: [{ role: 'user', content: userText }],
-        maxTokens: 25,
-      });
-      logCostViaApi(tr.modelKey, tr.usage, 'reminder_title');
-      reminderTitle = tr.text?.trim().replace(/\.$/, '') || null;
-    } catch { /* fallback below */ }
-
-    if (!reminderTitle) {
-      reminderTitle = userText
-        .replace(/^(set (a )?reminder (for \S+ )?to|remind me to)\s*/i, '')
-        .replace(/\s+(on|at|by|this|next)\s+\S.*$/i, '')
-        .trim().slice(0, 60);
-      reminderTitle = reminderTitle.charAt(0).toUpperCase() + reminderTitle.slice(1);
+      await callCorrect(prev.logId, proj, userText);
+      lastSaved.delete(userId);
+      await say(`got it — logged as ${proj}`);
+      continue;
     }
 
-    if (cls.timeline) {
-      // ── Date provided upfront → calendar immediately ──────────────────────
-      const date    = parseTimelineToDate(cls.timeline);
-      const colorId = pickCalendarColor(cls.project_hint ?? 'personal', userText);
-      let calCreated = false;
-
-      if (process.env.CALENDAR_ENABLED === 'true' && date) {
-        try {
-          const calRes = await fetch(`${process.env.APP_URL}/api/calendar/event`, {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
-            body:    JSON.stringify({ title: reminderTitle, date, colorId, description: userText }),
-          });
-          calCreated = calRes.ok;
-        } catch (err) { console.error('[calendar] event creation failed:', err.message); }
+    if (cls.intent === 'recall') {
+      const topic = cls.recall_topic ?? cls.title ?? userText;
+      try {
+        const res = await fetch(
+          `${process.env.APP_URL}/api/inbox/search?q=${encodeURIComponent(topic)}&limit=5`,
+          { headers: { 'x-api-secret': process.env.APP_SECRET } },
+        );
+        const { results } = await res.json();
+        if (!results?.length) { await say(`nothing saved about "${topic}" yet`); continue; }
+        const projectEmoji = {
+          personal: '🗓️', learning_tech: '📚', work: '💼', school: '🎓',
+          research_apps: '🔬', baking: '🍞', beadwork: '📿', art: '🎨',
+          reading: '📖', exercise: '💪', circuitry: '⚡',
+        };
+        const lines = results.map(r => {
+          const emoji   = projectEmoji[r.project] ?? '📁';
+          const dateStr = r.saved_at ? ` · ${new Date(r.saved_at).toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })}` : '';
+          const link    = r.url ? `<${r.url}|${r.title}>` : r.title;
+          return `${emoji} ${link}${dateStr}`;
+        });
+        await reply(message.channel, `here's what I have on "${topic}":\n${lines.join('\n')}`);
+      } catch (err) {
+        console.error('[recall] search failed:', err.message);
+        await say("couldn't search that");
       }
-      await say(`📅 ${reminderTitle} · ${cls.timeline}${calCreated ? ' · added to calendar' : ''}`);
-
-    } else {
-      // ── No date → ask ─────────────────────────────────────────────────────
-      pending.set(userId, { reminderMode: true, reminderTitle, originalText: userText });
-      await say(`when is this? (or say *to do* to add to your list)`);
+      continue;
     }
-    return;
-  }
 
-  // Search request: application text with no URL
-  if (cls.intent === 'search_request') {
-    pending.set(userId, { url: null, text: userText, searchMode: true, step: 1 });
-    await say('no link — want me to search for the application page? (y/n)');
-    return;
-  }
+    if (cls.intent === 'reminder') {
+      await processReminderTask(cls, message.channel, userId, say);
+      continue;
+    }
 
-  // Save — default intent
-  if (cls.needs_clarification) {
-    pending.set(userId, { url: urls[0] ?? null, text: userText, step: 1 });
-    await say('work or personal?');
-    return;
-  }
+    if (cls.intent === 'search_request') {
+      pending.set(userId, { url: null, text: cls.title ?? userText, searchMode: true, step: 1 });
+      await say('no link — want me to search for the application page? (y/n)');
+      continue;
+    }
 
-  // Vague learning intent with no URL → clarify before saving
-  // "I want to learn about X" is not actionable. Ask what they actually want to do.
-  const isVagueLearning = cls.project_hint === 'learning_tech' && urls.length === 0;
-  if (isVagueLearning) {
-    pending.set(userId, { learningMode: true, originalText: userText, step: 1, history: [] });
-    await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
-    return;
-  }
+    // Save — default intent
+    if (cls.needs_clarification) {
+      pending.set(userId, { url: urls[0] ?? null, text: cls.title ?? userText, step: 1 });
+      await say('work or personal?');
+      continue;
+    }
 
-  const url     = urls[0] ?? undefined;
-  const project = cls.project_hint ?? (cls.context === 'work' ? 'work' : null);
-  const enrichedText = buildEnrichedText(cls.context, cls.timeline, userText, url);
+    const isVagueLearning = cls.project_hint === 'learning_tech' && urls.length === 0;
+    if (isVagueLearning) {
+      pending.set(userId, { learningMode: true, originalText: cls.title ?? userText, step: 1, history: [] });
+      await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
+      continue;
+    }
 
-  try {
-    const data = await callInbox({
-      url,
-      text:         enrichedText || userText || undefined,
-      source:       'slack',
-      timeline:     cls.timeline      ?? undefined,
-      priority_tier: cls.priority_tier ?? undefined,
-      ...(project ? { project } : {}),
-    });
-    if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
-    await reply(message.channel, buildSuccessMessage(data, cls));
-  } catch {
-    await say("couldn't save that");
+    const url          = urls[0] ?? undefined;
+    const project      = cls.project_hint ?? (cls.context === 'work' ? 'work' : null);
+    const enrichedText = buildEnrichedText(cls.context, cls.timeline, cls.title ?? userText, url);
+
+    try {
+      const data = await callInbox({
+        url,
+        text:          enrichedText || cls.title || userText || undefined,
+        title:         cls.title ?? undefined,
+        source:        'slack',
+        timeline:      cls.timeline      ?? undefined,
+        priority_tier: cls.priority_tier ?? undefined,
+        ...(project ? { project } : {}),
+      });
+      if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
+      await reply(message.channel, buildSuccessMessage(data, cls));
+    } catch {
+      await say("couldn't save that");
+    }
   }
 });
 
