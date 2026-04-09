@@ -791,7 +791,10 @@ Rules:
       const hasResearchAsk = /\b(find|look up|lookup|search|research|get|what('?s| is) the date|when is)\b/i.test(userText);
 
       try {
-        const data = await callInbox({ url: state.url ?? undefined, text: enrichedText, source: 'slack', project });
+        // Pass title: state.text (clean original) separately from text: enrichedText (routing context).
+        // Without this, the inbox title extractor receives "[Personal] there's a..." and the
+        // [Personal] annotation leaks into the displayed title.
+        const data = await callInbox({ url: state.url ?? undefined, text: enrichedText, title: state.text ?? undefined, source: 'slack', project });
         if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
         await reply(message.channel, buildSuccessMessage(data, {}));
       } catch {
@@ -799,7 +802,7 @@ Rules:
       }
 
       if (hasResearchAsk) {
-        await say(`saved — I can't look things up in real time, but I've noted it. Check the source directly for the date/details.`);
+        await say(`noted — I can't look up dates in real time. Check lu.ma or the event page directly.`);
       }
       return;
     }
