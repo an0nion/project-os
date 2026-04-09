@@ -215,8 +215,9 @@ const buildFinalTask = (taskText, originalText) =>
   `${taskText} — ${originalText.slice(0, 120)}`;
 
 // --- isShortConversational, isPureUrl, isVagueLearning, fallbackClassification, buildEnrichedTask ---
+// Threshold is NOW 2 (was 3) — "add this" was silently discarded, so 3-word messages go to AI
 const isShortConversational = (text, urls) =>
-  urls.length === 0 && text.trim().split(/\s+/).filter(Boolean).length <= 3;
+  urls.length === 0 && text.trim().split(/\s+/).filter(Boolean).length <= 2;
 
 const isPureUrl = (text, urls) => {
   const stripped = urls.reduce((t, u) => t.replace(u, ''), text).trim();
@@ -1500,9 +1501,20 @@ describe('Short-message conversational guard (expanded)', () => {
   test('"nice job" → conversational', () => assert.ok(isShortConversational('nice job', [])));
   test('"ok" → conversational', () => assert.ok(isShortConversational('ok', [])));
   test('":(" → conversational', () => assert.ok(isShortConversational(':(', [])));
-  test('"did you save" → conversational (exactly 3 words)', () => assert.ok(isShortConversational('did you save', [])));
-  test('"thanks!" → conversational (punctuation ignored in word count)', () => assert.ok(isShortConversational('thanks!', [])));
+  test('"thanks!" → conversational (1 word)', () => assert.ok(isShortConversational('thanks!', [])));
   test('"lol" → conversational', () => assert.ok(isShortConversational('lol', [])));
+  test('"ok" → conversational', () => assert.ok(isShortConversational('ok', [])));
+  test('"nice" → conversational (1 word)', () => assert.ok(isShortConversational('nice', [])));
+  test('"got it" → conversational (2 words)', () => assert.ok(isShortConversational('got it', [])));
+  test('"did you" → conversational (2 words)', () => assert.ok(isShortConversational('did you', [])));
+
+  // 3-word messages now go to AI (threshold is 2, not 3) — FIX for "add this" being discarded
+  test('"did you save" → NOT conversational (3 words → goes to AI now)', () =>
+    assert.ok(!isShortConversational('did you save', [])));
+  test('"add this" (2 words) → still conversational (≤2)', () =>
+    assert.ok(isShortConversational('add this', [])));
+  test('"add this now" (3 words) → NOT conversational (goes to AI)', () =>
+    assert.ok(!isShortConversational('add this now', [])));
 
   test('"want to apply now" → NOT conversational (4 words)', () =>
     assert.ok(!isShortConversational('want to apply now', [])));
@@ -2227,18 +2239,24 @@ describe('pickCalendarColor — keyword + project color routing', () => {
 // ══════════════════════════════════════════════════════════════════════════════
 
 const VALID_INTENTS_TEST = ['save', 'correct', 'converse', 'search_request', 'reminder', 'recall'];
+const PROJECT_KEYS_TEST = [
+  'personal', 'school', 'work', 'research_apps', 'learning_tech',
+  'baking', 'beadwork', 'art', 'reading', 'exercise', 'circuitry',
+];
 
+// Replicated from bot.js — must stay in sync
 function normaliseTask(t) {
+  const tier = t.priority_tier;
   return {
     intent:              VALID_INTENTS_TEST.includes(t.intent) ? t.intent : 'save',
-    title:               t.title               ?? null,
-    timeline:            t.timeline            ?? null,
+    title:               typeof t.title === 'string' && t.title.trim() ? t.title.trim() : null,
+    timeline:            typeof t.timeline === 'string' && t.timeline.trim() ? t.timeline.trim() : null,
     context:             t.context             ?? null,
-    project_hint:        t.project_hint        ?? null,
-    priority_tier:       t.priority_tier       ?? null,
-    needs_clarification: t.needs_clarification ?? false,
+    project_hint:        PROJECT_KEYS_TEST.includes(t.project_hint) ? t.project_hint : null,
+    priority_tier:       (Number.isInteger(tier) && tier >= 1 && tier <= 4) ? tier : null,
+    needs_clarification: t.needs_clarification === true,
     corrected_project:   t.corrected_project   ?? null,
-    recall_topic:        t.recall_topic        ?? null,
+    recall_topic:        typeof t.recall_topic === 'string' && t.recall_topic.trim() ? t.recall_topic.trim() : null,
   };
 }
 
@@ -2336,6 +2354,40 @@ describe('normaliseTask — field defaulting and intent validation', () => {
     const t = normaliseTask({ intent: 'save', title: 'X', unknown_field: 'value', another: 123 });
     assert.ok(!('unknown_field' in t));
     assert.ok(!('another' in t));
+  });
+
+  // ── priority_tier validation ──
+  test('priority_tier=1 is valid', () => assert.equal(normaliseTask({ intent: 'save', priority_tier: 1 }).priority_tier, 1));
+  test('priority_tier=4 is valid', () => assert.equal(normaliseTask({ intent: 'save', priority_tier: 4 }).priority_tier, 4));
+  test('priority_tier=0 → null (out of range)', () => assert.equal(normaliseTask({ intent: 'save', priority_tier: 0 }).priority_tier, null));
+  test('priority_tier=5 → null (out of range)', () => assert.equal(normaliseTask({ intent: 'save', priority_tier: 5 }).priority_tier, null));
+  test('priority_tier=-1 → null (out of range)', () => assert.equal(normaliseTask({ intent: 'save', priority_tier: -1 }).priority_tier, null));
+  test('priority_tier="high" → null (string, not integer)', () => assert.equal(normaliseTask({ intent: 'save', priority_tier: 'high' }).priority_tier, null));
+  test('priority_tier=2.5 → null (not integer)', () => assert.equal(normaliseTask({ intent: 'save', priority_tier: 2.5 }).priority_tier, null));
+
+  // ── title sanitisation ──
+  test('whitespace-only title → null', () => assert.equal(normaliseTask({ intent: 'save', title: '   ' }).title, null));
+  test('title with leading/trailing whitespace → trimmed', () => {
+    assert.equal(normaliseTask({ intent: 'save', title: '  Buy milk  ' }).title, 'Buy milk');
+  });
+
+  // ── project_hint validation ──
+  test('valid project_hint passes through', () => {
+    assert.equal(normaliseTask({ intent: 'save', project_hint: 'learning_tech' }).project_hint, 'learning_tech');
+  });
+  test('invalid project_hint → null', () => {
+    assert.equal(normaliseTask({ intent: 'save', project_hint: 'invalid_project' }).project_hint, null);
+  });
+  test('empty string project_hint → null', () => {
+    assert.equal(normaliseTask({ intent: 'save', project_hint: '' }).project_hint, null);
+  });
+
+  // ── recall_topic sanitisation ──
+  test('whitespace-only recall_topic → null', () => {
+    assert.equal(normaliseTask({ intent: 'recall', recall_topic: '  ' }).recall_topic, null);
+  });
+  test('valid recall_topic → trimmed string', () => {
+    assert.equal(normaliseTask({ intent: 'recall', recall_topic: ' linear probes ' }).recall_topic, 'linear probes');
   });
 });
 

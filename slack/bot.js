@@ -273,16 +273,17 @@ corrected_project: only if intent=correct AND user named a project
 recall_topic: only if intent=recall — the topic to search for, stripped of meta-phrasing`;
 
 function normaliseTask(t) {
+  const tier = t.priority_tier;
   return {
     intent:              VALID_INTENTS.includes(t.intent) ? t.intent : 'save',
-    title:               t.title               ?? null,
-    timeline:            t.timeline            ?? null,
+    title:               typeof t.title === 'string' && t.title.trim() ? t.title.trim() : null,
+    timeline:            typeof t.timeline === 'string' && t.timeline.trim() ? t.timeline.trim() : null,
     context:             t.context             ?? null,
-    project_hint:        t.project_hint        ?? null,
-    priority_tier:       t.priority_tier       ?? null,
-    needs_clarification: t.needs_clarification ?? false,
+    project_hint:        PROJECT_KEYS.includes(t.project_hint) ? t.project_hint : null,
+    priority_tier:       (Number.isInteger(tier) && tier >= 1 && tier <= 4) ? tier : null,
+    needs_clarification: t.needs_clarification === true,
     corrected_project:   t.corrected_project   ?? null,
-    recall_topic:        t.recall_topic        ?? null,
+    recall_topic:        typeof t.recall_topic === 'string' && t.recall_topic.trim() ? t.recall_topic.trim() : null,
   };
 }
 
@@ -290,8 +291,10 @@ function normaliseTask(t) {
 async function classifyIntent(text, urls) {
   const words = text.trim().split(/\s+/).filter(Boolean);
 
-  // Very short messages with no URLs are always conversational
-  if (urls.length === 0 && words.length <= 3) {
+  // Very short messages with no URLs (≤2 words) are always conversational.
+  // 3-word messages go to the AI — "add this" (2 words) was silently discarded
+  // but "add this now" (3 words) needs classification.
+  if (urls.length === 0 && words.length <= 2) {
     return [normaliseTask({ intent: 'converse' })];
   }
 
@@ -875,37 +878,46 @@ Rules:
 
     if (cls.intent === 'reminder') {
       await processReminderTask(cls, message.channel, userId, say);
+      // If reminder had no timeline, pending state was set — stop processing further tasks
+      if (pending.has(userId)) break;
       continue;
     }
 
     if (cls.intent === 'search_request') {
       pending.set(userId, { url: null, text: cls.title ?? userText, searchMode: true, step: 1 });
       await say('no link — want me to search for the application page? (y/n)');
-      continue;
+      break; // pending state set — stop processing remaining tasks until user responds
     }
 
     // Save — default intent
     if (cls.needs_clarification) {
       pending.set(userId, { url: urls[0] ?? null, text: cls.title ?? userText, step: 1 });
       await say('work or personal?');
-      continue;
+      break; // pending state set — stop processing remaining tasks until user responds
     }
 
     const isVagueLearning = cls.project_hint === 'learning_tech' && urls.length === 0;
     if (isVagueLearning) {
       pending.set(userId, { learningMode: true, originalText: cls.title ?? userText, step: 1, history: [] });
       await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
-      continue;
+      break; // pending state set — stop processing remaining tasks until user responds
     }
 
     const url          = urls[0] ?? undefined;
     const project      = cls.project_hint ?? (cls.context === 'work' ? 'work' : null);
     const enrichedText = buildEnrichedText(cls.context, cls.timeline, cls.title ?? userText, url);
 
+    // Guard: skip save if we have nothing to save (null title + empty enrichedText + empty userText)
+    const saveText = enrichedText || cls.title || userText;
+    if (!saveText && !url) {
+      console.warn('[save] skipped — no text or url to save');
+      continue;
+    }
+
     try {
       const data = await callInbox({
         url,
-        text:          enrichedText || cls.title || userText || undefined,
+        text:          saveText || undefined,
         title:         cls.title ?? undefined,
         source:        'slack',
         timeline:      cls.timeline      ?? undefined,
