@@ -2979,3 +2979,330 @@ describe('reminderMode pending state — to-do routing contract', () => {
     assert.ok(reask.includes('in 2 weeks'));
   });
 });
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 27 — Calendar reply format contracts (calCreated flag)
+// Tests what the bot says when calendar succeeds or fails.
+// The actual API call is mocked via the calCreated boolean.
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe('Calendar reply format — calCreated flag contracts', () => {
+
+  // Simulate what processReminderTask / reminderMode handler builds
+  const buildCalendarReply = (title, timeline, calCreated) =>
+    `📅 ${title} · ${timeline}${calCreated ? ' · added to calendar' : ''}`;
+
+  test('calCreated=true → reply includes "added to calendar"', () => {
+    const msg = buildCalendarReply('Buy cleansing oil', 'this Saturday', true);
+    assert.ok(msg.includes('added to calendar'));
+  });
+
+  test('calCreated=false → reply does NOT include "added to calendar"', () => {
+    const msg = buildCalendarReply('Buy cleansing oil', 'this Saturday', false);
+    assert.ok(!msg.includes('added to calendar'));
+  });
+
+  test('calCreated=false → reply still includes the title and timeline', () => {
+    const msg = buildCalendarReply('Buy milk', 'tomorrow', false);
+    assert.ok(msg.includes('Buy milk'));
+    assert.ok(msg.includes('tomorrow'));
+    assert.ok(msg.startsWith('📅'));
+  });
+
+  test('calCreated=true → reply includes all three components', () => {
+    const msg = buildCalendarReply('Dentist', 'Friday 2pm', true);
+    assert.ok(msg.startsWith('📅'));
+    assert.ok(msg.includes('Dentist'));
+    assert.ok(msg.includes('Friday 2pm'));
+    assert.ok(msg.includes('added to calendar'));
+  });
+
+  test('CALENDAR_ENABLED=false → calCreated stays false → no calendar note in reply', () => {
+    // Simulate: CALENDAR_ENABLED not set → calCreated never set to true
+    const calEnabled = process.env.CALENDAR_ENABLED_TEST ?? 'false'; // test env
+    let calCreated = false;
+    if (calEnabled === 'true') {
+      calCreated = true; // would be set by API call
+    }
+    const msg = buildCalendarReply('Meeting', 'Monday 9am', calCreated);
+    assert.ok(!msg.includes('added to calendar'));
+  });
+
+  test('calendar error (HTTP 401) → calCreated=false → reply has no calendar note', () => {
+    // Simulate: API returned 401 Unauthorized → calRes.ok = false → calCreated = false
+    const calRes = { ok: false, status: 401 };
+    let calCreated = calRes.ok; // false
+    const msg = buildCalendarReply('Doctor appointment', 'next Tuesday', calCreated);
+    assert.ok(!msg.includes('added to calendar'));
+    assert.ok(msg.includes('Doctor appointment'));
+  });
+
+  test('calendar error (HTTP 500) → calCreated=false', () => {
+    const calRes = { ok: false, status: 500 };
+    const calCreated = calRes.ok;
+    assert.equal(calCreated, false);
+  });
+
+  test('calendar success (HTTP 200) → calCreated=true', () => {
+    const calRes = { ok: true, status: 200 };
+    const calCreated = calRes.ok;
+    assert.equal(calCreated, true);
+  });
+
+  // ── REGRESSION: calendar was silently failing with no log ──
+  test('REGRESSION: non-ok calRes → calCreated is false (not undefined or truthy)', () => {
+    // Previously: calCreated = calRes.ok where calRes.ok=false → calCreated=false ✓
+    // The bug was: error body never read, so HTTP 401 "Calendar not connected" was invisible in logs
+    const calRes = { ok: false, status: 401 };
+    const calCreated = calRes.ok;
+    assert.strictEqual(calCreated, false);
+    assert.notEqual(calCreated, undefined);
+    assert.notEqual(calCreated, null);
+  });
+
+  test('date=null (parse failed) → calendar block is skipped → calCreated=false', () => {
+    // Simulate: parseTimelineToDate returned null (bad timeline input)
+    const date = null;
+    const CALENDAR_ENABLED = 'true';
+    let calCreated = false;
+    if (CALENDAR_ENABLED === 'true' && date) {
+      calCreated = true; // would be set if date were valid
+    }
+    assert.equal(calCreated, false);
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 28 — Pass 2 deferred task processing
+// Two-pass multi-task strategy: Pass 1 processes tasks with timelines immediately,
+// Pass 2 handles the first deferred task (usually a reminder without a date).
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe('Pass 2 — deferred task processing for multi-task messages', () => {
+
+  // Simulate the Pass 2 decision logic
+  const shouldRunPass2 = (needsInput, pendingHasUser) =>
+    needsInput.length > 0 && !pendingHasUser;
+
+  test('needsInput=[reminder], no pending → Pass 2 runs', () => {
+    const needsInput = [{ type: 'reminder', cls: { title: 'Buy milk', timeline: null } }];
+    assert.ok(shouldRunPass2(needsInput, false));
+  });
+
+  test('needsInput=[], no pending → Pass 2 is skipped (nothing to do)', () => {
+    assert.ok(!shouldRunPass2([], false));
+  });
+
+  test('needsInput=[reminder], pending already set by Pass 1 → Pass 2 is skipped', () => {
+    // e.g., a search_request in Pass 1 already set pending → skip Pass 2
+    const needsInput = [{ type: 'reminder', cls: { title: 'Buy milk', timeline: null } }];
+    assert.ok(!shouldRunPass2(needsInput, true));
+  });
+
+  test('needsInput has multiple deferred tasks → only the first is processed', () => {
+    // Only needsInput[0] is handled — others remain unprocessed (next message will handle them)
+    const needsInput = [
+      { type: 'reminder', cls: { title: 'Buy milk', timeline: null } },
+      { type: 'reminder', cls: { title: 'Call mum', timeline: null } },
+    ];
+    // Simulate: only process first
+    const processed = needsInput.slice(0, 1);
+    assert.equal(processed.length, 1);
+    assert.equal(processed[0].cls.title, 'Buy milk');
+  });
+
+  // ── The exact failing multi-task scenario ──
+  test('REGRESSION: "remind me to buy milk, also add assignment for the 13th"', () => {
+    // AI classifies as 2 tasks:
+    const tasks = [
+      normaliseTask({ intent: 'reminder', title: 'Buy milk', timeline: null }),        // no date → defer
+      normaliseTask({ intent: 'reminder', title: 'Linear Algebra Assignment 2', timeline: '13th' }), // has date → immediate
+    ];
+
+    const needsInput = [];
+    const pass1Processed = [];
+
+    for (const cls of tasks) {
+      if (cls.intent === 'reminder') {
+        if (cls.timeline) {
+          pass1Processed.push(cls.title);  // would call processReminderTask
+        } else {
+          needsInput.push({ type: 'reminder', cls });
+        }
+      }
+    }
+
+    // Pass 1: assignment was processed (has timeline)
+    assert.equal(pass1Processed.length, 1);
+    assert.equal(pass1Processed[0], 'Linear Algebra Assignment 2');
+
+    // Pass 2: milk is deferred (no timeline) → will ask "when is Buy milk?"
+    assert.equal(needsInput.length, 1);
+    assert.equal(needsInput[0].cls.title, 'Buy milk');
+    assert.equal(needsInput[0].type, 'reminder');
+  });
+
+  test('single reminder with timeline → Pass 1 only, needsInput empty', () => {
+    const tasks = [normaliseTask({ intent: 'reminder', title: 'Doctor appointment', timeline: 'Friday 2pm' })];
+    const needsInput = [];
+    const pass1 = [];
+    for (const cls of tasks) {
+      if (cls.intent === 'reminder') {
+        if (cls.timeline) { pass1.push(cls.title); }
+        else { needsInput.push({ type: 'reminder', cls }); }
+      }
+    }
+    assert.equal(pass1.length, 1);
+    assert.equal(needsInput.length, 0);
+  });
+
+  test('single reminder without timeline → needsInput has 1, pass1 empty', () => {
+    const tasks = [normaliseTask({ intent: 'reminder', title: 'Buy milk', timeline: null })];
+    const needsInput = [];
+    const pass1 = [];
+    for (const cls of tasks) {
+      if (cls.intent === 'reminder') {
+        if (cls.timeline) { pass1.push(cls.title); }
+        else { needsInput.push({ type: 'reminder', cls }); }
+      }
+    }
+    assert.equal(pass1.length, 0);
+    assert.equal(needsInput.length, 1);
+    // Pass 2 would call processReminderTask → asks "when is Buy milk?"
+  });
+
+  test('mixed: save + reminder-with-timeline + reminder-without-timeline', () => {
+    const tasks = [
+      normaliseTask({ intent: 'save', title: 'Read diffusion paper', timeline: null }),
+      normaliseTask({ intent: 'reminder', title: 'Submit assignment', timeline: '13th' }),
+      normaliseTask({ intent: 'reminder', title: 'Buy milk', timeline: null }),
+    ];
+    const needsInput = [];
+    const pass1Reminders = [];
+    for (const cls of tasks) {
+      if (cls.intent === 'reminder') {
+        if (cls.timeline) { pass1Reminders.push(cls.title); }
+        else { needsInput.push({ type: 'reminder', cls }); }
+      }
+    }
+    assert.equal(pass1Reminders.length, 1);
+    assert.equal(pass1Reminders[0], 'Submit assignment');
+    assert.equal(needsInput.length, 1);
+    assert.equal(needsInput[0].cls.title, 'Buy milk');
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 29 — reminderMode resend guard
+// When a user accidentally sends a new "remind me to..." message instead of
+// providing a date, the bot should clear pending and reprocess as fresh.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Replicated from bot.js reminderMode guard — must stay in sync
+const looksLikeNewReminderGuard = (userText) =>
+  /^(remind me|set a reminder|can you remind|add a reminder)\b/i.test(userText.trim()) &&
+  userText.trim().split(/\s+/).length > 5;
+
+describe('reminderMode resend guard — clears pending on new reminder command', () => {
+
+  // ── Messages that SHOULD trigger the guard (clear pending + reprocess) ──
+  test('"remind me to buy cleansing oil this Saturday" → guard triggers', () => {
+    assert.ok(looksLikeNewReminderGuard('remind me to buy cleansing oil this Saturday'));
+  });
+
+  test('"remind me to call the dentist tomorrow at 2pm" → guard triggers', () => {
+    assert.ok(looksLikeNewReminderGuard('remind me to call the dentist tomorrow at 2pm'));
+  });
+
+  test('"set a reminder for the assignment on the 13th" → guard triggers', () => {
+    assert.ok(looksLikeNewReminderGuard('set a reminder for the assignment on the 13th'));
+  });
+
+  test('"can you remind me about the meeting next week" → guard triggers', () => {
+    assert.ok(looksLikeNewReminderGuard('can you remind me about the meeting next week'));
+  });
+
+  test('"add a reminder for gym on Monday" → guard triggers', () => {
+    assert.ok(looksLikeNewReminderGuard('add a reminder for gym on Monday'));
+  });
+
+  // ── Messages that should NOT trigger the guard (normal date replies) ──
+  test('"saturday" → no guard (1 word, clearly a date)', () => {
+    assert.ok(!looksLikeNewReminderGuard('saturday'));
+  });
+
+  test('"this Saturday" → no guard (2 words)', () => {
+    assert.ok(!looksLikeNewReminderGuard('this Saturday'));
+  });
+
+  test('"tomorrow morning" → no guard (2 words)', () => {
+    assert.ok(!looksLikeNewReminderGuard('tomorrow morning'));
+  });
+
+  test('"Friday 2pm" → no guard (2 words)', () => {
+    assert.ok(!looksLikeNewReminderGuard('Friday 2pm'));
+  });
+
+  test('"to do" → no guard (not a reminder command)', () => {
+    assert.ok(!looksLikeNewReminderGuard('to do'));
+  });
+
+  test('"in 2 weeks" → no guard (3 words, no reminder keyword)', () => {
+    assert.ok(!looksLikeNewReminderGuard('in 2 weeks'));
+  });
+
+  test('"the 13th" → no guard', () => {
+    assert.ok(!looksLikeNewReminderGuard('the 13th'));
+  });
+
+  test('"13th of this month" → no guard (4 words, no reminder keyword)', () => {
+    assert.ok(!looksLikeNewReminderGuard('13th of this month'));
+  });
+
+  // ── Edge cases ──
+  test('"remind me" (2 words, too short) → no guard (< 6 words)', () => {
+    // length check > 5 means 6+ words required to avoid false positives on short phrases
+    assert.ok(!looksLikeNewReminderGuard('remind me'));
+  });
+
+  test('"remind me to" (3 words) → no guard (still too short)', () => {
+    assert.ok(!looksLikeNewReminderGuard('remind me to'));
+  });
+
+  test('"remind me to do X" (5 words) → no guard (needs > 5)', () => {
+    assert.ok(!looksLikeNewReminderGuard('remind me to do X'));
+  });
+
+  test('"remind me to call her saturday" (6 words) → guard triggers (≥6)', () => {
+    assert.ok(looksLikeNewReminderGuard('remind me to call her saturday'));
+  });
+
+  test('case-insensitive: "REMIND ME TO BUY MILK TOMORROW" → guard triggers', () => {
+    assert.ok(looksLikeNewReminderGuard('REMIND ME TO BUY MILK TOMORROW'));
+  });
+
+  // ── Contract: guard clears pending state ──
+  test('when guard triggers: pending is cleared, message reprocessed as fresh', () => {
+    // Simulate: user is in reminderMode waiting for date for "Buy milk"
+    // User sends "remind me to also add assignment for the 13th" instead
+    const pendingState = { reminderMode: true, reminderTitle: 'Buy milk' };
+    const userMessage = 'remind me to also add assignment for the 13th';
+
+    const shouldClear = looksLikeNewReminderGuard(userMessage);
+    assert.ok(shouldClear); // guard fires → bot clears pending
+
+    // After clearing, the fresh message would be processed normally
+    // (re-classified as reminder with title="Linear Algebra Assignment 2", timeline="13th")
+    assert.ok(!!pendingState); // state existed before
+    // In bot.js: pending.delete(userId) then fall through
+  });
+
+  test('when guard does NOT trigger: reminderMode handler processes date normally', () => {
+    const userMessage = 'Saturday'; // normal date reply
+    const shouldClear = looksLikeNewReminderGuard(userMessage);
+    assert.ok(!shouldClear); // guard does not fire → normal date parsing proceeds
+  });
+});

@@ -463,7 +463,11 @@ async function processReminderTask(cls, channel, userId, say) {
           body:    JSON.stringify({ title: reminderTitle, date, colorId, description: cls.title ?? reminderTitle }),
         });
         calCreated = calRes.ok;
-      } catch (err) { console.error('[calendar] event creation failed:', err.message); }
+        if (!calRes.ok) {
+          const errBody = await calRes.text().catch(() => '(unreadable)');
+          console.error(`[calendar] event creation failed: HTTP ${calRes.status}`, errBody.slice(0, 300));
+        }
+      } catch (err) { console.error('[calendar] event creation failed (network):', err.message); }
     }
     await reply(channel, `📅 ${reminderTitle} · ${cls.timeline}${calCreated ? ' · added to calendar' : ''}`);
 
@@ -513,59 +517,72 @@ app.message(async ({ message, say }) => {
 
     // Reminder date prompt — user is answering "when is this?"
     if (state.reminderMode) {
-      const lc = userText.toLowerCase().trim();
-      const isToDoReply = /^(to.?do|td|my list|add to list|no date|just add it|whenever)$/i.test(lc);
+      // Guard: if user sends a new "remind me to..." message instead of a date (confused state),
+      // clear pending and fall through to re-classify as a fresh message
+      const looksLikeNewReminder =
+        /^(remind me|set a reminder|can you remind|add a reminder)\b/i.test(userText.trim()) &&
+        userText.trim().split(/\s+/).length > 5;
+      if (!looksLikeNewReminder) {
+        const lc = userText.toLowerCase().trim();
+        const isToDoReply = /^(to.?do|td|my list|add to list|no date|just add it|whenever)$/i.test(lc);
 
-      if (isToDoReply) {
-        // Save to personal Kanban, no calendar
-        pending.delete(userId);
-        try {
-          const data = await callInbox({
-            text:    state.reminderTitle,
-            title:   state.reminderTitle,
-            source:  'slack',
-            project: 'personal',
-          });
-          if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: state.reminderTitle });
-          await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${state.reminderTitle.slice(0, 60)}> · added to your to-do list`);
-        } catch { await say("couldn't save that"); }
-        return;
-      }
-
-      // User gave a date — parse it and route to calendar
-      const date = await parseTimelineToDate(userText) ?? await parseTimelineToDate(userText.replace(/^(on|at|by|this|next)\s+/i, ''));
-      if (!date) {
-        // Couldn't parse — re-ask once then save as to-do
-        const reask = (state.reminderReask ?? 0) + 1;
-        if (reask >= 2) {
+        if (isToDoReply) {
+          // Save to personal Kanban, no calendar
           pending.delete(userId);
           try {
-            await callInbox({ text: state.reminderTitle, title: state.reminderTitle, source: 'slack', project: 'personal' });
+            const data = await callInbox({
+              text:    state.reminderTitle,
+              title:   state.reminderTitle,
+              source:  'slack',
+              project: 'personal',
+            });
+            if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: state.reminderTitle });
             await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${state.reminderTitle.slice(0, 60)}> · added to your to-do list`);
           } catch { await say("couldn't save that"); }
           return;
         }
-        pending.set(userId, { ...state, reminderReask: reask });
-        await say(`didn't catch a date — try "this Saturday", "13th", "in 2 weeks", or say *to do* to add to your list`);
+
+        // User gave a date — parse it and route to calendar
+        const date = await parseTimelineToDate(userText) ?? await parseTimelineToDate(userText.replace(/^(on|at|by|this|next)\s+/i, ''));
+        if (!date) {
+          // Couldn't parse — re-ask once then save as to-do
+          const reask = (state.reminderReask ?? 0) + 1;
+          if (reask >= 2) {
+            pending.delete(userId);
+            try {
+              await callInbox({ text: state.reminderTitle, title: state.reminderTitle, source: 'slack', project: 'personal' });
+              await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${state.reminderTitle.slice(0, 60)}> · added to your to-do list`);
+            } catch { await say("couldn't save that"); }
+            return;
+          }
+          pending.set(userId, { ...state, reminderReask: reask });
+          await say(`didn't catch a date — try "this Saturday", "13th", "in 2 weeks", or say *to do* to add to your list`);
+          return;
+        }
+
+        // Got a valid date — create calendar event
+        pending.delete(userId);
+        const colorId = pickCalendarColor('personal', state.originalText);
+        let calCreated = false;
+        if (process.env.CALENDAR_ENABLED === 'true') {
+          try {
+            const calRes = await fetch(`${process.env.APP_URL}/api/calendar/event`, {
+              method:  'POST',
+              headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
+              body:    JSON.stringify({ title: state.reminderTitle, date, colorId, description: state.originalText }),
+            });
+            calCreated = calRes.ok;
+            if (!calRes.ok) {
+              const errBody = await calRes.text().catch(() => '(unreadable)');
+              console.error(`[calendar] event creation failed: HTTP ${calRes.status}`, errBody.slice(0, 300));
+            }
+          } catch (err) { console.error('[calendar] event creation failed (network):', err.message); }
+        }
+        await say(`📅 ${state.reminderTitle} · ${userText.trim()}${calCreated ? ' · added to calendar' : ''}`);
         return;
       }
-
-      // Got a valid date — create calendar event
+      // looksLikeNewReminder=true: clear pending and fall through to fresh message processing
       pending.delete(userId);
-      const colorId = pickCalendarColor('personal', state.originalText);
-      let calCreated = false;
-      if (process.env.CALENDAR_ENABLED === 'true') {
-        try {
-          const calRes = await fetch(`${process.env.APP_URL}/api/calendar/event`, {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
-            body:    JSON.stringify({ title: state.reminderTitle, date, colorId, description: state.originalText }),
-          });
-          calCreated = calRes.ok;
-        } catch (err) { console.error('[calendar] event creation failed:', err.message); }
-      }
-      await say(`📅 ${state.reminderTitle} · ${userText.trim()}${calCreated ? ' · added to calendar' : ''}`);
-      return;
     }
 
     // Learning clarification mode — two-call architecture:
@@ -835,8 +852,16 @@ Rules:
 
   // ── Classify intent — returns array (handles multi-task messages natively) ───
   const tasks = await classifyIntent(userText, urls);
-  // Process all tasks; for multi-task we loop. For single-task the array has one element.
-  // Pending state (reminderMode, learningMode) is only set for the last unresolved task.
+
+  // Two-pass strategy for multi-task messages:
+  // Pass 1: process all tasks that can be completed immediately (no pending state needed).
+  //         For reminders: only those WITH a timeline.
+  // Pass 2: handle the first task that needs clarification (sets pending, asks question).
+  // This ensures "remind me to buy milk, also add assignment for the 13th" correctly
+  // adds the assignment to calendar AND asks when to buy milk — instead of stopping at milk.
+
+  const needsInput = []; // tasks deferred to pass 2
+
   for (const cls of tasks) {
     if (cls.intent === 'converse') continue;
 
@@ -845,8 +870,7 @@ Rules:
       if (!prev) { await say('nothing recent to correct'); continue; }
       const proj = cls.corrected_project ?? parseProjectFromText(userText);
       if (!proj) {
-        pending.set(userId, { ...prev, correctionMode: true });
-        await say('which project? (school / work / learning / research / art / baking / beads / circuits / reading / exercise)');
+        needsInput.push({ type: 'correction', prev });
         continue;
       }
       await callCorrect(prev.logId, proj, userText);
@@ -884,9 +908,13 @@ Rules:
     }
 
     if (cls.intent === 'reminder') {
-      await processReminderTask(cls, message.channel, userId, say);
-      // If reminder had no timeline, pending state was set — stop processing further tasks
-      if (pending.has(userId)) break;
+      if (cls.timeline) {
+        // Has date/time — process immediately, no pending needed
+        await processReminderTask(cls, message.channel, userId, say);
+      } else {
+        // No date — defer to pass 2 (ask "when is X?")
+        needsInput.push({ type: 'reminder', cls });
+      }
       continue;
     }
 
@@ -935,6 +963,23 @@ Rules:
       await reply(message.channel, buildSuccessMessage(data, cls));
     } catch {
       await say("couldn't save that");
+    }
+  }
+
+  // ── Pass 2: handle the first deferred task (needs user input) ─────────────────
+  // Only one pending question at a time. Process needsInput[0] if no pending state was set
+  // by the loop above. This ensures multi-task messages like "remind me to buy milk,
+  // also add assignment for the 13th" correctly process both tasks:
+  //   Pass 1: assignment (has timeline) → calendar event created immediately
+  //   Pass 2: milk (no timeline) → asks "when is Buy milk?"
+  if (needsInput.length > 0 && !pending.has(userId)) {
+    const deferred = needsInput[0];
+    if (deferred.type === 'reminder') {
+      // processReminderTask with no cls.timeline → sets pending + asks "when is X?"
+      await processReminderTask(deferred.cls, message.channel, userId, say);
+    } else if (deferred.type === 'correction') {
+      pending.set(userId, { correctionMode: true, logId: deferred.prev.logId, correctionStep: 0 });
+      await say("which project should it be in? (school, work, learning, research, art, baking, beads, circuits, reading, exercise, personal)");
     }
   }
 });
