@@ -790,19 +790,40 @@ Rules:
       // Check if user added a research/lookup request alongside the context answer
       const hasResearchAsk = /\b(find|look up|lookup|search|research|get|what('?s| is) the date|when is)\b/i.test(userText);
 
+      if (hasResearchAsk) {
+        // Save silently in background — user wants the date, not the app link
+        callInbox({ url: state.url ?? undefined, text: enrichedText, title: state.text ?? undefined, source: 'slack', project })
+          .then(data => { if (data?.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary }); })
+          .catch(() => {});
+
+        // Ask AI to look up event details from training knowledge
+        let found = null;
+        try {
+          const res = await callModelWithFallback('gemini-flash', 'deepseek-chat', {
+            system: `You are searching for event details. Given a description of an event, state the date, time, and location if you know them. Be concise: 1-2 sentences. If you don't know, respond with exactly: "I don't have this event."`,
+            messages: [{ role: 'user', content: state.text }],
+            maxTokens: 100,
+          });
+          logCostViaApi(res.modelKey, res.usage, 'event_lookup');
+          const answer = res.text?.trim() ?? '';
+          if (answer && !/i don'?t (have|know)/i.test(answer)) found = answer;
+        } catch { /* silent */ }
+
+        if (found) {
+          await say(found);
+        } else {
+          const shortQuery = (state.text ?? '').replace(/^there'?s?\s+(a\s+)?/i, '').trim().slice(0, 80);
+          await say(`I don't have that date — search *"${shortQuery}"* on lu.ma`);
+        }
+        return;
+      }
+
       try {
-        // Pass title: state.text (clean original) separately from text: enrichedText (routing context).
-        // Without this, the inbox title extractor receives "[Personal] there's a..." and the
-        // [Personal] annotation leaks into the displayed title.
         const data = await callInbox({ url: state.url ?? undefined, text: enrichedText, title: state.text ?? undefined, source: 'slack', project });
         if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
         await reply(message.channel, buildSuccessMessage(data, {}));
       } catch {
         await say("couldn't save that");
-      }
-
-      if (hasResearchAsk) {
-        await say(`noted — I can't look up dates in real time. Check lu.ma or the event page directly.`);
       }
       return;
     }
