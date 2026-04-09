@@ -66,7 +66,7 @@ function buildEnrichedText(context, timeline, text, url) {
 function parseClarificationContext(text) {
   const t = text.toLowerCase();
   if (/\bwork\b|\bjob\b|\bprofessional\b|\bsprint\b|\bticket\b/i.test(text)) return 'work';
-  if (/\bpersonal\b|\bmine\b|\bme\b|\blearning\b|\bfun\b|\bcurious\b/i.test(text)) return 'personal';
+  if (/\bpersonal\b|\bperson\b|\bmine\b|\bme\b|\blearning\b|\bfun\b|\bcurious\b/i.test(text)) return 'personal';
   if (/^w\b/i.test(t.trim())) return 'work';
   if (/^p\b/i.test(t.trim())) return 'personal';
   return null;
@@ -2605,7 +2605,6 @@ describe('softCheckIn — step reset prevents infinite loop', () => {
   });
 
   test('step=5 allows 3 more chat turns before re-triggering check-in at step=8', () => {
-    const state = { step: 5 };
     // Simulate 3 more chat turns: steps 5, 6, 7 should all allow chat
     for (let s = 5; s <= 7; s++) {
       const { chatReply } = handleLearningReplyResult({ type: 'chat' }, s);
@@ -2827,7 +2826,6 @@ describe('buildLearningTitle — verb-led actionable title generation', () => {
 
   test('empty action after stripping → "Explore [topic]" (not " [topic]")', () => {
     // Action = "" after stripping → verb defaults to "Explore"
-    const verb = ''.trim() || 'Explore';
     const result = buildLearningTitle('', 'linear probes');
     // With the fix, empty action defaults to "Explore"
     assert.ok(result.startsWith('Explore'));
@@ -2887,7 +2885,7 @@ describe('Multi-task loop — edge case contracts', () => {
   test('empty tasks array → loop executes zero iterations (safe)', () => {
     const tasks = [];
     let iterations = 0;
-    for (const cls of tasks) { iterations++; }
+    for (const _cls of tasks) { iterations++; }
     assert.equal(iterations, 0);
   });
 
@@ -2924,7 +2922,6 @@ describe('Multi-task loop — edge case contracts', () => {
     // When cls.title is null and url is undefined, callInbox receives {text: undefined}
     // This documents the current behavior — the inbox API must handle null text gracefully
     const cls = normaliseTask({ intent: 'save' });
-    const url = undefined;
     const text = cls.title ?? undefined;
     assert.equal(text, undefined); // documents current behavior
     // The API is called with {text: undefined} — the inbox route should handle this

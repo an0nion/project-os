@@ -432,7 +432,7 @@ function buildEnrichedText(context, timeline, text, url) {
 function parseClarificationContext(text) {
   const t = text.toLowerCase();
   if (/\bwork\b|\bjob\b|\bprofessional\b|\bsprint\b|\bticket\b/i.test(text)) return 'work';
-  if (/\bpersonal\b|\bmine\b|\bme\b|\blearning\b|\bfun\b|\bcurious\b/i.test(text)) return 'personal';
+  if (/\bpersonal\b|\bperson\b|\bmine\b|\bme\b|\blearning\b|\bfun\b|\bcurious\b/i.test(text)) return 'personal';
   if (/^w\b/i.test(t.trim())) return 'work';     // bare "w"
   if (/^p\b/i.test(t.trim())) return 'personal';  // bare "p"
   return null;
@@ -770,12 +770,19 @@ Rules:
       const enrichedText = buildEnrichedText(context, null, state.text, state.url);
       pending.delete(userId);
 
+      // Check if user added a research/lookup request alongside the context answer
+      const hasResearchAsk = /\b(find|look up|lookup|search|research|get|what('?s| is) the date|when is)\b/i.test(userText);
+
       try {
         const data = await callInbox({ url: state.url ?? undefined, text: enrichedText, source: 'slack', project });
         if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
         await reply(message.channel, buildSuccessMessage(data, {}));
       } catch {
         await say("couldn't save that");
+      }
+
+      if (hasResearchAsk) {
+        await say(`saved — I can't look things up in real time, but I've noted it. Check the source directly for the date/details.`);
       }
       return;
     }
