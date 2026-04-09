@@ -12,6 +12,7 @@
 import 'dotenv/config';
 import bolt from '@slack/bolt';
 import { callModelWithFallback } from '../lib/multiModelClient.js';
+import { webSearch } from '../lib/search.js';
 
 const { App } = bolt;
 
@@ -791,29 +792,37 @@ Rules:
       const hasResearchAsk = /\b(find|look up|lookup|search|research|get|what('?s| is) the date|when is)\b/i.test(userText);
 
       if (hasResearchAsk) {
-        // Save silently in background — user wants the date, not the app link
+        // Save silently in background — user wants the search result, not the app link
         callInbox({ url: state.url ?? undefined, text: enrichedText, title: state.text ?? undefined, source: 'slack', project })
           .then(data => { if (data?.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary }); })
           .catch(() => {});
 
-        // Ask AI to look up event details from training knowledge
-        let found = null;
-        try {
-          const res = await callModelWithFallback('gemini-flash', 'deepseek-chat', {
-            system: `You are searching for event details. Given a description of an event, state the date, time, and location if you know them. Be concise: 1-2 sentences. If you don't know, respond with exactly: "I don't have this event."`,
-            messages: [{ role: 'user', content: state.text }],
-            maxTokens: 100,
-          });
-          logCostViaApi(res.modelKey, res.usage, 'event_lookup');
-          const answer = res.text?.trim() ?? '';
-          if (answer && !/i don'?t (have|know)/i.test(answer)) found = answer;
-        } catch { /* silent */ }
+        // Real-time web search via Tavily
+        const searchQuery = (state.text ?? '').replace(/^there'?s?\s+(a\s+)?/i, '').trim();
+        const searchData  = await webSearch(searchQuery);
 
-        if (found) {
-          await say(found);
+        if (searchData?.answer) {
+          // Tavily already synthesised an answer — use it directly
+          await say(searchData.answer.slice(0, 500));
+        } else if (searchData?.results?.length) {
+          // Raw results — ask AI to extract the relevant info
+          const snippets = searchData.results.slice(0, 3)
+            .map(r => `${r.title}: ${(r.content ?? '').slice(0, 200)}`)
+            .join('\n\n');
+          try {
+            const aiRes = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
+              system: `Based on these search results, answer in 1-2 sentences: when and where exactly is this event? Include the date, time, and a link if present. If the results don't contain this info, say "couldn't find the date."`,
+              messages: [{ role: 'user', content: `Event: ${state.text}\n\nSearch results:\n${snippets}` }],
+              maxTokens: 150,
+            });
+            logCostViaApi(aiRes.modelKey, aiRes.usage, 'event_lookup');
+            await say(aiRes.text?.trim() || `couldn't find the date — check lu.ma`);
+          } catch {
+            await say(`couldn't find the date — check lu.ma`);
+          }
         } else {
-          const shortQuery = (state.text ?? '').replace(/^there'?s?\s+(a\s+)?/i, '').trim().slice(0, 80);
-          await say(`I don't have that date — search *"${shortQuery}"* on lu.ma`);
+          // Search unavailable or no results
+          await say(`couldn't find the date — search *"${searchQuery.slice(0, 80)}"* on lu.ma`);
         }
         return;
       }
