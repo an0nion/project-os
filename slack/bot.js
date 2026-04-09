@@ -802,26 +802,13 @@ Rules:
         const searchData  = await webSearch(searchQuery);
 
         if (searchData?.answer) {
-          // Tavily already synthesised an answer — use it directly
           await say(searchData.answer.slice(0, 500));
         } else if (searchData?.results?.length) {
-          // Raw results — ask AI to extract the relevant info
-          const snippets = searchData.results.slice(0, 3)
-            .map(r => `${r.title}: ${(r.content ?? '').slice(0, 200)}`)
-            .join('\n\n');
-          try {
-            const aiRes = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
-              system: `Based on these search results, answer in 1-2 sentences: when and where exactly is this event? Include the date, time, and a link if present. If the results don't contain this info, say "couldn't find the date."`,
-              messages: [{ role: 'user', content: `Event: ${state.text}\n\nSearch results:\n${snippets}` }],
-              maxTokens: 150,
-            });
-            logCostViaApi(aiRes.modelKey, aiRes.usage, 'event_lookup');
-            await say(aiRes.text?.trim() || `couldn't find the date — check lu.ma`);
-          } catch {
-            await say(`couldn't find the date — check lu.ma`);
-          }
+          // Show top result directly — no AI synthesis (avoids hallucinated dates)
+          const top = searchData.results[0];
+          const snippet = (top.content ?? '').slice(0, 300).trim();
+          await say(`*${top.title}*\n${snippet}${top.url ? `\n${top.url}` : ''}`);
         } else {
-          // Search unavailable or no results
           await say(`couldn't find the date — search *"${searchQuery.slice(0, 80)}"* on lu.ma`);
         }
         return;
@@ -928,17 +915,9 @@ Rules:
             if (searchData?.answer) {
               await say(searchData.answer.slice(0, 500));
             } else if (searchData?.results?.length) {
-              const snippets = searchData.results.slice(0, 3)
-                .map(r => `${r.title}: ${(r.content ?? '').slice(0, 200)}`).join('\n\n');
-              try {
-                const aiRes = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
-                  system: `Based on these search results, answer in 1-2 sentences: when and where exactly is this event? Include the date, time, and location if present. If not found, say "couldn't find the date."`,
-                  messages: [{ role: 'user', content: `Event: ${topic}\n\nSearch results:\n${snippets}` }],
-                  maxTokens: 150,
-                });
-                logCostViaApi(aiRes.modelKey, aiRes.usage, 'event_lookup');
-                await say(aiRes.text?.trim() || `couldn't find the date — try searching on lu.ma`);
-              } catch { await say(`couldn't find the date — try searching on lu.ma`); }
+              const top = searchData.results[0];
+              const snippet = (top.content ?? '').slice(0, 300).trim();
+              await say(`*${top.title}*\n${snippet}${top.url ? `\n${top.url}` : ''}`);
             } else {
               await say(`couldn't find anything about "${topic}" — try searching on lu.ma`);
             }
