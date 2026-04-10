@@ -13,6 +13,10 @@ import 'dotenv/config';
 import bolt from '@slack/bolt';
 import { callModelWithFallback } from '../lib/multiModelClient.js';
 import { webSearch } from '../lib/search.js';
+import { pickColorId } from '../lib/calendar.js';
+import { PROJECT_KEYS, VALID_INTENTS, INTENT_SYSTEM_PROMPT } from '../lib/intentPrompt.js';
+import { parseContext, parseProjectKey, parseReminderMins, parseDurationMins } from '../lib/naturalParser.js';
+import { logCostViaApi } from '../lib/vmCostLogger.js';
 
 const { App } = bolt;
 
@@ -143,26 +147,6 @@ Examples given current date ${nowStr.split(' ')[0]}:
   }
 }
 
-// ── Google Calendar colorId routing (single-calendar, per-event colours) ──────
-// colorId 1-11 per Google Calendar API. No calendar switching needed.
-function pickCalendarColor(project, text) {
-  const t = (text ?? '').toLowerCase();
-  if (/\bfinal exam|finals\b/.test(t))                                       return '6';  // Tangerine  — orange        — Exam
-  if (/\bassignment|\bhomework\b|\bhw\b|due date|submit|graded\b/.test(t))   return '1';  // Lavender   — light purple  — Graded
-  if (/\bbirthday|bday\b/.test(t))                                           return '5';  // Banana     — yellow        — Birthdays
-  if (/\bdoctor|dentist|physio|\bgp\b|appointment|outing|catch.?up/.test(t)) return '3';  // Grape      — bright purple — Appointments
-  if (/\bcancel|subscription|renew|expires?|warning\b/.test(t))              return '11'; // Tomato     — red           — Warnings
-  if (/\bconference|neurips|icml|iclr|\bnips\b|symposium|seminar|talk\b|info session|event/.test(t)) return '4';  // Flamingo — salmon pink — Events + Conference
-  if (/\boptional/.test(t))                                                  return '8';  // Graphite  — grey        — Optional only
-  switch (project) {
-    case 'work':          return '9';  // Blueberry  — dark blue
-    case 'school':        return '10'; // Basil      — dark green
-    case 'personal':      return '2';  // Sage       — bright green
-    case 'research_apps': return '4';  // Flamingo   — salmon pink
-    default:              return '2';
-  }
-}
-
 // ── Deduplication ─────────────────────────────────────────────────────────────
 const _seen = new Set();
 function isDuplicate(message) {
@@ -186,97 +170,8 @@ function setLastSaved(userId, data) {
   setTimeout(() => lastSaved.delete(userId), 5 * 60 * 1000);
 }
 
-// ── Project name → key map (for correction fallback parsing) ──────────────────
-const PROJECT_ALIASES = {
-  'personal':      'personal',
-  'school':        'school',        'uni': 'school',      'university': 'school',
-  'work':          'work',          'job': 'work',
-  'research':      'research_apps', 'applications': 'research_apps', 'apps': 'research_apps',
-  'learning':      'learning_tech', 'tech': 'learning_tech', 'learn': 'learning_tech',
-  'circuits':      'circuitry',     'electronics': 'circuitry',  'arduino': 'circuitry',
-  'baking':        'baking',        'bread': 'baking',
-  'beads':         'beadwork',      'beadwork': 'beadwork', 'jewelry': 'beadwork',
-  'art':           'art',           'drawing': 'art', 'pastels': 'art',
-  'reading':       'reading',       'books': 'reading',
-  'exercise':      'exercise',      'gym': 'exercise', 'fitness': 'exercise',
-};
-
-function parseProjectFromText(text) {
-  const lower = text.toLowerCase().replace(/[^a-z\s]/g, ' ');
-  for (const [alias, key] of Object.entries(PROJECT_ALIASES)) {
-    if (lower.includes(alias)) return key;
-  }
-  return null;
-}
-
 // ── AI Intent Classifier ──────────────────────────────────────────────────────
-const PROJECT_KEYS = [
-  'personal', 'school', 'work', 'research_apps', 'learning_tech',
-  'baking', 'beadwork', 'art', 'reading', 'exercise', 'circuitry',
-];
-
-const VALID_INTENTS = ['save', 'correct', 'converse', 'search_request', 'reminder', 'recall', 'web_search'];
-
-const INTENT_SYSTEM_PROMPT = `You are an intent classifier for a personal project management Slack bot.
-
-The user may send ONE task or MULTIPLE tasks in a single message (e.g. "remind me to X, also add Y").
-Always return an array of tasks — even if there is only one.
-
-Return ONLY valid JSON (no markdown):
-{
-  "tasks": [
-    {
-      "intent": "save" | "reminder" | "recall" | "correct" | "search_request" | "web_search" | "converse",
-      "title": string,
-      "timeline": string or null,
-      "context": "work" | "personal" | null,
-      "project_hint": string or null,
-      "priority_tier": 1 | 2 | 3 | 4 | null,
-      "needs_clarification": boolean,
-      "corrected_project": string or null,
-      "recall_topic": string or null,
-      "search_query": string or null
-    }
-  ]
-}
-
-INTENT:
-- "reminder": user wants to be reminded / notified / has an appointment or deadline
-- "recall": asking what was previously saved — "what did I save about X?", "what do I have on Y?"
-- "web_search": user wants to look something up in real time — event dates, locations, deadlines of external things, "when is X", "what time does Y start", "where is Z being held", "find the date of". Use this for anything requiring live information NOT stored by the bot.
-- "converse": greetings, one-word reactions, meta-questions about the bot, "set preferences", "preferences"
-- "correct": user says last save was routed wrong
-- "search_request": wants to apply to a program/fellowship but gave no URL
-- "save": everything else — save a URL, paper, task, note, resource
-
-title: clean, actionable task name. Strip filler: "remind me to", "set a reminder", "set a notification", "also", dates, time phrases. Capitalise first word. Max 8 words.
-  Examples:
-    "set a reminder for this Saturday to buy cleansing oil" → "Buy cleansing oil"
-    "set an assignment notification for the 13th for linear algebra Assignment 2" → "Linear Algebra Assignment 2"
-    "I want to save this arxiv paper on diffusion" → "Diffusion paper (arxiv)"
-
-timeline: the specific date/time string for this task only, as the user said it. null if none.
-  Examples: "this Saturday", "13th of this month", "by June 30", "5:30pm Thursday"
-
-search_query: only if intent=web_search — an optimised search query (proper nouns, event name, location). Strip meta-phrasing like "what's the date of" or "when is". Keep the subject.
-  Examples: "when is the Square Peg Claude Code event Melbourne" → "Square Peg Claude Code event Melbourne luma"
-
-project_hint: one of ${PROJECT_KEYS.join(', ')} or null:
-  personal=appointments/errands/life admin, school=coursework/exams/uni,
-  work=job tasks/sprint/tickets, research_apps=fellowships/grants/PhD,
-  learning_tech=papers/ML/repos, baking=recipes/bread, beadwork=jewelry/craft,
-  art=drawing/pastels, reading=books/essays, exercise=gym/sport, circuitry=Arduino/PCB
-
-priority_tier:
-  1=hard deadline (specific date, exam, submission)
-  2=medium deadline (school/work task, weeks away)
-  3=medium goal (personal learning, no firm date)
-  4=hobby/interest (baking/art/reading/exercise)
-  null=unclear
-
-needs_clarification: true only if intent=save AND context null AND tech content (work vs personal unclear)
-corrected_project: only if intent=correct AND user named a project
-recall_topic: only if intent=recall — the topic to search for, stripped of meta-phrasing`;
+// PROJECT_KEYS, VALID_INTENTS, INTENT_SYSTEM_PROMPT imported from lib/intentPrompt.js
 
 function normaliseTask(t) {
   const tier = t.priority_tier;
@@ -366,41 +261,6 @@ async function saveCalendarPrefs(updates) {
   }
 }
 
-// Parse a human reminder string into minutes: "30 min", "1 hour", "none", "15"
-function parseReminderMinutes(text) {
-  const t = text.toLowerCase().trim();
-  if (/\b(none|no|off|never|skip)\b/.test(t)) return [];
-  const hourMatch = t.match(/(\d+)\s*h(our)?/);
-  const minMatch  = t.match(/(\d+)\s*m(in)?/);
-  const bareNum   = t.match(/^(\d+)$/);
-  const reminders = [];
-  if (hourMatch) reminders.push(parseInt(hourMatch[1]) * 60);
-  if (minMatch)  reminders.push(parseInt(minMatch[1]));
-  if (bareNum && !hourMatch && !minMatch) reminders.push(parseInt(bareNum[1]));
-  return reminders.length ? reminders : null; // null = couldn't parse
-}
-
-// Parse a human duration string into minutes: "30 min", "1 hour", "2h", "90"
-function parseDurationMinutes(text) {
-  const t = text.toLowerCase().trim();
-  const hourMatch = t.match(/(\d+)\s*h(our)?/);
-  const minMatch  = t.match(/(\d+(?:\.\d+)?)\s*m(in)?/);
-  const bareNum   = t.match(/^(\d+)$/);
-  if (hourMatch) return parseInt(hourMatch[1]) * 60 + (minMatch ? parseInt(minMatch[1]) : 0);
-  if (minMatch)  return parseInt(minMatch[1]);
-  if (bareNum)   return parseInt(bareNum[1]);
-  return null;
-}
-
-// ── Cost logging via API (avoids importing supabase on the VM) ────────────────
-function logCostViaApi(modelKey, usage, reason) {
-  if (!process.env.APP_URL || !usage) return;
-  fetch(`${process.env.APP_URL}/api/costs/log`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
-    body:    JSON.stringify({ modelKey, usage, reason }),
-  }).catch(() => {}); // fire-and-forget, non-fatal
-}
 
 // ── Correction API call ───────────────────────────────────────────────────────
 async function callCorrect(logId, correctedProject, note) {
@@ -497,15 +357,6 @@ function buildEnrichedText(context, timeline, text, url) {
   return parts.filter(Boolean).join(' ');
 }
 
-// ── Parse a clarification reply (for pending work/personal question) ──────────
-function parseClarificationContext(text) {
-  const t = text.toLowerCase();
-  if (/\bwork\b|\bjob\b|\bprofessional\b|\bsprint\b|\bticket\b/i.test(text)) return 'work';
-  if (/\bpersonal\b|\bperson\b|\bmine\b|\bme\b|\blearning\b|\bfun\b|\bcurious\b/i.test(text)) return 'personal';
-  if (/^w\b/i.test(t.trim())) return 'work';     // bare "w"
-  if (/^p\b/i.test(t.trim())) return 'personal';  // bare "p"
-  return null;
-}
 
 // ── Post a clean one-liner (no link unfurls) ──────────────────────────────────
 async function reply(channel, text) {
@@ -544,7 +395,7 @@ async function processReminderTask(cls, channel, userId, say) {
 
   if (cls.timeline) {
     const date    = await parseTimelineToDate(cls.timeline);
-    const colorId = pickCalendarColor(cls.project_hint ?? 'personal', reminderTitle);
+    const colorId = pickColorId(cls.project_hint ?? 'personal', reminderTitle);
     let calCreated = false;
 
     if (process.env.CALENDAR_ENABLED === 'true' && date) {
@@ -583,7 +434,7 @@ app.message(async ({ message, say }) => {
 
       if (step === 0) {
         // Duration
-        const mins = parseDurationMinutes(t);
+        const mins = await parseDurationMins(t);
         if (!mins || mins < 5 || mins > 480) {
           pending.set(userId, { ...state, prefsStep: 0 });
           await say(`didn't catch that — enter a duration like "30 min", "1 hour", or "90 min" (5–480 min)`);
@@ -596,7 +447,7 @@ app.message(async ({ message, say }) => {
 
       if (step === 1) {
         // Reminders
-        const reminders = parseReminderMinutes(t);
+        const reminders = await parseReminderMins(t);
         if (reminders === null) {
           pending.set(userId, { ...state, prefsStep: 1 });
           await say(`didn't catch that — try "30 min", "1 hour", or "none" for no reminder`);
@@ -628,7 +479,7 @@ app.message(async ({ message, say }) => {
 
     // Correction mode: "which project did you mean?"
     if (state.correctionMode) {
-      const proj = parseProjectFromText(userText);
+      const proj = await parseProjectKey(userText);
       if (!proj) {
         const reaskCount = (state.correctionStep ?? 0) + 1;
         if (reaskCount >= 2) {
@@ -695,7 +546,7 @@ app.message(async ({ message, say }) => {
 
         // Got a valid date — create calendar event with user preferences
         pending.delete(userId);
-        const colorId = pickCalendarColor('personal', state.originalText);
+        const colorId = pickColorId('personal', state.originalText);
         let calCreated = false;
         if (process.env.CALENDAR_ENABLED === 'true') {
           try {
@@ -885,66 +736,68 @@ Rules:
       return;
     }
 
-    // Work/personal clarification mode
-    // If they sent a genuinely new URL, abort pending and treat as a fresh message
-    const isNewUrl = urls.length > 0 && urls[0] !== state.url;
-    if (!isNewUrl) {
-      const context = parseClarificationContext(userText);
-      if (!context) {
-        const reaskCount = (state.clarStep ?? 0) + 1;
-        if (reaskCount >= 2) {
-          // Can't determine context — save without forcing work/personal
-          pending.delete(userId);
-          try {
-            const data = await callInbox({ url: state.url ?? undefined, text: state.text, source: 'slack' });
-            if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
-            await reply(message.channel, buildSuccessMessage(data, {}));
-          } catch { await say('saved ✓'); }
+    // Work/personal clarification mode — only when explicitly in this mode
+    if (state.clarificationMode) {
+      // If they sent a genuinely new URL, abort pending and treat as a fresh message
+      const isNewUrl = urls.length > 0 && urls[0] !== state.url;
+      if (!isNewUrl) {
+        const context = await parseContext(userText);
+        if (!context) {
+          const reaskCount = (state.clarStep ?? 0) + 1;
+          if (reaskCount >= 2) {
+            // Can't determine context — save without forcing work/personal
+            pending.delete(userId);
+            try {
+              const data = await callInbox({ url: state.url ?? undefined, text: state.text, source: 'slack' });
+              if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
+              await reply(message.channel, buildSuccessMessage(data, {}));
+            } catch { await say('saved ✓'); }
+            return;
+          }
+          pending.set(userId, { ...state, clarStep: reaskCount });
+          await say('work or personal?');
           return;
         }
-        pending.set(userId, { ...state, clarStep: reaskCount });
-        await say('work or personal?');
-        return;
-      }
 
-      const project      = context === 'work' ? 'work' : 'learning_tech';
-      const enrichedText = buildEnrichedText(context, null, state.text, state.url);
-      pending.delete(userId);
+        const project      = context === 'work' ? 'work' : 'learning_tech';
+        const enrichedText = buildEnrichedText(context, null, state.text, state.url);
+        pending.delete(userId);
 
-      // User answered "work/personal" AND added a search request (e.g. "personal, but find the date").
-      // Save silently and return the search result instead of the app confirmation link.
-      const hasSearchAsk = /\b(find|look up|search|when is|what.s the date|what time)\b/i.test(userText);
+        // User answered "work/personal" AND added a search request (e.g. "personal, but find the date").
+        // Save silently and return the search result instead of the app confirmation link.
+        const hasSearchAsk = /\b(find|look up|search|when is|what.s the date|what time)\b/i.test(userText);
 
-      if (hasSearchAsk) {
-        callInbox({ url: state.url ?? undefined, text: enrichedText, title: state.text ?? undefined, source: 'slack', project })
-          .then(data => { if (data?.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary }); })
-          .catch(() => {});
-        const searchQuery = (state.text ?? '').replace(/^there.?s?\s+(a\s+)?/i, '').trim();
-        const searchData  = await webSearch(searchQuery);
-        if (searchData?.answer) {
-          await say(searchData.answer.slice(0, 500));
-        } else if (searchData?.results?.length) {
-          const top = searchData.results[0];
-          const snippet = (top.content ?? '').slice(0, 300).trim();
-          await say(`*${top.title}*\n${snippet}${top.url ? `\n${top.url}` : ''}`);
-        } else {
-          await say(`couldn't find that — try searching *"${searchQuery.slice(0, 80)}"* on lu.ma`);
+        if (hasSearchAsk) {
+          callInbox({ url: state.url ?? undefined, text: enrichedText, title: state.text ?? undefined, source: 'slack', project })
+            .then(data => { if (data?.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary }); })
+            .catch(() => {});
+          const searchQuery = (state.text ?? '').replace(/^there.?s?\s+(a\s+)?/i, '').trim();
+          const searchData  = await webSearch(searchQuery);
+          if (searchData?.answer) {
+            await say(searchData.answer.slice(0, 500));
+          } else if (searchData?.results?.length) {
+            const top = searchData.results[0];
+            const snippet = (top.content ?? '').slice(0, 300).trim();
+            await say(`*${top.title}*\n${snippet}${top.url ? `\n${top.url}` : ''}`);
+          } else {
+            await say(`couldn't find that — try searching *"${searchQuery.slice(0, 80)}"* on lu.ma`);
+          }
+          return;
+        }
+
+        try {
+          const data = await callInbox({ url: state.url ?? undefined, text: enrichedText, title: state.text ?? undefined, source: 'slack', project });
+          if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
+          await reply(message.channel, buildSuccessMessage(data, {}));
+        } catch {
+          await say("couldn't save that");
         }
         return;
       }
 
-      try {
-        const data = await callInbox({ url: state.url ?? undefined, text: enrichedText, title: state.text ?? undefined, source: 'slack', project });
-        if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
-        await reply(message.channel, buildSuccessMessage(data, {}));
-      } catch {
-        await say("couldn't save that");
-      }
-      return;
+      // New URL arrived → drop pending, fall through to fresh handling
+      pending.delete(userId);
     }
-
-    // New URL arrived → drop pending, fall through to fresh handling
-    pending.delete(userId);
   }
 
   // ── Fast path: pure URL with no extra context → always a save, skip AI ──────
@@ -1021,7 +874,13 @@ Rules:
   }
 
   for (const cls of tasks) {
-    if (cls.intent === 'converse') continue;
+    if (cls.intent === 'converse') {
+      // Only reply when this is the sole task — mixed converse+save messages don't need ack
+      if (tasks.length === 1) {
+        await say("I save tasks, links, and set reminders. Try _\"remind me to...\"_ or paste a link.");
+      }
+      continue;
+    }
 
     if (cls.intent === 'web_search') {
       const query = cls.search_query ?? cls.title ?? userText;
@@ -1041,7 +900,7 @@ Rules:
     if (cls.intent === 'correct') {
       const prev = lastSaved.get(userId);
       if (!prev) { await say('nothing recent to correct'); continue; }
-      const proj = cls.corrected_project ?? parseProjectFromText(userText);
+      const proj = cls.corrected_project ?? await parseProjectKey(userText);
       if (!proj) {
         needsInput.push({ type: 'correction', prev });
         continue;
@@ -1110,23 +969,23 @@ Rules:
     }
 
     if (cls.intent === 'search_request') {
-      pending.set(userId, { url: null, text: cls.title ?? userText, searchMode: true, step: 1 });
-      await say('no link — want me to search for the application page? (y/n)');
-      break; // pending state set — stop processing remaining tasks until user responds
+      // Defer to pass 2 so all immediate tasks in this message are processed first
+      needsInput.push({ type: 'search_request', cls });
+      continue;
     }
 
     // Save — default intent
     if (cls.needs_clarification) {
-      pending.set(userId, { url: urls[0] ?? null, text: cls.title ?? userText, step: 1 });
-      await say('work or personal?');
-      break; // pending state set — stop processing remaining tasks until user responds
+      // Defer to pass 2 so all immediate tasks in this message are processed first
+      needsInput.push({ type: 'clarification', cls, url: urls[0] ?? null });
+      continue;
     }
 
     const isVagueLearning = cls.project_hint === 'learning_tech' && urls.length === 0;
     if (isVagueLearning) {
-      pending.set(userId, { learningMode: true, originalText: cls.title ?? userText, step: 1, history: [] });
-      await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
-      break; // pending state set — stop processing remaining tasks until user responds
+      // Defer to pass 2 so all immediate tasks in this message are processed first
+      needsInput.push({ type: 'vague_learning', cls });
+      continue;
     }
 
     const url          = urls[0] ?? undefined;
@@ -1165,12 +1024,26 @@ Rules:
   //   Pass 2: milk (no timeline) → asks "when is Buy milk?"
   if (needsInput.length > 0 && !pending.has(userId)) {
     const deferred = needsInput[0];
+
     if (deferred.type === 'reminder') {
       // processReminderTask with no cls.timeline → sets pending + asks "when is X?"
       await processReminderTask(deferred.cls, message.channel, userId, say);
+
     } else if (deferred.type === 'correction') {
       pending.set(userId, { correctionMode: true, logId: deferred.prev.logId, correctionStep: 0 });
       await say("which project should it be in? (school, work, learning, research, art, baking, beads, circuits, reading, exercise, personal)");
+
+    } else if (deferred.type === 'search_request') {
+      pending.set(userId, { url: null, text: deferred.cls.title ?? userText, searchMode: true, step: 1 });
+      await say('no link — want me to search for the application page? (y/n)');
+
+    } else if (deferred.type === 'clarification') {
+      pending.set(userId, { clarificationMode: true, url: deferred.url, text: deferred.cls.title ?? userText, step: 1 });
+      await say('work or personal?');
+
+    } else if (deferred.type === 'vague_learning') {
+      pending.set(userId, { learningMode: true, originalText: deferred.cls.title ?? userText, step: 1, history: [] });
+      await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
     }
   }
 });

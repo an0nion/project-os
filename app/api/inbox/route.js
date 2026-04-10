@@ -350,7 +350,9 @@ export async function POST(req) {
       .select('id')
       .single();
     if (logRow) logId = logRow.id;
-  } catch { /* non-fatal */ }
+  } catch (err) {
+    console.error('[inbox] inbox_log insert failed:', err.message);
+  }
 
   return NextResponse.json({
     project,

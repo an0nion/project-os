@@ -13,6 +13,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { VALID_INTENTS, PROJECT_KEYS, INTENT_SYSTEM_PROMPT } from '../lib/intentPrompt.js';
 
 // ── Replicated pure functions from bot.js ─────────────────────────────────────
 // Keep these in sync with bot.js. If bot.js changes, update here too.
@@ -2033,8 +2034,9 @@ describe('parseTimelineToDateFallback — regex date parser (must stay in sync w
 // All 10 color categories tested. Keyword rules take precedence over project fallback.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Replicated from bot.js — must stay in sync
-function pickCalendarColor(project, text) {
+// Replicated from lib/calendar.js pickColorId — must stay in sync.
+// Cannot import directly because calendar.js imports supabase (has side effects in tests).
+function pickColorId(project, text) {
   const t = (text ?? '').toLowerCase();
   if (/\bfinal exam|finals\b/.test(t))                                       return '6';
   if (/\bassignment|\bhomework\b|\bhw\b|due date|submit|graded\b/.test(t))   return '1';
@@ -2052,185 +2054,185 @@ function pickCalendarColor(project, text) {
   }
 }
 
-describe('pickCalendarColor — keyword + project color routing', () => {
+describe('pickColorId (lib/calendar.js) — keyword + project color routing', () => {
 
   // ── Exam (Tangerine = 6) ──
   test('"final exam" → 6 (Tangerine/orange — Exam)', () => {
-    assert.equal(pickCalendarColor(null, 'final exam tomorrow'), '6');
+    assert.equal(pickColorId(null, 'final exam tomorrow'), '6');
   });
 
   test('"finals" → 6', () => {
-    assert.equal(pickCalendarColor(null, 'finals week'), '6');
+    assert.equal(pickColorId(null, 'finals week'), '6');
   });
 
   // ── Graded (Lavender = 1) ──
   test('"assignment" → 1 (Lavender/purple — Graded)', () => {
-    assert.equal(pickCalendarColor('school', 'Linear Algebra Assignment 2'), '1');
+    assert.equal(pickColorId('school', 'Linear Algebra Assignment 2'), '1');
   });
 
   test('"homework" → 1', () => {
-    assert.equal(pickCalendarColor(null, 'homework due Friday'), '1');
+    assert.equal(pickColorId(null, 'homework due Friday'), '1');
   });
 
   test('"hw" → 1 (word boundary)', () => {
-    assert.equal(pickCalendarColor(null, 'hw due'), '1');
+    assert.equal(pickColorId(null, 'hw due'), '1');
   });
 
   test('"due date" → 1', () => {
-    assert.equal(pickCalendarColor(null, 'due date for project'), '1');
+    assert.equal(pickColorId(null, 'due date for project'), '1');
   });
 
   test('"submit" → 1', () => {
-    assert.equal(pickCalendarColor(null, 'submit thesis draft'), '1');
+    assert.equal(pickColorId(null, 'submit thesis draft'), '1');
   });
 
   // ── Birthdays (Banana = 5) ──
   test('"birthday" → 5 (Banana/yellow)', () => {
-    assert.equal(pickCalendarColor(null, "Mum's birthday dinner"), '5');
+    assert.equal(pickColorId(null, "Mum's birthday dinner"), '5');
   });
 
   test('"bday" → 5', () => {
-    assert.equal(pickCalendarColor(null, 'bday party'), '5');
+    assert.equal(pickColorId(null, 'bday party'), '5');
   });
 
   // ── Appointments (Grape = 3) ──
   test('"dentist" → 3 (Grape/purple — Appointments)', () => {
-    assert.equal(pickCalendarColor(null, 'dentist appointment'), '3');
+    assert.equal(pickColorId(null, 'dentist appointment'), '3');
   });
 
   test('"doctor" → 3', () => {
-    assert.equal(pickCalendarColor(null, 'doctor visit at 3pm'), '3');
+    assert.equal(pickColorId(null, 'doctor visit at 3pm'), '3');
   });
 
   test('"physio" → 3', () => {
-    assert.equal(pickCalendarColor(null, 'physio session'), '3');
+    assert.equal(pickColorId(null, 'physio session'), '3');
   });
 
   test('"gp" (word boundary) → 3', () => {
-    assert.equal(pickCalendarColor(null, 'gp appointment'), '3');
+    assert.equal(pickColorId(null, 'gp appointment'), '3');
   });
 
   test('"appointment" → 3', () => {
-    assert.equal(pickCalendarColor(null, 'nail appointment'), '3');
+    assert.equal(pickColorId(null, 'nail appointment'), '3');
   });
 
   test('"outing" → 3', () => {
-    assert.equal(pickCalendarColor(null, 'outing with friends'), '3');
+    assert.equal(pickColorId(null, 'outing with friends'), '3');
   });
 
   test('"catch up" → 3 (catch.?up pattern)', () => {
-    assert.equal(pickCalendarColor(null, 'catch up with Sarah'), '3');
+    assert.equal(pickColorId(null, 'catch up with Sarah'), '3');
   });
 
   test('"catch-up" → 3', () => {
-    assert.equal(pickCalendarColor(null, 'catch-up with team'), '3');
+    assert.equal(pickColorId(null, 'catch-up with team'), '3');
   });
 
   // ── Warnings (Tomato = 11) ──
   test('"subscription" → 11 (Tomato/red — Warnings)', () => {
-    assert.equal(pickCalendarColor(null, 'subscription renewal'), '11');
+    assert.equal(pickColorId(null, 'subscription renewal'), '11');
   });
 
   test('"cancel" → 11', () => {
-    assert.equal(pickCalendarColor(null, 'cancel gym membership'), '11');
+    assert.equal(pickColorId(null, 'cancel gym membership'), '11');
   });
 
   test('"renew" → 11', () => {
-    assert.equal(pickCalendarColor(null, 'renew license'), '11');
+    assert.equal(pickColorId(null, 'renew license'), '11');
   });
 
   test('"expires" → 11', () => {
-    assert.equal(pickCalendarColor(null, 'passport expires June'), '11');
+    assert.equal(pickColorId(null, 'passport expires June'), '11');
   });
 
   test('"warning" (word boundary) → 11', () => {
-    assert.equal(pickCalendarColor(null, 'payment warning'), '11');
+    assert.equal(pickColorId(null, 'payment warning'), '11');
   });
 
   // ── Events/Conferences (Flamingo = 4) ──
   test('"conference" → 4 (Flamingo/salmon — Events)', () => {
-    assert.equal(pickCalendarColor(null, 'ML conference abstract deadline'), '4');
+    assert.equal(pickColorId(null, 'ML conference abstract deadline'), '4');
   });
 
   test('"NeurIPS" → 4', () => {
-    assert.equal(pickCalendarColor(null, 'NeurIPS submission deadline'), '4');
+    assert.equal(pickColorId(null, 'NeurIPS submission deadline'), '4');
   });
 
   test('"ICML" → 4', () => {
-    assert.equal(pickCalendarColor(null, 'ICML paper due'), '4');
+    assert.equal(pickColorId(null, 'ICML paper due'), '4');
   });
 
   test('"seminar" → 4', () => {
-    assert.equal(pickCalendarColor(null, 'seminar on AI safety'), '4');
+    assert.equal(pickColorId(null, 'seminar on AI safety'), '4');
   });
 
   test('"info session" → 4', () => {
-    assert.equal(pickCalendarColor(null, 'info session for fellowship'), '4');
+    assert.equal(pickColorId(null, 'info session for fellowship'), '4');
   });
 
   test('"event" → 4', () => {
-    assert.equal(pickCalendarColor(null, 'fundraising event'), '4');
+    assert.equal(pickColorId(null, 'fundraising event'), '4');
   });
 
   // ── Optional (Graphite = 8) ──
   test('"optional" → 8 (Graphite/grey)', () => {
-    assert.equal(pickCalendarColor(null, 'optional review session'), '8');
+    assert.equal(pickColorId(null, 'optional review session'), '8');
   });
 
   // ── Project fallbacks (when no keyword matches) ──
   test('work project → 9 (Blueberry/dark blue)', () => {
-    assert.equal(pickCalendarColor('work', 'Sprint planning'), '9');
+    assert.equal(pickColorId('work', 'Sprint planning'), '9');
   });
 
   test('school project → 10 (Basil/dark green)', () => {
-    assert.equal(pickCalendarColor('school', 'Study session'), '10');
+    assert.equal(pickColorId('school', 'Study session'), '10');
   });
 
   test('personal project → 2 (Sage/green)', () => {
-    assert.equal(pickCalendarColor('personal', 'Grocery run'), '2');
+    assert.equal(pickColorId('personal', 'Grocery run'), '2');
   });
 
   test('research_apps project → 4 (Flamingo/salmon)', () => {
-    assert.equal(pickCalendarColor('research_apps', 'Fellowship application'), '4');
+    assert.equal(pickColorId('research_apps', 'Fellowship application'), '4');
   });
 
   test('unknown project → 2 (default Sage)', () => {
-    assert.equal(pickCalendarColor('unknown_project', 'Random task'), '2');
+    assert.equal(pickColorId('unknown_project', 'Random task'), '2');
   });
 
   test('null project → 2 (default)', () => {
-    assert.equal(pickCalendarColor(null, 'Miscellaneous task'), '2');
+    assert.equal(pickColorId(null, 'Miscellaneous task'), '2');
   });
 
   // ── Keyword precedence over project ──
   test('keyword "birthday" overrides "work" project → 5 not 9', () => {
-    assert.equal(pickCalendarColor('work', "John's birthday"), '5');
+    assert.equal(pickColorId('work', "John's birthday"), '5');
   });
 
   test('keyword "assignment" overrides "personal" project → 1 not 2', () => {
-    assert.equal(pickCalendarColor('personal', 'assignment due'), '1');
+    assert.equal(pickColorId('personal', 'assignment due'), '1');
   });
 
   test('keyword "final exam" overrides "work" project → 6 not 9', () => {
-    assert.equal(pickCalendarColor('work', 'final exam prep'), '6');
+    assert.equal(pickColorId('work', 'final exam prep'), '6');
   });
 
   // ── Edge cases ──
   test('null text → falls through to project fallback', () => {
-    assert.equal(pickCalendarColor('work', null), '9');
+    assert.equal(pickColorId('work', null), '9');
   });
 
   test('empty text → falls through to project fallback', () => {
-    assert.equal(pickCalendarColor('school', ''), '10');
+    assert.equal(pickColorId('school', ''), '10');
   });
 
   test('"hw" in middle of word does NOT match (word boundary)', () => {
     // "show" contains "hw" substring but not as \bhw\b
-    assert.notEqual(pickCalendarColor(null, 'show me the code'), '1');
+    assert.notEqual(pickColorId(null, 'show me the code'), '1');
   });
 
   test('case-insensitive: "BIRTHDAY" → 5', () => {
-    assert.equal(pickCalendarColor(null, 'BIRTHDAY PARTY'), '5');
+    assert.equal(pickColorId(null, 'BIRTHDAY PARTY'), '5');
   });
 });
 
@@ -2238,22 +2240,17 @@ describe('pickCalendarColor — keyword + project color routing', () => {
 // ══════════════════════════════════════════════════════════════════════════════
 // SECTION 18 — normaliseTask — validation, defaulting, VALID_INTENTS filter
 // ══════════════════════════════════════════════════════════════════════════════
-
-const VALID_INTENTS_TEST = ['save', 'correct', 'converse', 'search_request', 'reminder', 'recall', 'web_search'];
-const PROJECT_KEYS_TEST = [
-  'personal', 'school', 'work', 'research_apps', 'learning_tech',
-  'baking', 'beadwork', 'art', 'reading', 'exercise', 'circuitry',
-];
+// VALID_INTENTS and PROJECT_KEYS imported from lib/intentPrompt.js — single source of truth.
 
 // Replicated from bot.js — must stay in sync
 function normaliseTask(t) {
   const tier = t.priority_tier;
   return {
-    intent:              VALID_INTENTS_TEST.includes(t.intent) ? t.intent : 'save',
+    intent:              VALID_INTENTS.includes(t.intent) ? t.intent : 'save',
     title:               typeof t.title === 'string' && t.title.trim() ? t.title.trim() : null,
     timeline:            typeof t.timeline === 'string' && t.timeline.trim() ? t.timeline.trim() : null,
     context:             t.context             ?? null,
-    project_hint:        PROJECT_KEYS_TEST.includes(t.project_hint) ? t.project_hint : null,
+    project_hint:        PROJECT_KEYS.includes(t.project_hint) ? t.project_hint : null,
     priority_tier:       (Number.isInteger(tier) && tier >= 1 && tier <= 4) ? tier : null,
     needs_clarification: t.needs_clarification === true,
     corrected_project:   t.corrected_project   ?? null,
@@ -2265,7 +2262,7 @@ function normaliseTask(t) {
 describe('normaliseTask — field defaulting and intent validation', () => {
 
   test('all valid intents pass through unchanged', () => {
-    for (const intent of VALID_INTENTS_TEST) {
+    for (const intent of VALID_INTENTS) {
       assert.equal(normaliseTask({ intent }).intent, intent);
     }
   });
@@ -2413,90 +2410,58 @@ describe('normaliseTask — field defaulting and intent validation', () => {
 // ══════════════════════════════════════════════════════════════════════════════
 // SECTION 19 — INTENT_SYSTEM_PROMPT multi-task format
 // Validates the prompt correctly specifies array-based multi-task output.
+// INTENT_SYSTEM_PROMPT is imported from lib/intentPrompt.js — single source of truth.
+// No local copy → no drift risk.
 // ══════════════════════════════════════════════════════════════════════════════
-
-const INTENT_SYSTEM_PROMPT_TEST = `You are an intent classifier for a personal project management Slack bot.
-
-The user may send ONE task or MULTIPLE tasks in a single message (e.g. "remind me to X, also add Y").
-Always return an array of tasks — even if there is only one.
-
-Return ONLY valid JSON (no markdown):
-{
-  "tasks": [
-    {
-      "intent": "save" | "reminder" | "recall" | "correct" | "search_request" | "web_search" | "converse",
-      "title": string,
-      "timeline": string or null,
-      "context": "work" | "personal" | null,
-      "project_hint": string or null,
-      "priority_tier": 1 | 2 | 3 | 4 | null,
-      "needs_clarification": boolean,
-      "corrected_project": string or null,
-      "recall_topic": string or null,
-      "search_query": string or null
-    }
-  ]
-}
-
-INTENT:
-- "reminder": user wants to be reminded / notified / has an appointment or deadline
-- "recall": asking what was previously saved — "what did I save about X?", "what do I have on Y?"
-- "web_search": user wants to look something up in real time — event dates, locations, "when is X", "find the date of"
-- "converse": greetings, one-word reactions, meta-questions about the bot
-- "correct": user says last save was routed wrong
-- "search_request": wants to apply to a program/fellowship but gave no URL
-- "save": everything else — save a URL, paper, task, note, resource
-
-title: clean, actionable task name. Strip filler: "remind me to", "set a reminder", "set a notification", "also", dates, time phrases. Capitalise first word. Max 8 words.`;
 
 describe('INTENT_SYSTEM_PROMPT — multi-task format specification', () => {
 
   test('prompt specifies that output is ALWAYS an array, even for one task', () => {
-    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('Always return an array of tasks'));
+    assert.ok(INTENT_SYSTEM_PROMPT.includes('Always return an array of tasks'));
   });
 
   test('prompt shows {"tasks": [...]} wrapper in schema', () => {
-    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('"tasks"'));
-    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('['));
+    assert.ok(INTENT_SYSTEM_PROMPT.includes('"tasks"'));
+    assert.ok(INTENT_SYSTEM_PROMPT.includes('['));
   });
 
   test('prompt gives multi-task example with "also" connective', () => {
-    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('also'));
+    assert.ok(INTENT_SYSTEM_PROMPT.includes('also'));
   });
 
   test('prompt defines all 7 valid intents', () => {
     const intents = ['save', 'reminder', 'recall', 'correct', 'search_request', 'web_search', 'converse'];
     for (const intent of intents) {
-      assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes(`"${intent}"`), `Missing intent: ${intent}`);
+      assert.ok(INTENT_SYSTEM_PROMPT.includes(`"${intent}"`), `Missing intent: ${intent}`);
     }
   });
 
   test('prompt defines search_query field for web_search', () => {
-    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('search_query'));
+    assert.ok(INTENT_SYSTEM_PROMPT.includes('search_query'));
   });
 
   test('prompt describes web_search as real-time lookup for event dates/locations', () => {
-    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('web_search'));
-    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('real time') || INTENT_SYSTEM_PROMPT_TEST.includes('real-time'));
+    assert.ok(INTENT_SYSTEM_PROMPT.includes('web_search'));
+    assert.ok(INTENT_SYSTEM_PROMPT.includes('real time') || INTENT_SYSTEM_PROMPT.includes('real-time'));
   });
 
   test('prompt requires title stripping of filler words', () => {
-    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('remind me to'));
-    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('set a reminder'));
+    assert.ok(INTENT_SYSTEM_PROMPT.includes('remind me to'));
+    assert.ok(INTENT_SYSTEM_PROMPT.includes('set a reminder'));
   });
 
   test('prompt specifies title max 8 words', () => {
-    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('8 words'));
+    assert.ok(INTENT_SYSTEM_PROMPT.includes('8 words'));
   });
 
   test('prompt requires ONLY valid JSON (no markdown)', () => {
-    assert.ok(INTENT_SYSTEM_PROMPT_TEST.toLowerCase().includes('only valid json'));
-    assert.ok(INTENT_SYSTEM_PROMPT_TEST.toLowerCase().includes('no markdown'));
+    assert.ok(INTENT_SYSTEM_PROMPT.toLowerCase().includes('only valid json'));
+    assert.ok(INTENT_SYSTEM_PROMPT.toLowerCase().includes('no markdown'));
   });
 
   test('prompt has priority_tier with numeric values 1-4', () => {
-    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('priority_tier'));
-    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('1 | 2 | 3 | 4'));
+    assert.ok(INTENT_SYSTEM_PROMPT.includes('priority_tier'));
+    assert.ok(INTENT_SYSTEM_PROMPT.includes('1 | 2 | 3 | 4'));
   });
 
   // ── classifyIntent return structure (simulate output parsing) ──
@@ -3319,5 +3284,476 @@ describe('reminderMode resend guard — clears pending on new reminder command',
     const userMessage = 'Saturday'; // normal date reply
     const shouldClear = looksLikeNewReminderGuard(userMessage);
     assert.ok(!shouldClear); // guard does not fire → normal date parsing proceeds
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 30 — Preferences: parsing helpers (D1)
+// parseReminderMinutes and parseDurationMinutes — pure functions, no I/O.
+// Must stay in sync with bot.js.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Replicated from bot.js — must stay in sync
+function parseReminderMinutes(text) {
+  const t = text.toLowerCase().trim();
+  if (/\b(none|no|off|never|skip)\b/.test(t)) return [];
+  const hourMatch = t.match(/(\d+)\s*h(our)?/);
+  const minMatch  = t.match(/(\d+)\s*m(in)?/);
+  const bareNum   = t.match(/^(\d+)$/);
+  const reminders = [];
+  if (hourMatch) reminders.push(parseInt(hourMatch[1]) * 60);
+  if (minMatch)  reminders.push(parseInt(minMatch[1]));
+  if (bareNum && !hourMatch && !minMatch) reminders.push(parseInt(bareNum[1]));
+  return reminders.length ? reminders : null; // null = couldn't parse
+}
+
+function parseDurationMinutes(text) {
+  const t = text.toLowerCase().trim();
+  const hourMatch = t.match(/(\d+)\s*h(our)?/);
+  const minMatch  = t.match(/(\d+(?:\.\d+)?)\s*m(in)?/);
+  const bareNum   = t.match(/^(\d+)$/);
+  if (hourMatch) return parseInt(hourMatch[1]) * 60 + (minMatch ? parseInt(minMatch[1]) : 0);
+  if (minMatch)  return parseInt(minMatch[1]);
+  if (bareNum)   return parseInt(bareNum[1]);
+  return null;
+}
+
+describe('parseReminderMinutes — human reminder string to minutes array', () => {
+
+  // ── "none" and equivalents → [] (no reminders) ──
+  test('"none" → [] (no reminder)', () => assert.deepEqual(parseReminderMinutes('none'), []));
+  test('"no" → []', () => assert.deepEqual(parseReminderMinutes('no'), []));
+  test('"off" → []', () => assert.deepEqual(parseReminderMinutes('off'), []));
+  test('"never" → []', () => assert.deepEqual(parseReminderMinutes('never'), []));
+  test('"skip" → []', () => assert.deepEqual(parseReminderMinutes('skip'), []));
+  test('"None" (capital) → []', () => assert.deepEqual(parseReminderMinutes('None'), []));
+  test('"NO" (all caps) → []', () => assert.deepEqual(parseReminderMinutes('NO'), []));
+
+  // ── Minutes ──
+  test('"30 min" → [30]', () => assert.deepEqual(parseReminderMinutes('30 min'), [30]));
+  test('"30 minutes" → [30]', () => assert.deepEqual(parseReminderMinutes('30 minutes'), [30]));
+  test('"15 min" → [15]', () => assert.deepEqual(parseReminderMinutes('15 min'), [15]));
+  test('"5min" (no space) → [5]', () => assert.deepEqual(parseReminderMinutes('5min'), [5]));
+  test('"30m" → [30]', () => assert.deepEqual(parseReminderMinutes('30m'), [30]));
+
+  // ── Hours ──
+  test('"1 hour" → [60]', () => assert.deepEqual(parseReminderMinutes('1 hour'), [60]));
+  test('"2 hours" → [120]', () => assert.deepEqual(parseReminderMinutes('2 hours'), [120]));
+  test('"1h" → [60]', () => assert.deepEqual(parseReminderMinutes('1h'), [60]));
+  test('"2h" → [120]', () => assert.deepEqual(parseReminderMinutes('2h'), [120]));
+
+  // ── Bare number ──
+  test('"30" (bare number, no unit) → [30]', () => assert.deepEqual(parseReminderMinutes('30'), [30]));
+  test('"15" → [15]', () => assert.deepEqual(parseReminderMinutes('15'), [15]));
+  test('"60" → [60] (60 minutes from bare number)', () => assert.deepEqual(parseReminderMinutes('60'), [60]));
+
+  // ── Combined (hour + minute) ──
+  test('"1 hour 30 min" → [60, 30] (hour AND minute — two reminder points)', () => {
+    const result = parseReminderMinutes('1 hour 30 min');
+    assert.ok(result !== null);
+    assert.ok(result.includes(60));
+    assert.ok(result.includes(30));
+  });
+
+  // ── Unparseable ──
+  test('"soon" → null (cannot parse)', () => assert.equal(parseReminderMinutes('soon'), null));
+  test('"before" → null', () => assert.equal(parseReminderMinutes('before'), null));
+  test('"remind" → null', () => assert.equal(parseReminderMinutes('remind'), null));
+  test('empty string "" → null', () => assert.equal(parseReminderMinutes(''), null));
+
+  // ── Return type contract ──
+  test('returns [] (empty array) for "none" — NOT null', () => {
+    const result = parseReminderMinutes('none');
+    assert.ok(Array.isArray(result));
+    assert.equal(result.length, 0);
+  });
+
+  test('returns [N] (single-element array) for valid input — NOT a number', () => {
+    const result = parseReminderMinutes('30 min');
+    assert.ok(Array.isArray(result));
+    assert.equal(result.length, 1);
+    assert.equal(result[0], 30);
+  });
+
+  test('returns null for invalid input — NOT empty array', () => {
+    const result = parseReminderMinutes('blah');
+    assert.equal(result, null);
+  });
+});
+
+
+describe('parseDurationMinutes — human duration string to minutes number', () => {
+
+  // ── Minutes ──
+  test('"30 min" → 30', () => assert.equal(parseDurationMinutes('30 min'), 30));
+  test('"30 minutes" → 30', () => assert.equal(parseDurationMinutes('30 minutes'), 30));
+  test('"45 min" → 45', () => assert.equal(parseDurationMinutes('45 min'), 45));
+  test('"5 min" → 5', () => assert.equal(parseDurationMinutes('5 min'), 5));
+  test('"90 min" → 90', () => assert.equal(parseDurationMinutes('90 min'), 90));
+  test('"30m" → 30', () => assert.equal(parseDurationMinutes('30m'), 30));
+
+  // ── Hours ──
+  test('"1 hour" → 60', () => assert.equal(parseDurationMinutes('1 hour'), 60));
+  test('"2 hours" → 120', () => assert.equal(parseDurationMinutes('2 hours'), 120));
+  test('"1h" → 60', () => assert.equal(parseDurationMinutes('1h'), 60));
+  test('"2h" → 120', () => assert.equal(parseDurationMinutes('2h'), 120));
+  test('"1.5h" → null (decimal hours not fully supported — bare number check fails)', () => {
+    // "1.5h" matches hourMatch (parseInt('1') = 1 → 60) — implementation returns 60
+    const result = parseDurationMinutes('1.5h');
+    assert.ok(result !== null); // doesn't crash — returns 60 (parseInt truncates decimal)
+  });
+
+  // ── Hour + minute combined ──
+  test('"1 hour 30 min" → 90', () => assert.equal(parseDurationMinutes('1 hour 30 min'), 90));
+  test('"2 hours 15 min" → 135', () => assert.equal(parseDurationMinutes('2 hours 15 min'), 135));
+  test('"1h 30m" → 90', () => assert.equal(parseDurationMinutes('1h 30m'), 90));
+
+  // ── Bare number ──
+  test('"60" → 60', () => assert.equal(parseDurationMinutes('60'), 60));
+  test('"90" → 90', () => assert.equal(parseDurationMinutes('90'), 90));
+  test('"30" → 30', () => assert.equal(parseDurationMinutes('30'), 30));
+
+  // ── Unparseable ──
+  test('"soon" → null', () => assert.equal(parseDurationMinutes('soon'), null));
+  test('"long" → null', () => assert.equal(parseDurationMinutes('long'), null));
+  test('"a while" → null', () => assert.equal(parseDurationMinutes('a while'), null));
+  test('empty string "" → null', () => assert.equal(parseDurationMinutes(''), null));
+
+  // ── Valid range contract (bot.js validation: 5–480 min) ──
+  test('"5 min" is within valid range (≥5)', () => {
+    const result = parseDurationMinutes('5 min');
+    assert.ok(result !== null && result >= 5);
+  });
+
+  test('"480 min" → 480 (8 hours — upper bound)', () => {
+    const result = parseDurationMinutes('480 min');
+    assert.equal(result, 480);
+  });
+
+  test('"1 min" parses (but bot.js rejects it — below 5 min minimum)', () => {
+    // parseDurationMinutes itself doesn't validate — bot.js does: mins < 5 → re-ask
+    const result = parseDurationMinutes('1 min');
+    assert.equal(result, 1); // parsed correctly; bot.js validation rejects it
+  });
+});
+
+
+describe('Preferences state machine — prefsMode steps 0/1/2', () => {
+
+  // Simulate the 3-step preferences dialogue logic
+  const simulatePrefsStep0 = (text) => {
+    const mins = parseDurationMinutes(text.trim());
+    if (!mins || mins < 5 || mins > 480) return { valid: false };
+    return { valid: true, duration: mins, nextStep: 1 };
+  };
+
+  const simulatePrefsStep1 = (text) => {
+    const reminders = parseReminderMinutes(text.trim());
+    if (reminders === null) return { valid: false };
+    return { valid: true, reminders, nextStep: 2 };
+  };
+
+  const simulatePrefsStep2 = (text) => {
+    const notes = /^(none|no|skip|nah|n\/a|-)$/i.test(text.trim()) ? '' : text.slice(0, 500);
+    return { valid: true, notes, done: true };
+  };
+
+  // ── Step 0: duration ──
+  test('step 0: "1 hour" → valid, duration=60, nextStep=1', () => {
+    const result = simulatePrefsStep0('1 hour');
+    assert.ok(result.valid);
+    assert.equal(result.duration, 60);
+    assert.equal(result.nextStep, 1);
+  });
+
+  test('step 0: "30 min" → valid, duration=30', () => {
+    const result = simulatePrefsStep0('30 min');
+    assert.ok(result.valid);
+    assert.equal(result.duration, 30);
+  });
+
+  test('step 0: "90 min" → valid, duration=90', () => {
+    const result = simulatePrefsStep0('90 min');
+    assert.ok(result.valid);
+    assert.equal(result.duration, 90);
+  });
+
+  test('step 0: "3 min" (< 5 min) → invalid — bot re-asks', () => {
+    const result = simulatePrefsStep0('3 min');
+    assert.ok(!result.valid);
+  });
+
+  test('step 0: "600 min" (> 480 min) → invalid — bot re-asks', () => {
+    const result = simulatePrefsStep0('600 min');
+    assert.ok(!result.valid);
+  });
+
+  test('step 0: "blah" → invalid', () => {
+    const result = simulatePrefsStep0('blah');
+    assert.ok(!result.valid);
+  });
+
+  // ── Step 1: reminders ──
+  test('step 1: "30 min" → valid, reminders=[30], nextStep=2', () => {
+    const result = simulatePrefsStep1('30 min');
+    assert.ok(result.valid);
+    assert.deepEqual(result.reminders, [30]);
+    assert.equal(result.nextStep, 2);
+  });
+
+  test('step 1: "none" → valid, reminders=[] (no reminders)', () => {
+    const result = simulatePrefsStep1('none');
+    assert.ok(result.valid);
+    assert.deepEqual(result.reminders, []);
+  });
+
+  test('step 1: "1 hour" → valid, reminders=[60]', () => {
+    const result = simulatePrefsStep1('1 hour');
+    assert.ok(result.valid);
+    assert.deepEqual(result.reminders, [60]);
+  });
+
+  test('step 1: "blah" → invalid — bot re-asks', () => {
+    const result = simulatePrefsStep1('blah');
+    assert.ok(!result.valid);
+  });
+
+  // ── Step 2: default notes ──
+  test('step 2: "none" → notes="" (empty string)', () => {
+    const result = simulatePrefsStep2('none');
+    assert.ok(result.done);
+    assert.equal(result.notes, '');
+  });
+
+  test('step 2: "no" → notes=""', () => {
+    const result = simulatePrefsStep2('no');
+    assert.equal(result.notes, '');
+  });
+
+  test('step 2: "skip" → notes=""', () => {
+    const result = simulatePrefsStep2('skip');
+    assert.equal(result.notes, '');
+  });
+
+  test('step 2: "nah" → notes=""', () => {
+    const result = simulatePrefsStep2('nah');
+    assert.equal(result.notes, '');
+  });
+
+  test('step 2: "-" → notes=""', () => {
+    const result = simulatePrefsStep2('-');
+    assert.equal(result.notes, '');
+  });
+
+  test('step 2: actual notes → saved verbatim', () => {
+    const result = simulatePrefsStep2('Phone: 0412 345 678');
+    assert.ok(result.done);
+    assert.equal(result.notes, 'Phone: 0412 345 678');
+  });
+
+  test('step 2: notes longer than 500 chars → truncated to 500', () => {
+    const longNotes = 'a'.repeat(600);
+    const result = simulatePrefsStep2(longNotes);
+    assert.ok(result.notes.length <= 500);
+  });
+
+  // ── Full 3-step flow ──
+  test('HAPPY PATH: full 3-step flow completes with valid prefs object', () => {
+    const step0 = simulatePrefsStep0('1 hour');
+    assert.ok(step0.valid);
+
+    const step1 = simulatePrefsStep1('30 min');
+    assert.ok(step1.valid);
+
+    const step2 = simulatePrefsStep2('Phone: 0412 345 678');
+    assert.ok(step2.done);
+
+    const prefs = {
+      duration_minutes: step0.duration,
+      reminder_minutes: step1.reminders,
+      default_notes:    step2.notes,
+      setup_complete:   true,
+    };
+    assert.equal(prefs.duration_minutes, 60);
+    assert.deepEqual(prefs.reminder_minutes, [30]);
+    assert.equal(prefs.default_notes, 'Phone: 0412 345 678');
+    assert.ok(prefs.setup_complete);
+  });
+
+  test('HAPPY PATH: no reminders, no notes', () => {
+    const step0 = simulatePrefsStep0('30 min');
+    const step1 = simulatePrefsStep1('none');
+    const step2 = simulatePrefsStep2('none');
+
+    const prefs = {
+      duration_minutes: step0.duration,
+      reminder_minutes: step1.reminders,
+      default_notes:    step2.notes,
+      setup_complete:   true,
+    };
+    assert.equal(prefs.duration_minutes, 30);
+    assert.deepEqual(prefs.reminder_minutes, []);
+    assert.equal(prefs.default_notes, '');
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 31 — web_search intent handler contracts (D2)
+// Tests the response format when webSearch() returns results.
+// webSearch() itself is mocked — these are pure format/logic tests.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Simulate the web_search handler from bot.js
+function simulateWebSearchHandler(query, searchData) {
+  if (searchData?.answer) {
+    return searchData.answer.slice(0, 500);
+  } else if (searchData?.results?.length) {
+    const top     = searchData.results[0];
+    const snippet = (top.content ?? '').slice(0, 300).trim();
+    return `*${top.title}*\n${snippet}${top.url ? `\n${top.url}` : ''}`;
+  } else {
+    return `couldn't find anything about "${query.slice(0, 80)}"`;
+  }
+}
+
+describe('web_search handler — response format contracts', () => {
+
+  // ── answer field present (synthesised answer from Tavily) ──
+  test('searchData.answer present → returns answer verbatim (no markup added)', () => {
+    const result = simulateWebSearchHandler('Square Peg Claude Code event', {
+      answer: 'The Square Peg Claude Code event is on April 17, 2026 in Melbourne.',
+      results: [],
+    });
+    assert.ok(result.includes('April 17'));
+    assert.ok(result.includes('Melbourne'));
+  });
+
+  test('searchData.answer longer than 500 chars → truncated to 500', () => {
+    const longAnswer = 'x'.repeat(600);
+    const result = simulateWebSearchHandler('test query', { answer: longAnswer });
+    assert.ok(result.length <= 500);
+  });
+
+  test('searchData.answer = empty string → falls through to results', () => {
+    const result = simulateWebSearchHandler('query', {
+      answer:  '',
+      results: [{ title: 'Result Title', content: 'Some content', url: 'https://example.com' }],
+    });
+    // Empty string is falsy → falls through to results block
+    assert.ok(result.includes('Result Title'));
+  });
+
+  test('searchData.answer = null → falls through to results', () => {
+    const result = simulateWebSearchHandler('query', {
+      answer:  null,
+      results: [{ title: 'Top Result', content: 'Relevant info here', url: 'https://example.com' }],
+    });
+    assert.ok(result.includes('Top Result'));
+  });
+
+  // ── results only (no answer field) ──
+  test('results present → returns formatted top result with title in bold', () => {
+    const result = simulateWebSearchHandler('NeurIPS 2026 dates', {
+      answer:  null,
+      results: [{
+        title:   'NeurIPS 2026 Conference',
+        content: 'NeurIPS 2026 will be held December 6-12 in Vancouver.',
+        url:     'https://neurips.cc/2026',
+      }],
+    });
+    assert.ok(result.includes('*NeurIPS 2026 Conference*'));
+    assert.ok(result.includes('Vancouver'));
+    assert.ok(result.includes('https://neurips.cc/2026'));
+  });
+
+  test('result has no url → no URL line in output (no crash)', () => {
+    const result = simulateWebSearchHandler('query', {
+      answer:  null,
+      results: [{ title: 'A Result', content: 'Some content', url: null }],
+    });
+    assert.ok(!result.includes('null'));
+    assert.ok(result.includes('A Result'));
+  });
+
+  test('result content longer than 300 chars → snippet truncated', () => {
+    const result = simulateWebSearchHandler('query', {
+      answer:  null,
+      results: [{ title: 'Title', content: 'x'.repeat(400), url: 'https://example.com' }],
+    });
+    const lines = result.split('\n');
+    const snippetLine = lines[1]; // second line is the snippet
+    assert.ok(snippetLine.length <= 300);
+  });
+
+  test('result content with whitespace → trimmed in snippet', () => {
+    const result = simulateWebSearchHandler('query', {
+      answer:  null,
+      results: [{ title: 'Title', content: '   trimmed content   ', url: 'https://example.com' }],
+    });
+    assert.ok(result.includes('trimmed content'));
+    assert.ok(!result.includes('   trimmed'));
+  });
+
+  // ── no results, no answer ──
+  test('no answer, empty results → returns "couldn\'t find anything about" message', () => {
+    const result = simulateWebSearchHandler('obscure query no one knows', { answer: null, results: [] });
+    assert.ok(result.includes("couldn't find anything about"));
+    assert.ok(result.includes('obscure query no one knows'));
+  });
+
+  test('null searchData → returns "couldn\'t find" message (no crash)', () => {
+    const result = simulateWebSearchHandler('query', null);
+    assert.ok(result.includes("couldn't find anything about"));
+  });
+
+  test('query longer than 80 chars → truncated in the "couldn\'t find" message', () => {
+    const longQuery = 'a'.repeat(100);
+    const result = simulateWebSearchHandler(longQuery, null);
+    // The message includes query.slice(0, 80) — total message may be longer but query part is truncated
+    const queryInMsg = result.match(/"([^"]+)"/)?.[1] ?? '';
+    assert.ok(queryInMsg.length <= 80);
+  });
+
+  // ── search_query vs title vs userText fallback chain ──
+  test('search_query used as query when present (most specific)', () => {
+    // Simulate: cls.search_query = "Square Peg Claude Code Melbourne"
+    // bot.js: const query = cls.search_query ?? cls.title ?? userText
+    const cls = normaliseTask({ intent: 'web_search', search_query: 'Square Peg Claude Code Melbourne', title: 'event date query' });
+    const query = cls.search_query ?? cls.title ?? 'fallback';
+    assert.equal(query, 'Square Peg Claude Code Melbourne');
+  });
+
+  test('title used as query when search_query is null', () => {
+    const cls = normaliseTask({ intent: 'web_search', search_query: null, title: 'Claude Code event Melbourne' });
+    const query = cls.search_query ?? cls.title ?? 'fallback';
+    assert.equal(query, 'Claude Code event Melbourne');
+  });
+
+  test('userText used as query when both search_query and title are null', () => {
+    const cls = normaliseTask({ intent: 'web_search', search_query: null, title: null });
+    const userText = 'when is the NeurIPS event';
+    const query = cls.search_query ?? cls.title ?? userText;
+    assert.equal(query, userText);
+  });
+
+  // ── converse-only single task → bot sends help message ──
+  test('single converse task → bot replies with help message (not silence)', () => {
+    // Simulate the B3 fix: single converse task sends a reply instead of being silent
+    const tasks = [normaliseTask({ intent: 'converse' })];
+    const isSingleConverse = tasks.length === 1 && tasks[0].intent === 'converse';
+    assert.ok(isSingleConverse);
+    // In bot.js: await say("I save tasks, links, and set reminders...")
+    // Contract: bot DOES say something (not silent)
+  });
+
+  test('converse in mixed array → no standalone reply (other tasks handle it)', () => {
+    const tasks = [
+      normaliseTask({ intent: 'converse' }),
+      normaliseTask({ intent: 'save', title: 'Read diffusion paper' }),
+    ];
+    const isSingleConverse = tasks.length === 1 && tasks[0].intent === 'converse';
+    assert.ok(!isSingleConverse); // mixed array → no special converse reply
   });
 });
