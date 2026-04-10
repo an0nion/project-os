@@ -182,17 +182,21 @@ export async function POST(req) {
   const projectDef = PROJECTS.find(p => p.key === project);
   const firstCol   = projectDef?.columns?.[0]?.key ?? 'backlog';
 
-  // ── 2. Build a good item title ──────────────────────────────────────────────
-  // For URL captures: fetch real page title. For text-only: use AI summary.
+  // ── 2. Build title, subtitle, and notes ────────────────────────────────────
+  // Title: short, scannable name shown bold on the card (≤ 80 chars ideal)
+  // Subtitle: context line shown below title (source, category, urgency)
+  // Notes: fuller context shown on card back / hover
   let itemTitle    = forcedTitle?.trim().slice(0, 200) ?? null;   // caller-provided wins
-  let itemDesc     = null;   // one-liner shown on the Kanban card
-  let itemSubtitle = extractSubtitle(text);
+  let itemDesc     = null;   // used as notes on the Kanban card
+  let itemSubtitle = null;
 
   if (url) {
     const meta = await fetchPageMeta(url);
-    itemTitle = meta.title;
-    // AI generates a factual one-liner, not meta marketing copy
+    if (!itemTitle) itemTitle = meta.title;
+    // AI generates a factual one-liner for the notes field
     itemDesc  = await generateDescription(meta.title, meta.bodyText, url);
+    // Subtitle: hostname for URL cards (e.g. "arxiv.org", "github.com")
+    try { itemSubtitle = new URL(url).hostname.replace('www.', ''); } catch {}
   }
 
   if (!itemTitle) {
@@ -203,10 +207,10 @@ export async function POST(req) {
       const host = new URL(url).hostname.replace('www.', '');
       itemTitle = slug ? `${slug} — ${host}` : host;
     } else if (text) {
-      // For text-only: use AI to extract a clean short title (event/org name etc.)
+      // Extract a clean short title from the full text
       try {
         const result = await callModelWithFallback('gemini-flash', 'deepseek-chat', {
-          system:   'Extract the topic, concept, or event name from this text. Return ONLY the name itself — never describe the message, never say "User is asking about". Examples: input "I want to learn linear probes" → output "linear probes". Input "tell me about toy models of superposition" → output "toy models of superposition". Input "apply to Meridian fellowship" → output "Meridian fellowship". Max 8 words, no punctuation.',
+          system:   'Extract the topic, concept, or event name from this text. Return ONLY the name itself — never describe the message, never say "User is asking about". Examples: input "I want to learn linear probes" → output "linear probes". Input "apply to Meridian fellowship" → output "Meridian fellowship". Max 8 words, no punctuation.',
           messages: [{ role: 'user', content: text.slice(0, 600) }],
           maxTokens: 30,
         });
@@ -218,6 +222,27 @@ export async function POST(req) {
     } else {
       itemTitle = 'Untitled';
     }
+  }
+
+  // For text-only Slack saves: use the original full text as notes if it's
+  // meaningfully longer than the extracted title (gives card context without clutter)
+  if (!url && text && !itemDesc) {
+    const cleanText = text
+      .replace(/^\[Work\]\s*/i, '').replace(/^\[Personal\]\s*/i, '')
+      .replace(/\s*—\s*\S+/g, '') // strip "— timeline" appended by bot
+      .trim();
+    if (cleanText.length > (itemTitle?.length ?? 0) + 20) {
+      itemDesc = cleanText.slice(0, 500);
+    }
+  }
+
+  // Subtitle: project-context label for text-only saves (timeline or priority hint)
+  if (!itemSubtitle && timeline) {
+    itemSubtitle = timeline.slice(0, 60);
+  } else if (!itemSubtitle && priority_tier === 1) {
+    itemSubtitle = 'Hard deadline';
+  } else if (!itemSubtitle && priority_tier === 2) {
+    itemSubtitle = 'Medium priority';
   }
 
   // ── 3. Create a card ────────────────────────────────────────────────────────
@@ -291,19 +316,20 @@ export async function POST(req) {
       const { data: item } = await supabase
         .from('items')
         .insert({
-          project_key:   project,
-          title:         itemTitle.slice(0, 200),
-          subtitle:      itemSubtitle,
-          status:        firstCol,
-          url:           url            ?? null,
-          notes:         itemDesc       ?? null,
-          priority_tier: priority_tier  ?? null,
-          deadline:      parseDeadlineDate(timeline),
+          project_key: project,
+          title:       itemTitle.slice(0, 200),
+          subtitle:    itemSubtitle   ?? null,
+          status:      firstCol,
+          url:         url            ?? null,
+          notes:       itemDesc       ?? null,
+          due_date:    parseDeadlineDate(timeline),
         })
         .select()
         .single();
       if (item) itemId = item.id;
-    } catch { /* non-fatal */ }
+    } catch (err) {
+      console.error('[inbox] items insert failed:', err.message);
+    }
   }
 
   // ── 4. Audit log (training signal) ─────────────────────────────────────────

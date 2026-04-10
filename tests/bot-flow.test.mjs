@@ -128,13 +128,12 @@ function buildDeadlineNudgeLine(app, now = new Date()) {
 }
 
 // --- isExplicitLearning (replicated from bot.js — KEEP IN SYNC) ---
+// Only matches unambiguous study/learning intent — NOT information queries like "what is the date"
 const isExplicitLearning = (text, urls) => {
   if (urls.length > 0) return false;
   const words = text.trim().split(/\s+/).filter(Boolean).length;
-  // "want to learn / learning about" patterns — need >5 words so topic is present
-  if (words > 5 && /\b(want to learn|learning about|i'?m learning|been learning|trying to learn|i want to understand)\b/i.test(text)) return true;
-  // "tell me about X / explain X" — need >4 words (topic is part of the phrase)
-  if (words > 4 && /\b(tell me about|explain to me|what is a|what are)\b/i.test(text)) return true;
+  if (words > 5 && /\b(want to learn about|want to learn|learning about|i'?m learning about|been learning|trying to learn|i want to understand|i need to understand|need to learn about)\b/i.test(text)) return true;
+  if (words > 4 && /^(can you |could you |please )?(explain)\b/i.test(text.trim()) && /\bto me\b/i.test(text)) return true;
   return false;
 };
 
@@ -200,7 +199,7 @@ function handleLearningReplyResult(parsed, step) {
  * step<3: return null → bot re-asks (too early to give up).
  * step>=3: saves generic "Explore and learn about [topic]" task.
  */
-function learningReplyFallback(userText, step, originalText) {
+function learningReplyFallback(_userText, step, originalText) {
   if (step >= 3) {
     return { saveAsText: `Explore and learn about ${originalText.slice(0, 60)}` };
   }
@@ -1458,28 +1457,30 @@ describe('isExplicitLearning — pre-AI heuristic (the fix for the Neel Nanda bu
   test('non-tech topic (baking) → triggers (user wants clarification on ANY explicit learning)', () =>
     assert.ok(isExplicitLearning('I want to learn about sourdough fermentation and starter culture', [])));
 
-  // ── REGRESSION: "tell me about X" — the exact messages from the screenshot ──
-  test('REGRESSION: "so tell me about linear probes" → triggers (5 words > 4)', () =>
-    assert.ok(isExplicitLearning('so tell me about linear probes', [])));
+  // ── "tell me about", "what is", "what are" do NOT trigger the pre-AI heuristic ──
+  // These are information queries — they go to the AI classifier, which routes them
+  // to web_search (for event dates) or save (for learning topics).
+  // The pre-AI heuristic is intentionally narrow to avoid pre-empting the classifier.
+  test('"tell me about linear probes" → does NOT trigger pre-AI (goes to classifier)', () =>
+    assert.ok(!isExplicitLearning('tell me about linear probes', [])));
 
-  test('REGRESSION: "tell me about toy models of superposition" → triggers', () =>
-    assert.ok(isExplicitLearning('tell me about toy models of superposition', [])));
+  test('"what is a linear probe" → does NOT trigger pre-AI (goes to classifier)', () =>
+    assert.ok(!isExplicitLearning('what is a linear probe', [])));
 
-  test('"tell me about attention mechanisms in transformers" → triggers', () =>
-    assert.ok(isExplicitLearning('tell me about attention mechanisms in transformers', [])));
+  test('"what are residual stream representations" → does NOT trigger pre-AI', () =>
+    assert.ok(!isExplicitLearning('what are residual stream representations', [])));
 
-  test('"explain to me how backpropagation works" → triggers', () =>
+  // "explain to me how X works" — starts with "explain" + contains "to me" = triggers
+  // (The pattern requires >4 words, which is satisfied here)
+  test('"explain to me how backpropagation works" → DOES trigger (starts with explain + has "to me")', () =>
     assert.ok(isExplicitLearning('explain to me how backpropagation works', [])));
 
-  test('"what is a linear probe" → triggers (5 words > 4)', () =>
-    assert.ok(isExplicitLearning('what is a linear probe', [])));
+  // "explain X to me" DOES trigger (different word order — unambiguously a study request)
+  test('"explain transformers to me" → DOES trigger (explain...to me pattern)', () =>
+    assert.ok(isExplicitLearning('explain transformers to me in detail', [])));
 
-  test('"what are residual stream representations" → triggers', () =>
-    assert.ok(isExplicitLearning('what are residual stream representations in transformers', [])));
-
-  // ── "tell me about" boundary cases ──
-  test('"tell me about it" (4 words, no topic) → does NOT trigger', () =>
-    assert.ok(!isExplicitLearning('tell me about it', [])));
+  test('"can you explain RLHF to me" → DOES trigger', () =>
+    assert.ok(isExplicitLearning('can you explain RLHF to me in detail', [])));
 
   test('"explain it" (2 words) → does NOT trigger', () =>
     assert.ok(!isExplicitLearning('explain it', [])));
@@ -2238,7 +2239,7 @@ describe('pickCalendarColor — keyword + project color routing', () => {
 // SECTION 18 — normaliseTask — validation, defaulting, VALID_INTENTS filter
 // ══════════════════════════════════════════════════════════════════════════════
 
-const VALID_INTENTS_TEST = ['save', 'correct', 'converse', 'search_request', 'reminder', 'recall'];
+const VALID_INTENTS_TEST = ['save', 'correct', 'converse', 'search_request', 'reminder', 'recall', 'web_search'];
 const PROJECT_KEYS_TEST = [
   'personal', 'school', 'work', 'research_apps', 'learning_tech',
   'baking', 'beadwork', 'art', 'reading', 'exercise', 'circuitry',
@@ -2257,6 +2258,7 @@ function normaliseTask(t) {
     needs_clarification: t.needs_clarification === true,
     corrected_project:   t.corrected_project   ?? null,
     recall_topic:        typeof t.recall_topic === 'string' && t.recall_topic.trim() ? t.recall_topic.trim() : null,
+    search_query:        typeof t.search_query === 'string' && t.search_query.trim() ? t.search_query.trim() : null,
   };
 }
 
@@ -2341,13 +2343,29 @@ describe('normaliseTask — field defaulting and intent validation', () => {
     assert.equal(t.recall_topic,        'linear probes');
   });
 
-  test('always has all 9 required fields', () => {
+  test('always has all 10 required fields', () => {
     const required = ['intent','title','timeline','context','project_hint',
-                      'priority_tier','needs_clarification','corrected_project','recall_topic'];
+                      'priority_tier','needs_clarification','corrected_project','recall_topic','search_query'];
     const t = normaliseTask({});
     for (const f of required) {
       assert.ok(f in t, `Missing field: ${f}`);
     }
+  });
+
+  test('missing search_query → null', () => {
+    assert.equal(normaliseTask({ intent: 'web_search' }).search_query, null);
+  });
+
+  test('web_search intent passes through', () => {
+    assert.equal(normaliseTask({ intent: 'web_search' }).intent, 'web_search');
+  });
+
+  test('search_query is trimmed', () => {
+    assert.equal(normaliseTask({ intent: 'web_search', search_query: '  Square Peg event Melbourne  ' }).search_query, 'Square Peg event Melbourne');
+  });
+
+  test('whitespace-only search_query → null', () => {
+    assert.equal(normaliseTask({ intent: 'web_search', search_query: '   ' }).search_query, null);
   });
 
   test('extra unknown fields from AI are not included in output', () => {
@@ -2406,7 +2424,7 @@ Return ONLY valid JSON (no markdown):
 {
   "tasks": [
     {
-      "intent": "save" | "reminder" | "recall" | "correct" | "search_request" | "converse",
+      "intent": "save" | "reminder" | "recall" | "correct" | "search_request" | "web_search" | "converse",
       "title": string,
       "timeline": string or null,
       "context": "work" | "personal" | null,
@@ -2414,7 +2432,8 @@ Return ONLY valid JSON (no markdown):
       "priority_tier": 1 | 2 | 3 | 4 | null,
       "needs_clarification": boolean,
       "corrected_project": string or null,
-      "recall_topic": string or null
+      "recall_topic": string or null,
+      "search_query": string or null
     }
   ]
 }
@@ -2422,6 +2441,7 @@ Return ONLY valid JSON (no markdown):
 INTENT:
 - "reminder": user wants to be reminded / notified / has an appointment or deadline
 - "recall": asking what was previously saved — "what did I save about X?", "what do I have on Y?"
+- "web_search": user wants to look something up in real time — event dates, locations, "when is X", "find the date of"
 - "converse": greetings, one-word reactions, meta-questions about the bot
 - "correct": user says last save was routed wrong
 - "search_request": wants to apply to a program/fellowship but gave no URL
@@ -2444,11 +2464,20 @@ describe('INTENT_SYSTEM_PROMPT — multi-task format specification', () => {
     assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('also'));
   });
 
-  test('prompt defines all 6 valid intents', () => {
-    const intents = ['save', 'reminder', 'recall', 'correct', 'search_request', 'converse'];
+  test('prompt defines all 7 valid intents', () => {
+    const intents = ['save', 'reminder', 'recall', 'correct', 'search_request', 'web_search', 'converse'];
     for (const intent of intents) {
       assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes(`"${intent}"`), `Missing intent: ${intent}`);
     }
+  });
+
+  test('prompt defines search_query field for web_search', () => {
+    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('search_query'));
+  });
+
+  test('prompt describes web_search as real-time lookup for event dates/locations', () => {
+    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('web_search'));
+    assert.ok(INTENT_SYSTEM_PROMPT_TEST.includes('real time') || INTENT_SYSTEM_PROMPT_TEST.includes('real-time'));
   });
 
   test('prompt requires title stripping of filler words', () => {
@@ -2630,75 +2659,61 @@ describe('softCheckIn — step reset prevents infinite loop', () => {
 // These were missing and caused real user messages to not trigger learning mode.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Replicated with the new patterns — must stay in sync with bot.js
-const isExplicitLearningV2 = (text, urls) => {
+// Replicated from current bot.js — must stay in sync
+const isExplicitLearningCurrent = (text, urls) => {
   if (urls.length > 0) return false;
   const words = text.trim().split(/\s+/).filter(Boolean).length;
-  if (words > 5 && /\b(want to learn|learning about|i'?m learning|been learning|trying to learn|i want to understand|i need to understand|need to learn)\b/i.test(text)) return true;
-  if (words > 4 && /\b(tell me about|explain to me|what is a|what is the|what is an|what are)\b/i.test(text)) return true;
-  if (words > 3 && /\bexplain\b.+\bto me\b/i.test(text)) return true;
+  if (words > 5 && /\b(want to learn about|want to learn|learning about|i'?m learning about|been learning|trying to learn|i want to understand|i need to understand|need to learn about)\b/i.test(text)) return true;
+  if (words > 4 && /^(can you |could you |please )?(explain)\b/i.test(text.trim()) && /\bto me\b/i.test(text)) return true;
   return false;
 };
 
-describe('isExplicitLearning — extended pattern coverage (new fixes)', () => {
+describe('isExplicitLearning — architectural fix: narrow to unambiguous learning language only', () => {
 
-  // ── New patterns: "what is the" / "what is an" ──
-  test('"what is the transformer architecture" → triggers (new: what is the)', () =>
-    assert.ok(isExplicitLearningV2('what is the transformer architecture and how does it work', [])));
+  // ── Core learning patterns still trigger ──
+  test('"I want to learn about transformers" → triggers', () =>
+    assert.ok(isExplicitLearningCurrent('I want to learn about transformers and attention mechanisms', [])));
 
-  test('"what is an autoencoder" → triggers (new: what is an)', () =>
-    assert.ok(isExplicitLearningV2('what is an autoencoder and how does it work', [])));
+  test('"learning about diffusion models" → triggers', () =>
+    assert.ok(isExplicitLearningCurrent('been learning about diffusion models and score matching', [])));
 
-  test('"what is the attention mechanism" → triggers', () =>
-    assert.ok(isExplicitLearningV2('what is the attention mechanism in transformers', [])));
+  test('"I need to understand RLHF" → triggers', () =>
+    assert.ok(isExplicitLearningCurrent('I need to understand RLHF better for my research', [])));
 
-  // ── New patterns: "i need to understand" ──
-  test('"I need to understand RLHF better" → triggers (new: i need to understand)', () =>
-    assert.ok(isExplicitLearningV2('I need to understand RLHF better for my research', [])));
-
-  test('"I need to understand mechanistic interpretability" → triggers', () =>
-    assert.ok(isExplicitLearningV2('I need to understand mechanistic interpretability concepts', [])));
-
-  // ── New patterns: "explain X to me" ──
-  test('"explain transformers to me please" → triggers (new: explain...to me)', () =>
-    assert.ok(isExplicitLearningV2('explain transformers to me please', [])));
-
-  test('"explain diffusion models to me" → triggers', () =>
-    assert.ok(isExplicitLearningV2('explain diffusion models to me in simple terms', [])));
+  test('"explain transformers to me" → triggers (explain...to me pattern)', () =>
+    assert.ok(isExplicitLearningCurrent('explain transformers to me please', [])));
 
   test('"can you explain RLHF to me" → triggers', () =>
-    assert.ok(isExplicitLearningV2('can you explain RLHF to me in detail', [])));
+    assert.ok(isExplicitLearningCurrent('can you explain RLHF to me in detail', [])));
 
-  // ── Existing patterns still work ──
-  test('"I want to learn about X" still triggers (original pattern)', () =>
-    assert.ok(isExplicitLearningV2('I want to learn about linear probes in neural nets', [])));
+  // ── Information queries do NOT trigger (these go to AI classifier → web_search or save) ──
+  test('"what is the transformer architecture" → does NOT trigger (info query → classifier)', () =>
+    assert.ok(!isExplicitLearningCurrent('what is the transformer architecture and how does it work', [])));
 
-  test('"tell me about X" still triggers', () =>
-    assert.ok(isExplicitLearningV2('tell me about the ARENA curriculum for mech interp', [])));
+  test('"what is an autoencoder" → does NOT trigger', () =>
+    assert.ok(!isExplicitLearningCurrent('what is an autoencoder and how does it work', [])));
 
-  test('"what is a linear probe" still triggers', () =>
-    assert.ok(isExplicitLearningV2('what is a linear probe in neural networks', [])));
+  test('"what are attention heads" → does NOT trigger', () =>
+    assert.ok(!isExplicitLearningCurrent('what are attention heads and how do they work', [])));
 
-  test('"what are attention heads" still triggers', () =>
-    assert.ok(isExplicitLearningV2('what are attention heads and how do they work', [])));
+  test('"tell me about linear probes" → does NOT trigger', () =>
+    assert.ok(!isExplicitLearningCurrent('tell me about linear probes', [])));
 
-  // ── Boundary / non-triggering cases ──
-  test('"what is this" (3 words) → does NOT trigger (too short)', () =>
-    assert.ok(!isExplicitLearningV2('what is this', [])));
+  test('"when is the Square Peg event" → does NOT trigger (goes to web_search)', () =>
+    assert.ok(!isExplicitLearningCurrent('when is the Square Peg Claude Code event in Melbourne', [])));
 
-  test('"what is the" (3 words) → does NOT trigger (no topic)', () =>
-    assert.ok(!isExplicitLearningV2('what is the', [])));
+  test('"what is the date of the hackathon" → does NOT trigger', () =>
+    assert.ok(!isExplicitLearningCurrent('what is the date of the hackathon', [])));
 
-  test('"explain it to me" → does NOT trigger (< 3 word trigger... wait: 4 words, explain.+to me matches)', () => {
-    // "explain it to me" IS 4 words > 3, and matches \bexplain\b.+\bto me\b
-    // This is a known edge case: the topic is ambiguous but the user intends exploration
-    // We accept it triggers (the learning dialogue will work fine even with a short topic)
-    const result = isExplicitLearningV2('explain it to me', []);
-    assert.ok(typeof result === 'boolean'); // just verify no crash
-  });
+  // ── Boundary cases ──
+  test('"what is this" (3 words) → does NOT trigger', () =>
+    assert.ok(!isExplicitLearningCurrent('what is this', [])));
+
+  test('"explain to me how backpropagation works" → DOES trigger (starts with explain + has "to me")', () =>
+    assert.ok(isExplicitLearningCurrent('explain to me how backpropagation works', [])));
 
   test('with URL → does NOT trigger regardless of pattern', () =>
-    assert.ok(!isExplicitLearningV2(
+    assert.ok(!isExplicitLearningCurrent(
       'what is the transformer architecture https://arxiv.org/abs/1706.03762',
       ['https://arxiv.org/abs/1706.03762']
     )));

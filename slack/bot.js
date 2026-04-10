@@ -215,7 +215,7 @@ const PROJECT_KEYS = [
   'baking', 'beadwork', 'art', 'reading', 'exercise', 'circuitry',
 ];
 
-const VALID_INTENTS = ['save', 'correct', 'converse', 'search_request', 'reminder', 'recall'];
+const VALID_INTENTS = ['save', 'correct', 'converse', 'search_request', 'reminder', 'recall', 'web_search'];
 
 const INTENT_SYSTEM_PROMPT = `You are an intent classifier for a personal project management Slack bot.
 
@@ -226,7 +226,7 @@ Return ONLY valid JSON (no markdown):
 {
   "tasks": [
     {
-      "intent": "save" | "reminder" | "recall" | "correct" | "search_request" | "converse",
+      "intent": "save" | "reminder" | "recall" | "correct" | "search_request" | "web_search" | "converse",
       "title": string,
       "timeline": string or null,
       "context": "work" | "personal" | null,
@@ -234,7 +234,8 @@ Return ONLY valid JSON (no markdown):
       "priority_tier": 1 | 2 | 3 | 4 | null,
       "needs_clarification": boolean,
       "corrected_project": string or null,
-      "recall_topic": string or null
+      "recall_topic": string or null,
+      "search_query": string or null
     }
   ]
 }
@@ -242,7 +243,8 @@ Return ONLY valid JSON (no markdown):
 INTENT:
 - "reminder": user wants to be reminded / notified / has an appointment or deadline
 - "recall": asking what was previously saved — "what did I save about X?", "what do I have on Y?"
-- "converse": greetings, one-word reactions, meta-questions about the bot
+- "web_search": user wants to look something up in real time — event dates, locations, deadlines of external things, "when is X", "what time does Y start", "where is Z being held", "find the date of". Use this for anything requiring live information NOT stored by the bot.
+- "converse": greetings, one-word reactions, meta-questions about the bot, "set preferences", "preferences"
 - "correct": user says last save was routed wrong
 - "search_request": wants to apply to a program/fellowship but gave no URL
 - "save": everything else — save a URL, paper, task, note, resource
@@ -255,6 +257,9 @@ title: clean, actionable task name. Strip filler: "remind me to", "set a reminde
 
 timeline: the specific date/time string for this task only, as the user said it. null if none.
   Examples: "this Saturday", "13th of this month", "by June 30", "5:30pm Thursday"
+
+search_query: only if intent=web_search — an optimised search query (proper nouns, event name, location). Strip meta-phrasing like "what's the date of" or "when is". Keep the subject.
+  Examples: "when is the Square Peg Claude Code event Melbourne" → "Square Peg Claude Code event Melbourne luma"
 
 project_hint: one of ${PROJECT_KEYS.join(', ')} or null:
   personal=appointments/errands/life admin, school=coursework/exams/uni,
@@ -285,6 +290,7 @@ function normaliseTask(t) {
     needs_clarification: t.needs_clarification === true,
     corrected_project:   t.corrected_project   ?? null,
     recall_topic:        typeof t.recall_topic === 'string' && t.recall_topic.trim() ? t.recall_topic.trim() : null,
+    search_query:        typeof t.search_query === 'string' && t.search_query.trim() ? t.search_query.trim() : null,
   };
 }
 
@@ -322,6 +328,68 @@ async function classifyIntent(text, urls) {
     console.warn('[intent] classify failed:', err.message);
     return [normaliseTask({ intent: words.length <= 5 ? 'converse' : 'save' })];
   }
+}
+
+// ── User preferences (calendar duration, reminders, notes) ───────────────────
+// Loaded on demand, cached in memory. Refreshed when the user updates preferences.
+const DEFAULT_PREFS = { duration_minutes: 60, reminder_minutes: [30], default_notes: '', setup_complete: false };
+let cachedPrefs = null;
+
+async function getCalendarPrefs() {
+  if (cachedPrefs) return cachedPrefs;
+  try {
+    const res = await fetch(`${process.env.APP_URL}/api/preferences`, {
+      headers: { 'x-api-secret': process.env.APP_SECRET },
+    });
+    if (res.ok) {
+      const { calendar } = await res.json();
+      cachedPrefs = { ...DEFAULT_PREFS, ...calendar };
+      return cachedPrefs;
+    }
+  } catch {}
+  return DEFAULT_PREFS;
+}
+
+async function saveCalendarPrefs(updates) {
+  try {
+    const res = await fetch(`${process.env.APP_URL}/api/preferences`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
+      body:    JSON.stringify(updates),
+    });
+    if (res.ok) {
+      const { calendar } = await res.json();
+      cachedPrefs = { ...DEFAULT_PREFS, ...calendar };
+    }
+  } catch (err) {
+    console.error('[prefs] save failed:', err.message);
+  }
+}
+
+// Parse a human reminder string into minutes: "30 min", "1 hour", "none", "15"
+function parseReminderMinutes(text) {
+  const t = text.toLowerCase().trim();
+  if (/\b(none|no|off|never|skip)\b/.test(t)) return [];
+  const hourMatch = t.match(/(\d+)\s*h(our)?/);
+  const minMatch  = t.match(/(\d+)\s*m(in)?/);
+  const bareNum   = t.match(/^(\d+)$/);
+  const reminders = [];
+  if (hourMatch) reminders.push(parseInt(hourMatch[1]) * 60);
+  if (minMatch)  reminders.push(parseInt(minMatch[1]));
+  if (bareNum && !hourMatch && !minMatch) reminders.push(parseInt(bareNum[1]));
+  return reminders.length ? reminders : null; // null = couldn't parse
+}
+
+// Parse a human duration string into minutes: "30 min", "1 hour", "2h", "90"
+function parseDurationMinutes(text) {
+  const t = text.toLowerCase().trim();
+  const hourMatch = t.match(/(\d+)\s*h(our)?/);
+  const minMatch  = t.match(/(\d+(?:\.\d+)?)\s*m(in)?/);
+  const bareNum   = t.match(/^(\d+)$/);
+  if (hourMatch) return parseInt(hourMatch[1]) * 60 + (minMatch ? parseInt(minMatch[1]) : 0);
+  if (minMatch)  return parseInt(minMatch[1]);
+  if (bareNum)   return parseInt(bareNum[1]);
+  return null;
 }
 
 // ── Cost logging via API (avoids importing supabase on the VM) ────────────────
@@ -444,6 +512,29 @@ async function reply(channel, text) {
   await app.client.chat.postMessage({ channel, text, unfurl_links: false, unfurl_media: false });
 }
 
+// ── Create a calendar event with user preferences applied ────────────────────
+async function createCalendarEventWithPrefs({ title, date, colorId, description }) {
+  const prefs = await getCalendarPrefs();
+  const notes = [description, prefs.default_notes].filter(Boolean).join('\n\n') || '';
+  const calRes = await fetch(`${process.env.APP_URL}/api/calendar/event`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
+    body:    JSON.stringify({
+      title,
+      date,
+      colorId,
+      description:     notes,
+      durationMinutes: prefs.duration_minutes,
+      reminderMinutes: prefs.reminder_minutes,
+    }),
+  });
+  if (!calRes.ok) {
+    const errBody = await calRes.text().catch(() => '(unreadable)');
+    console.error(`[calendar] event creation failed: HTTP ${calRes.status}`, errBody.slice(0, 300));
+  }
+  return calRes.ok;
+}
+
 // ── Process a single reminder task ───────────────────────────────────────────
 // cls.title is the AI-extracted clean title from classifyIntent — no extra call needed.
 // If timeline is present → create calendar event immediately.
@@ -458,16 +549,7 @@ async function processReminderTask(cls, channel, userId, say) {
 
     if (process.env.CALENDAR_ENABLED === 'true' && date) {
       try {
-        const calRes = await fetch(`${process.env.APP_URL}/api/calendar/event`, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
-          body:    JSON.stringify({ title: reminderTitle, date, colorId, description: cls.title ?? reminderTitle }),
-        });
-        calCreated = calRes.ok;
-        if (!calRes.ok) {
-          const errBody = await calRes.text().catch(() => '(unreadable)');
-          console.error(`[calendar] event creation failed: HTTP ${calRes.status}`, errBody.slice(0, 300));
-        }
+        calCreated = await createCalendarEventWithPrefs({ title: reminderTitle, date, colorId, description: cls.title ?? reminderTitle });
       } catch (err) { console.error('[calendar] event creation failed (network):', err.message); }
     }
     await reply(channel, `📅 ${reminderTitle} · ${cls.timeline}${calCreated ? ' · added to calendar' : ''}`);
@@ -493,6 +575,56 @@ app.message(async ({ message, say }) => {
 
   if (pending.has(userId)) {
     const state = pending.get(userId);
+
+    // Preferences setup flow — multi-step, tracks which field we're collecting
+    if (state.prefsMode) {
+      const step = state.prefsStep ?? 0;
+      const t    = userText.trim();
+
+      if (step === 0) {
+        // Duration
+        const mins = parseDurationMinutes(t);
+        if (!mins || mins < 5 || mins > 480) {
+          pending.set(userId, { ...state, prefsStep: 0 });
+          await say(`didn't catch that — enter a duration like "30 min", "1 hour", or "90 min" (5–480 min)`);
+          return;
+        }
+        pending.set(userId, { ...state, prefsStep: 1, duration: mins });
+        await say(`got it — ${mins} min events. How many minutes before should I remind you? (e.g. "30 min", "1 hour", or "none")`);
+        return;
+      }
+
+      if (step === 1) {
+        // Reminders
+        const reminders = parseReminderMinutes(t);
+        if (reminders === null) {
+          pending.set(userId, { ...state, prefsStep: 1 });
+          await say(`didn't catch that — try "30 min", "1 hour", or "none" for no reminder`);
+          return;
+        }
+        pending.set(userId, { ...state, prefsStep: 2, reminders });
+        const reminderStr = reminders.length ? reminders.map(m => m >= 60 ? `${m/60}h` : `${m}min`).join(', ') : 'none';
+        await say(`got it — reminder${reminders.length !== 1 ? 's' : ''}: ${reminderStr}. Any default notes to add to every calendar event? (e.g. your phone number, "bring ID", or "none")`);
+        return;
+      }
+
+      if (step === 2) {
+        // Default notes
+        const notes = /^(none|no|skip|nah|n\/a|-)$/i.test(t.trim()) ? '' : t.slice(0, 500);
+        pending.delete(userId);
+        await saveCalendarPrefs({
+          duration_minutes: state.duration,
+          reminder_minutes: state.reminders,
+          default_notes:    notes,
+          setup_complete:   true,
+        });
+        const reminderStr = state.reminders.length
+          ? `reminders at ${state.reminders.map(m => m >= 60 ? `${m/60}h` : `${m}min`).join(', ')} before`
+          : 'no reminders';
+        await say(`saved ✓\n• Event duration: ${state.duration} min\n• ${reminderStr}${notes ? `\n• Default notes: "${notes.slice(0, 60)}"` : ''}\n\nSay *preferences* anytime to update.`);
+        return;
+      }
+    }
 
     // Correction mode: "which project did you mean?"
     if (state.correctionMode) {
@@ -561,22 +693,13 @@ app.message(async ({ message, say }) => {
           return;
         }
 
-        // Got a valid date — create calendar event
+        // Got a valid date — create calendar event with user preferences
         pending.delete(userId);
         const colorId = pickCalendarColor('personal', state.originalText);
         let calCreated = false;
         if (process.env.CALENDAR_ENABLED === 'true') {
           try {
-            const calRes = await fetch(`${process.env.APP_URL}/api/calendar/event`, {
-              method:  'POST',
-              headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
-              body:    JSON.stringify({ title: state.reminderTitle, date, colorId, description: state.originalText }),
-            });
-            calCreated = calRes.ok;
-            if (!calRes.ok) {
-              const errBody = await calRes.text().catch(() => '(unreadable)');
-              console.error(`[calendar] event creation failed: HTTP ${calRes.status}`, errBody.slice(0, 300));
-            }
+            calCreated = await createCalendarEventWithPrefs({ title: state.reminderTitle, date, colorId, description: state.originalText });
           } catch (err) { console.error('[calendar] event creation failed (network):', err.message); }
         }
         await say(`📅 ${state.reminderTitle} · ${userText.trim()}${calCreated ? ' · added to calendar' : ''}`);
@@ -592,27 +715,6 @@ app.message(async ({ message, say }) => {
     // History: each exchange is stored so Call 2 can answer follow-up questions correctly.
     // Step cap: 8 chat turns before a soft check-in ("want me to save something?")
     if (state.learningMode) {
-      // Escape: user is asking about an event date — completely unrelated to learning mode.
-      // Clear pending and do a web search instead of routing to the research companion.
-      const normalised     = userText.replace(/[\u2018\u2019\u201A\u201B\u2032]/g, "'");
-      const wantsEventDate = /\b(what'?s the date|whats the date|when is|find the date|date of)\b/i.test(normalised)
-        && /\b(event|conference|luma|meetup|talk|workshop|hackathon)\b/i.test(normalised);
-      if (wantsEventDate) {
-        pending.delete(userId);
-        const searchQuery = normalised.replace(/^there'?s?\s+(a\s+)?/i, '').replace(/\bin melbourne\b/i, '').trim();
-        const searchData  = await webSearch(searchQuery);
-        if (searchData?.answer) {
-          await say(searchData.answer.slice(0, 500));
-        } else if (searchData?.results?.length) {
-          const top = searchData.results[0];
-          const snippet = (top.content ?? '').slice(0, 300).trim();
-          await say(`*${top.title}*\n${snippet}${top.url ? `\n${top.url}` : ''}`);
-        } else {
-          await say(`couldn't find the date — search the event name on lu.ma`);
-        }
-        return;
-      }
-
       const step    = state.step ?? 1;
       const history = state.history ?? [];
       let saveAsText = null;
@@ -809,29 +911,24 @@ Rules:
       const enrichedText = buildEnrichedText(context, null, state.text, state.url);
       pending.delete(userId);
 
-      // Check if user added a research/lookup request alongside the context answer
-      const normalisedText  = userText.replace(/[\u2018\u2019\u201A\u201B\u2032]/g, "'");
-      const hasResearchAsk = /\b(find|look up|lookup|search|research|get|what'?s the date|what is the date|when is)\b/i.test(normalisedText);
+      // User answered "work/personal" AND added a search request (e.g. "personal, but find the date").
+      // Save silently and return the search result instead of the app confirmation link.
+      const hasSearchAsk = /\b(find|look up|search|when is|what.s the date|what time)\b/i.test(userText);
 
-      if (hasResearchAsk) {
-        // Save silently in background — user wants the search result, not the app link
+      if (hasSearchAsk) {
         callInbox({ url: state.url ?? undefined, text: enrichedText, title: state.text ?? undefined, source: 'slack', project })
           .then(data => { if (data?.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary }); })
           .catch(() => {});
-
-        // Real-time web search via Tavily
-        const searchQuery = (state.text ?? '').replace(/^there'?s?\s+(a\s+)?/i, '').trim();
+        const searchQuery = (state.text ?? '').replace(/^there.?s?\s+(a\s+)?/i, '').trim();
         const searchData  = await webSearch(searchQuery);
-
         if (searchData?.answer) {
           await say(searchData.answer.slice(0, 500));
         } else if (searchData?.results?.length) {
-          // Show top result directly — no AI synthesis (avoids hallucinated dates)
           const top = searchData.results[0];
           const snippet = (top.content ?? '').slice(0, 300).trim();
           await say(`*${top.title}*\n${snippet}${top.url ? `\n${top.url}` : ''}`);
         } else {
-          await say(`couldn't find the date — search *"${searchQuery.slice(0, 80)}"* on lu.ma`);
+          await say(`couldn't find that — try searching *"${searchQuery.slice(0, 80)}"* on lu.ma`);
         }
         return;
       }
@@ -874,15 +971,17 @@ Rules:
   // Gemini returns project_hint:null instead of learning_tech for these patterns.
   // Requires >5 words so bare "want to learn" (no topic) doesn't trigger.
   // "want to learn about X" patterns need > 5 words to ensure a topic is present
+  // Pre-AI fast path: explicit learning intent with no URL.
+  // Patterns must unambiguously mean "I want to study/understand this topic over time" —
+  // NOT information queries ("what is the date", "what time is"), which go to web_search.
+  // "tell me about" is also excluded: too broad (e.g. "tell me about the event date").
   const isExplicitLearning =
     urls.length === 0 && (() => {
       const words = userText.trim().split(/\s+/).filter(Boolean).length;
-      // "I want to learn / been learning about / trying to learn / need to understand" — needs > 5 words (topic required)
-      if (words > 5 && /\b(want to learn|learning about|i'?m learning|been learning|trying to learn|i want to understand|i need to understand|need to learn)\b/i.test(userText)) return true;
-      // "tell me about X" / "what is the X" / "what are X" — needs > 4 words
-      if (words > 4 && /\b(tell me about|explain to me|what is a|what is the|what is an|what are)\b/i.test(userText)) return true;
-      // "explain X to me" — model-agnostic catch for explain...to me patterns
-      if (words > 3 && /\bexplain\b.+\bto me\b/i.test(userText)) return true;
+      // Requires explicit learning language AND a topic (word count guards prevent bare triggers)
+      if (words > 5 && /\b(want to learn about|want to learn|learning about|i'?m learning about|been learning|trying to learn|i want to understand|i need to understand|need to learn about)\b/i.test(userText)) return true;
+      // "explain X to me" pattern — only if no question word in front (avoids "can you explain when...")
+      if (words > 4 && /^(can you |could you |please )?(explain)\b/i.test(userText.trim()) && /\bto me\b/i.test(userText)) return true;
       return false;
     })();
 
@@ -904,8 +1003,40 @@ Rules:
 
   const needsInput = []; // tasks deferred to pass 2
 
+  // ── Preferences trigger — handle before task loop ─────────────────────────
+  // "preferences", "set preferences", "change settings" etc.
+  const wantsPrefs = /\b(preference|preferences|settings|set up|setup|configure|change my)\b/i.test(userText)
+    && !/\b(save|remind|add|create)\b/i.test(userText); // don't trigger on "add my preference"
+  if (wantsPrefs && tasks.every(t => t.intent === 'converse')) {
+    const prefs = await getCalendarPrefs();
+    const reminderStr = prefs.reminder_minutes.length
+      ? prefs.reminder_minutes.map(m => m >= 60 ? `${m/60}h` : `${m}min`).join(', ')
+      : 'none';
+    const currentStr = prefs.setup_complete
+      ? `Current: ${prefs.duration_minutes} min events, reminders at ${reminderStr}${prefs.default_notes ? `, notes: "${prefs.default_notes.slice(0, 40)}"` : ''}\n\n`
+      : '';
+    pending.set(userId, { prefsMode: true, prefsStep: 0 });
+    await say(`${currentStr}How long should calendar events be by default? (e.g. "30 min", "1 hour", "90 min")`);
+    return;
+  }
+
   for (const cls of tasks) {
     if (cls.intent === 'converse') continue;
+
+    if (cls.intent === 'web_search') {
+      const query = cls.search_query ?? cls.title ?? userText;
+      const searchData = await webSearch(query);
+      if (searchData?.answer) {
+        await say(searchData.answer.slice(0, 500));
+      } else if (searchData?.results?.length) {
+        const top = searchData.results[0];
+        const snippet = (top.content ?? '').slice(0, 300).trim();
+        await say(`*${top.title}*\n${snippet}${top.url ? `\n${top.url}` : ''}`);
+      } else {
+        await say(`couldn't find anything about "${query.slice(0, 80)}"`);
+      }
+      continue;
+    }
 
     if (cls.intent === 'correct') {
       const prev = lastSaved.get(userId);
