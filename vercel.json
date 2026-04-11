@@ -1,8 +1,8 @@
 {
   "crons": [
     {
-      "path": "/api/cron/deadlines",
-      "schedule": "0 8 * * *"
+      "path": "/api/cron/daily",
+      "schedule": "0 14 * * *"
     }
   ],
   "rewrites": [

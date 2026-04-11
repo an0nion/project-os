@@ -8,13 +8,15 @@
     "start": "next start",
     "slack": "node slack/bot.js",
     "vapid": "node scripts/generate-vapid.js",
-    "icons": "node scripts/generate-icons.js"
+    "icons": "node scripts/generate-icons.js",
+    "migrate": "node scripts/migrate.js"
   },
   "dependencies": {
     "@slack/bolt": "^3.22.0",
     "@sparticuz/chromium": "^123.0.1",
     "@supabase/supabase-js": "^2.45.4",
     "cheerio": "^1.0.0",
+    "chrono-node": "^2.9.0",
     "dotenv": "^16.6.1",
     "next": "14.2.29",
     "puppeteer-core": "^22.15.0",
@@ -24,7 +26,8 @@
   },
   "devDependencies": {
     "eslint": "^8.57.0",
-    "eslint-config-next": "14.2.29"
+    "eslint-config-next": "14.2.29",
+    "postgres": "^3.4.5"
   },
   "type": "module"
 }

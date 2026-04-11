@@ -15,8 +15,11 @@ import { callModelWithFallback } from '../lib/multiModelClient.js';
 import { webSearch } from '../lib/search.js';
 import { pickColorId } from '../lib/calendar.js';
 import { PROJECT_KEYS, VALID_INTENTS, INTENT_SYSTEM_PROMPT } from '../lib/intentPrompt.js';
-import { parseContext, parseProjectKey, parseReminderMins, parseDurationMins } from '../lib/naturalParser.js';
+import { parseContext, parseProjectKey, parseReminderMins, parseDurationMins, parseTodoReply, parseSoftCheckInReply, parseYesNo } from '../lib/naturalParser.js';
 import { logCostViaApi } from '../lib/vmCostLogger.js';
+import { Deduplicator } from '../lib/deduplicator.js';
+import PendingStore from '../lib/pendingStore.js';
+import { loadQuota } from '../lib/geminiQuota.js';
 
 const { App } = bolt;
 
@@ -26,73 +29,9 @@ const app = new App({
   socketMode: true,
 });
 
-// ── Regex fallback for timeline parsing (used if AI call fails) ───────────────
-// Returns YYYY-MM-DD string or null. No time support — all-day events only.
-function parseTimelineToDateFallback(timeline) {
-  if (!timeline) return null;
-  const now = new Date();
-  const low = timeline.toLowerCase().trim();
-
-  if (/\b(today|tonight|now|asap)\b/.test(low)) {
-    // Use local Melbourne date, not UTC
-    const mel = new Date(now.toLocaleString('en-US', { timeZone: 'Australia/Melbourne' }));
-    return `${mel.getFullYear()}-${String(mel.getMonth()+1).padStart(2,'0')}-${String(mel.getDate()).padStart(2,'0')}`;
-  }
-
-  if (/\btomorrow\b/.test(low)) {
-    const mel = new Date(now.toLocaleString('en-US', { timeZone: 'Australia/Melbourne' }));
-    mel.setDate(mel.getDate() + 1);
-    return `${mel.getFullYear()}-${String(mel.getMonth()+1).padStart(2,'0')}-${String(mel.getDate()).padStart(2,'0')}`;
-  }
-
-  // Day-of-week: "this Saturday", "next Monday", bare "Saturday"
-  const DOW = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
-  for (let i = 0; i < DOW.length; i++) {
-    if (new RegExp(`\\b${DOW[i]}\\b`).test(low)) {
-      const mel = new Date(now.toLocaleString('en-US', { timeZone: 'Australia/Melbourne' }));
-      const diff = (i - mel.getDay() + 7) % 7 || 7;
-      mel.setDate(mel.getDate() + diff);
-      return `${mel.getFullYear()}-${String(mel.getMonth()+1).padStart(2,'0')}-${String(mel.getDate()).padStart(2,'0')}`;
-    }
-  }
-
-  // Ordinal day: "13th", "13th of this month", "the 13th"
-  const ordM = low.match(/\b(\d{1,2})(?:st|nd|rd|th)\b/);
-  if (ordM) {
-    const day = parseInt(ordM[1], 10);
-    if (day >= 1 && day <= 31) {
-      const mel = new Date(now.toLocaleString('en-US', { timeZone: 'Australia/Melbourne' }));
-      const d = new Date(mel.getFullYear(), mel.getMonth(), day);
-      if (d <= mel) d.setMonth(d.getMonth() + 1);
-      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-    }
-  }
-
-  // "in X weeks" / "in X days"
-  const wk = low.match(/in (\d+) week/);
-  if (wk) {
-    const d = new Date(now); d.setDate(d.getDate() + parseInt(wk[1]) * 7);
-    return d.toISOString().slice(0, 10);
-  }
-  const dy = low.match(/in (\d+) day/);
-  if (dy) {
-    const d = new Date(now); d.setDate(d.getDate() + parseInt(dy[1]));
-    return d.toISOString().slice(0, 10);
-  }
-
-  // Native parse fallback: "June 13", "13 June", "April 13, 2026"
-  // Preserve original case (not `low`) so month names parse correctly via new Date()
-  const stripped = timeline.trim().replace(/^(by|on|at)\s+/i, '');
-  const parsed   = new Date(stripped);
-  if (!isNaN(parsed.getTime()) && parsed.getFullYear() >= now.getFullYear()) {
-    return parsed.toISOString().slice(0, 10);
-  }
-  return null;
-}
-
 // ── AI-powered timeline parser — returns YYYY-MM-DD or full ISO datetime ───────
 // Primary: DeepSeek for structured date/time extraction.
-// Fallback: regex parser above (handles simple cases without API call).
+// Fallback: chrono-node (handles simple cases without API call).
 // Returns: "YYYY-MM-DD" for all-day, "YYYY-MM-DDTHH:MM:00" for timed events, or null.
 async function parseTimelineToDate(timeline) {
   if (!timeline) return null;
@@ -142,24 +81,29 @@ Examples given current date ${nowStr.split(' ')[0]}:
     return null;
 
   } catch (err) {
-    console.warn('[parseTimelineToDate] AI parse failed:', err.message, '— falling back to regex');
-    return parseTimelineToDateFallback(timeline);
+    console.error('[bot:parseTimelineToDate] AI failed:', err.message, '— chrono-node fallback');
+    const { parse: chronoParse } = await import('chrono-node');
+    const ref    = new Date();
+    const parsed = chronoParse(timeline, ref, { forwardDate: true });
+    if (!parsed?.length) return null;
+    const p = parsed[0].start;
+    const y = p.get('year'), mo = p.get('month'), d = p.get('day');
+    const h = p.get('hour') ?? 0, mi = p.get('minute') ?? 0;
+    const base = `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    return (p.isCertain('hour'))
+      ? `${base}T${String(h).padStart(2,'0')}:${String(mi).padStart(2,'0')}:00`
+      : base;
   }
 }
 
 // ── Deduplication ─────────────────────────────────────────────────────────────
-const _seen = new Set();
+const _dedup = new Deduplicator({ maxSize: 200, ttlSeconds: 90 });
 function isDuplicate(message) {
-  const key = message.client_msg_id ?? message.ts;
-  if (!key) return false;
-  if (_seen.has(key)) return true;
-  _seen.add(key);
-  if (_seen.size > 500) _seen.clear();
-  return false;
+  return _dedup.isDuplicate(message.client_msg_id ?? message.ts);
 }
 
-// ── Pending clarification (userId → { url, text, step, searchMode?, correctionMode? }) ──
-const pending = new Map();
+// ── Pending clarification (write-through: in-memory + Supabase via Vercel proxy) ──
+const pending = new PendingStore(process.env.APP_URL, process.env.APP_SECRET);
 
 // ── Last saved item per user (for correction flow) ────────────────────────────
 // userId → { logId, project, title }
@@ -241,7 +185,7 @@ async function getCalendarPrefs() {
       cachedPrefs = { ...DEFAULT_PREFS, ...calendar };
       return cachedPrefs;
     }
-  } catch {}
+  } catch (err) { console.error('[bot:getCalendarPrefs]', err.message); }
   return DEFAULT_PREFS;
 }
 
@@ -390,7 +334,8 @@ async function createCalendarEventWithPrefs({ title, date, colorId, description 
 // cls.title is the AI-extracted clean title from classifyIntent — no extra call needed.
 // If timeline is present → create calendar event immediately.
 // If no timeline → ask "when is X?" and wait for reminderMode reply.
-async function processReminderTask(cls, channel, userId, say) {
+// deferredQueue: remaining tasks to process after this pending state resolves.
+async function processReminderTask(cls, channel, userId, say, deferredQueue = []) {
   const reminderTitle = (cls.title ?? '').trim().slice(0, 60) || 'Reminder';
 
   if (cls.timeline) {
@@ -404,10 +349,38 @@ async function processReminderTask(cls, channel, userId, say) {
       } catch (err) { console.error('[calendar] event creation failed (network):', err.message); }
     }
     await reply(channel, `📅 ${reminderTitle} · ${cls.timeline}${calCreated ? ' · added to calendar' : ''}`);
+    await processNextDeferred(userId, channel, say, deferredQueue);
 
   } else {
-    pending.set(userId, { reminderMode: true, reminderTitle, originalText: cls.title ?? reminderTitle });
+    pending.set(userId, { reminderMode: true, reminderTitle, originalText: cls.title ?? reminderTitle, deferredQueue });
     await say(`when is "${reminderTitle}"? (or say *to do* to add to your list)`);
+  }
+}
+
+// Process the next item from the deferred queue after a pending state resolves.
+// Shifts the first item and sets a new pending state (or handles it immediately).
+async function processNextDeferred(userId, channel, say, queue) {
+  if (!queue?.length) return;
+  const [next, ...rest] = queue;
+
+  if (next.type === 'reminder') {
+    await processReminderTask(next.cls, channel, userId, say, rest);
+
+  } else if (next.type === 'correction') {
+    pending.set(userId, { correctionMode: true, logId: next.prev.logId, correctionStep: 0, deferredQueue: rest });
+    await say('which project should it be in? (school, work, learning, research, art, baking, beads, circuits, reading, exercise, personal)');
+
+  } else if (next.type === 'search_request') {
+    pending.set(userId, { url: null, text: next.cls.title, searchMode: true, step: 1, deferredQueue: rest });
+    await say('no link — want me to search for the application page? (y/n)');
+
+  } else if (next.type === 'clarification') {
+    pending.set(userId, { clarificationMode: true, url: next.url, text: next.cls.title, step: 1, deferredQueue: rest });
+    await say('work or personal?');
+
+  } else if (next.type === 'vague_learning') {
+    pending.set(userId, { learningMode: true, originalText: next.cls.title, step: 1, history: [], deferredQueue: rest });
+    await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
   }
 }
 
@@ -461,7 +434,8 @@ app.message(async ({ message, say }) => {
 
       if (step === 2) {
         // Default notes
-        const notes = /^(none|no|skip|nah|n\/a|-)$/i.test(t.trim()) ? '' : t.slice(0, 500);
+        const SKIP_WORDS = new Set(['none','no','nope','skip','nah','n/a','na','-','nothing','empty','blank']);
+        const notes = SKIP_WORDS.has(t.trim().toLowerCase()) ? '' : t.slice(0, 500);
         pending.delete(userId);
         await saveCalendarPrefs({
           duration_minutes: state.duration,
@@ -473,6 +447,7 @@ app.message(async ({ message, say }) => {
           ? `reminders at ${state.reminders.map(m => m >= 60 ? `${m/60}h` : `${m}min`).join(', ')} before`
           : 'no reminders';
         await say(`saved ✓\n• Event duration: ${state.duration} min\n• ${reminderStr}${notes ? `\n• Default notes: "${notes.slice(0, 60)}"` : ''}\n\nSay *preferences* anytime to update.`);
+        await processNextDeferred(userId, message.channel, say, state.deferredQueue);
         return;
       }
     }
@@ -486,6 +461,7 @@ app.message(async ({ message, say }) => {
           // Gave up — just confirm it stays where it is
           pending.delete(userId);
           await say(`ok, keeping it as-is`);
+          await processNextDeferred(userId, message.channel, say, state.deferredQueue);
           return;
         }
         pending.set(userId, { ...state, correctionStep: reaskCount });
@@ -496,68 +472,62 @@ app.message(async ({ message, say }) => {
       await callCorrect(state.logId, proj, userText);
       lastSaved.delete(userId);
       await say(`moved to ${proj} ✓`);
+      await processNextDeferred(userId, message.channel, say, state.deferredQueue);
       return;
     }
 
     // Reminder date prompt — user is answering "when is this?"
     if (state.reminderMode) {
-      // Guard: if user sends a new "remind me to..." message instead of a date (confused state),
-      // clear pending and fall through to re-classify as a fresh message
-      const looksLikeNewReminder =
-        /^(remind me|set a reminder|can you remind|add a reminder)\b/i.test(userText.trim()) &&
-        userText.trim().split(/\s+/).length > 5;
-      if (!looksLikeNewReminder) {
-        const lc = userText.toLowerCase().trim();
-        const isToDoReply = /^(to.?do|td|my list|add to list|no date|just add it|whenever)$/i.test(lc);
+      const isToDoReply = await parseTodoReply(userText);
 
-        if (isToDoReply) {
-          // Save to personal Kanban, no calendar
-          pending.delete(userId);
-          try {
-            const data = await callInbox({
-              text:    state.reminderTitle,
-              title:   state.reminderTitle,
-              source:  'slack',
-              project: 'personal',
-            });
-            if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: state.reminderTitle });
-            await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${state.reminderTitle.slice(0, 60)}> · added to your to-do list`);
-          } catch { await say("couldn't save that"); }
-          return;
-        }
-
-        // User gave a date — parse it and route to calendar
-        const date = await parseTimelineToDate(userText) ?? await parseTimelineToDate(userText.replace(/^(on|at|by|this|next)\s+/i, ''));
-        if (!date) {
-          // Couldn't parse — re-ask once then save as to-do
-          const reask = (state.reminderReask ?? 0) + 1;
-          if (reask >= 2) {
-            pending.delete(userId);
-            try {
-              await callInbox({ text: state.reminderTitle, title: state.reminderTitle, source: 'slack', project: 'personal' });
-              await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${state.reminderTitle.slice(0, 60)}> · added to your to-do list`);
-            } catch { await say("couldn't save that"); }
-            return;
-          }
-          pending.set(userId, { ...state, reminderReask: reask });
-          await say(`didn't catch a date — try "this Saturday", "13th", "in 2 weeks", or say *to do* to add to your list`);
-          return;
-        }
-
-        // Got a valid date — create calendar event with user preferences
+      if (isToDoReply) {
+        // Save to personal Kanban, no calendar
         pending.delete(userId);
-        const colorId = pickColorId('personal', state.originalText);
-        let calCreated = false;
-        if (process.env.CALENDAR_ENABLED === 'true') {
-          try {
-            calCreated = await createCalendarEventWithPrefs({ title: state.reminderTitle, date, colorId, description: state.originalText });
-          } catch (err) { console.error('[calendar] event creation failed (network):', err.message); }
-        }
-        await say(`📅 ${state.reminderTitle} · ${userText.trim()}${calCreated ? ' · added to calendar' : ''}`);
+        try {
+          const data = await callInbox({
+            text:    state.reminderTitle,
+            title:   state.reminderTitle,
+            source:  'slack',
+            project: 'personal',
+          });
+          if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: state.reminderTitle });
+          await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${state.reminderTitle.slice(0, 60)}> · added to your to-do list`);
+          await processNextDeferred(userId, message.channel, say, state.deferredQueue);
+        } catch (err) { console.error('[bot:reminderMode:todoSave]', err.message); await say("couldn't save that"); }
         return;
       }
-      // looksLikeNewReminder=true: clear pending and fall through to fresh message processing
+
+      // User gave a date — parse it and route to calendar
+      const date = await parseTimelineToDate(userText) ?? await parseTimelineToDate(userText.replace(/^(on|at|by|this|next)\s+/i, ''));
+      if (!date) {
+        // Couldn't parse — re-ask once then save as to-do
+        const reask = (state.reminderReask ?? 0) + 1;
+        if (reask >= 2) {
+          pending.delete(userId);
+          try {
+            await callInbox({ text: state.reminderTitle, title: state.reminderTitle, source: 'slack', project: 'personal' });
+            await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${state.reminderTitle.slice(0, 60)}> · added to your to-do list`);
+            await processNextDeferred(userId, message.channel, say, state.deferredQueue);
+          } catch (err) { console.error('[bot:reminderMode:reaskSave]', err.message); await say("couldn't save that"); }
+          return;
+        }
+        pending.set(userId, { ...state, reminderReask: reask });
+        await say(`didn't catch a date — try "this Saturday", "13th", "in 2 weeks", or say *to do* to add to your list`);
+        return;
+      }
+
+      // Got a valid date — create calendar event with user preferences
       pending.delete(userId);
+      const colorId = pickColorId('personal', state.originalText);
+      let calCreated = false;
+      if (process.env.CALENDAR_ENABLED === 'true') {
+        try {
+          calCreated = await createCalendarEventWithPrefs({ title: state.reminderTitle, date, colorId, description: state.originalText });
+        } catch (err) { console.error('[calendar] event creation failed (network):', err.message); }
+      }
+      await say(`📅 ${state.reminderTitle} · ${userText.trim()}${calCreated ? ' · added to calendar' : ''}`);
+      await processNextDeferred(userId, message.channel, say, state.deferredQueue);
+      return;
     }
 
     // Learning clarification mode — two-call architecture:
@@ -590,24 +560,10 @@ app.message(async ({ message, say }) => {
         return title.slice(0, 80);
       };
 
-      // ── Fast-path: bare action words need no AI ────────────────────────────
-      const bareAction = /^(read|implement|write|understand|learn|theory|both|all)(\s+(it|the paper|more|about it|everything))?$/i.test(userText.trim());
-      if (bareAction) {
-        pending.delete(userId);
-        const task     = userText.trim().toLowerCase();
-        const title    = buildLearningTitle(task, state.originalText);
-        const enriched = `${task} — ${state.originalText.slice(0, 120)}`;
-        try {
-          const data = await callInbox({ text: enriched, title, source: 'slack', project: 'learning_tech' });
-          await say(buildSuccessMessage(data));
-        } catch { await say('saved ✓'); }
-        return;
-      }
-
       // ── Soft check-in response: user replied to "shall I save?" prompt ─────
       if (state.softCheckIn) {
-        const lc = userText.toLowerCase().trim();
-        if (/^(no|nah|nope|not yet|keep going|continue|later)/.test(lc)) {
+        const softReply = await parseSoftCheckInReply(userText);
+        if (softReply === 'decline') {
           // Reset step to 5 so the next 3 turns allow chat before triggering check-in again at step=8
           pending.set(userId, { ...state, softCheckIn: false, step: 5 });
           await say(`all good — keep going`);
@@ -622,7 +578,8 @@ app.message(async ({ message, say }) => {
           const data = await callInbox({ text: enriched, title, source: 'slack', project: 'learning_tech' });
           if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
           await reply(message.channel, buildSuccessMessage(data, {}));
-        } catch { await say("couldn't save that"); }
+          await processNextDeferred(userId, message.channel, say, state.deferredQueue);
+        } catch (err) { console.error('[bot:learningMode:softCheckInSave]', err.message); await say("couldn't save that"); }
         return;
       }
 
@@ -713,7 +670,9 @@ Rules:
         const data = await callInbox({ text: enriched, title, source: 'slack', project: 'learning_tech' });
         if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
         await reply(message.channel, buildSuccessMessage(data, {}));
-      } catch {
+        await processNextDeferred(userId, message.channel, say, state.deferredQueue);
+      } catch (err) {
+        console.error('[bot:learningMode:finalSave]', err.message);
         await say("couldn't save that");
       }
       return;
@@ -722,16 +681,19 @@ Rules:
     // Search mode: "no link — want me to search? (y/n)"
     if (state.searchMode) {
       pending.delete(userId);
-      if (/^y/i.test(userText.trim())) {
+      if ((await parseYesNo(userText)) === 'yes') {
         try {
           const data = await callInbox({ text: state.text, source: 'slack', project: 'research_apps' });
           if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
           await reply(message.channel, buildSuccessMessage(data, {}));
-        } catch {
+          await processNextDeferred(userId, message.channel, say, state.deferredQueue);
+        } catch (err) {
+          console.error('[bot:searchMode:save]', err.message);
           await say("couldn't save that");
         }
       } else {
         await say('ok, ignored');
+        await processNextDeferred(userId, message.channel, say, state.deferredQueue);
       }
       return;
     }
@@ -751,7 +713,8 @@ Rules:
               const data = await callInbox({ url: state.url ?? undefined, text: state.text, source: 'slack' });
               if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
               await reply(message.channel, buildSuccessMessage(data, {}));
-            } catch { await say('saved ✓'); }
+              await processNextDeferred(userId, message.channel, say, state.deferredQueue);
+            } catch (err) { console.error('[bot:clarificationMode:reaskSave]', err.message); await say('saved ✓'); }
             return;
           }
           pending.set(userId, { ...state, clarStep: reaskCount });
@@ -765,12 +728,12 @@ Rules:
 
         // User answered "work/personal" AND added a search request (e.g. "personal, but find the date").
         // Save silently and return the search result instead of the app confirmation link.
-        const hasSearchAsk = /\b(find|look up|search|when is|what.s the date|what time)\b/i.test(userText);
+        const hasSearchAsk = tasks.some(t => t.intent === 'web_search');
 
         if (hasSearchAsk) {
           callInbox({ url: state.url ?? undefined, text: enrichedText, title: state.text ?? undefined, source: 'slack', project })
             .then(data => { if (data?.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary }); })
-            .catch(() => {});
+            .catch(err => console.error('[bot:clarificationMode:searchSave]', err.message));
           const searchQuery = (state.text ?? '').replace(/^there.?s?\s+(a\s+)?/i, '').trim();
           const searchData  = await webSearch(searchQuery);
           if (searchData?.answer) {
@@ -789,7 +752,9 @@ Rules:
           const data = await callInbox({ url: state.url ?? undefined, text: enrichedText, title: state.text ?? undefined, source: 'slack', project });
           if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
           await reply(message.channel, buildSuccessMessage(data, {}));
-        } catch {
+          await processNextDeferred(userId, message.channel, say, state.deferredQueue);
+        } catch (err) {
+          console.error('[bot:clarificationMode:save]', err.message);
           await say("couldn't save that");
         }
         return;
@@ -812,35 +777,10 @@ Rules:
       const data = await callInbox({ url, source: 'slack' });
       if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
       await reply(message.channel, buildSuccessMessage(data, {}));
-    } catch {
+    } catch (err) {
+      console.error('[bot:isPureUrl:save]', err.message);
       await say("couldn't save that");
     }
-    return;
-  }
-
-  // ── Pre-AI fast path: explicit learning intent with no URL ──────────────────
-  // "I want to learn about X" is unambiguous — skip the AI call entirely and go
-  // straight to the clarification dialogue. This prevents misclassification when
-  // Gemini returns project_hint:null instead of learning_tech for these patterns.
-  // Requires >5 words so bare "want to learn" (no topic) doesn't trigger.
-  // "want to learn about X" patterns need > 5 words to ensure a topic is present
-  // Pre-AI fast path: explicit learning intent with no URL.
-  // Patterns must unambiguously mean "I want to study/understand this topic over time" —
-  // NOT information queries ("what is the date", "what time is"), which go to web_search.
-  // "tell me about" is also excluded: too broad (e.g. "tell me about the event date").
-  const isExplicitLearning =
-    urls.length === 0 && (() => {
-      const words = userText.trim().split(/\s+/).filter(Boolean).length;
-      // Requires explicit learning language AND a topic (word count guards prevent bare triggers)
-      if (words > 5 && /\b(want to learn about|want to learn|learning about|i'?m learning about|been learning|trying to learn|i want to understand|i need to understand|need to learn about)\b/i.test(userText)) return true;
-      // "explain X to me" pattern — only if no question word in front (avoids "can you explain when...")
-      if (words > 4 && /^(can you |could you |please )?(explain)\b/i.test(userText.trim()) && /\bto me\b/i.test(userText)) return true;
-      return false;
-    })();
-
-  if (isExplicitLearning) {
-    pending.set(userId, { learningMode: true, originalText: userText, step: 1, history: [] });
-    await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
     return;
   }
 
@@ -857,10 +797,7 @@ Rules:
   const needsInput = []; // tasks deferred to pass 2
 
   // ── Preferences trigger — handle before task loop ─────────────────────────
-  // "preferences", "set preferences", "change settings" etc.
-  const wantsPrefs = /\b(preference|preferences|settings|set up|setup|configure|change my)\b/i.test(userText)
-    && !/\b(save|remind|add|create)\b/i.test(userText); // don't trigger on "add my preference"
-  if (wantsPrefs && tasks.every(t => t.intent === 'converse')) {
+  if (tasks.some(t => t.intent === 'preferences')) {
     const prefs = await getCalendarPrefs();
     const reminderStr = prefs.reminder_minutes.length
       ? prefs.reminder_minutes.map(m => m >= 60 ? `${m/60}h` : `${m}min`).join(', ')
@@ -880,6 +817,10 @@ Rules:
         await say("I save tasks, links, and set reminders. Try _\"remind me to...\"_ or paste a link.");
       }
       continue;
+    }
+
+    if (cls.intent === 'preferences') {
+      continue; // handled above before the loop
     }
 
     if (cls.intent === 'web_search') {
@@ -921,7 +862,7 @@ Rules:
         const { results } = await res.json();
         if (!results?.length) {
           // If the user was asking for a date/location of an event, try a web search
-          const wantsEventDate = /\b(what'?s the date|when is|find the date|date of|where is|what time)\b/i.test(userText);
+          const wantsEventDate = tasks.some(t => t.intent === 'web_search');
           if (wantsEventDate) {
             const searchData = await webSearch(topic);
             if (searchData?.answer) {
@@ -1011,7 +952,8 @@ Rules:
       });
       if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
       await reply(message.channel, buildSuccessMessage(data, cls));
-    } catch {
+    } catch (err) {
+      console.error('[bot:taskLoop:save]', err.message);
       await say("couldn't save that");
     }
   }
@@ -1023,26 +965,25 @@ Rules:
   //   Pass 1: assignment (has timeline) → calendar event created immediately
   //   Pass 2: milk (no timeline) → asks "when is Buy milk?"
   if (needsInput.length > 0 && !pending.has(userId)) {
-    const deferred = needsInput[0];
+    const [first, ...rest] = needsInput;
 
-    if (deferred.type === 'reminder') {
-      // processReminderTask with no cls.timeline → sets pending + asks "when is X?"
-      await processReminderTask(deferred.cls, message.channel, userId, say);
+    if (first.type === 'reminder') {
+      await processReminderTask(first.cls, message.channel, userId, say, rest);
 
-    } else if (deferred.type === 'correction') {
-      pending.set(userId, { correctionMode: true, logId: deferred.prev.logId, correctionStep: 0 });
-      await say("which project should it be in? (school, work, learning, research, art, baking, beads, circuits, reading, exercise, personal)");
+    } else if (first.type === 'correction') {
+      pending.set(userId, { correctionMode: true, logId: first.prev.logId, correctionStep: 0, deferredQueue: rest });
+      await say('which project should it be in? (school, work, learning, research, art, baking, beads, circuits, reading, exercise, personal)');
 
-    } else if (deferred.type === 'search_request') {
-      pending.set(userId, { url: null, text: deferred.cls.title ?? userText, searchMode: true, step: 1 });
+    } else if (first.type === 'search_request') {
+      pending.set(userId, { url: null, text: first.cls.title ?? userText, searchMode: true, step: 1, deferredQueue: rest });
       await say('no link — want me to search for the application page? (y/n)');
 
-    } else if (deferred.type === 'clarification') {
-      pending.set(userId, { clarificationMode: true, url: deferred.url, text: deferred.cls.title ?? userText, step: 1 });
+    } else if (first.type === 'clarification') {
+      pending.set(userId, { clarificationMode: true, url: first.url, text: first.cls.title ?? userText, step: 1, deferredQueue: rest });
       await say('work or personal?');
 
-    } else if (deferred.type === 'vague_learning') {
-      pending.set(userId, { learningMode: true, originalText: deferred.cls.title ?? userText, step: 1, history: [] });
+    } else if (first.type === 'vague_learning') {
+      pending.set(userId, { learningMode: true, originalText: first.cls.title ?? userText, step: 1, history: [], deferredQueue: rest });
       await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
     }
   }
@@ -1075,5 +1016,7 @@ export async function sendSlackDeadlineNudge(slackUserId, apps) {
   });
 }
 
+await loadQuota(process.env.APP_URL, process.env.APP_SECRET);
+await pending.hydrateAll();
 await app.start();
 console.log('✅ Project OS bot running');
