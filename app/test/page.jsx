@@ -50,11 +50,27 @@ export default function TestPage() {
   const [results,       setResults]       = useState({});
   const [running,       setRunning]       = useState(null);
   const [cronSecret,    setCronSecret]    = useState('dev-secret');
-  const [activeTab,     setActiveTab]     = useState('original'); // 'original' | 'model' | 'tier'
+  const [activeTab,     setActiveTab]     = useState('original'); // 'original' | 'model' | 'tier' | 'costs'
   const [tierInput,     setTierInput]     = useState('');
   const [tierStep,      setTierStep]      = useState(0);
   const [tierEscalated, setTierEscalated] = useState(false);
   const [tierResult,    setTierResult]    = useState(null);
+  const [costData,      setCostData]      = useState(null);
+  const [costPeriod,    setCostPeriod]    = useState('month');
+  const [costLoading,   setCostLoading]   = useState(false);
+
+  async function loadCosts(period = costPeriod) {
+    setCostLoading(true);
+    try {
+      const res  = await fetch(`/api/costs?period=${period}`);
+      const data = await res.json();
+      setCostData(data);
+    } catch (err) {
+      setCostData({ error: err.message });
+    } finally {
+      setCostLoading(false);
+    }
+  }
 
   function runTierClassify() {
     if (!tierInput.trim()) return;
@@ -107,12 +123,109 @@ export default function TestPage() {
 
       {/* Tabs */}
       <div style={s.tabs}>
-        {[['original', '20 Original Tests'], ['model', '9 Multi-Model Tests'], ['tier', 'Tier Inspector']].map(([tab, label]) => (
+        {[['original', '20 Original Tests'], ['model', '9 Multi-Model Tests'], ['tier', 'Tier Inspector'], ['costs', 'Cost Dashboard']].map(([tab, label]) => (
           <button key={tab} style={{ ...s.tab, ...(activeTab === tab ? s.tabActive : {}) }} onClick={() => setActiveTab(tab)}>
             {label}
           </button>
         ))}
       </div>
+
+      {/* Cost Dashboard tab */}
+      {activeTab === 'costs' && (
+        <div style={s.tierPanel}>
+          <p style={s.tierHint}>Reads from the <code>cost_log</code> Supabase table via <code>GET /api/costs</code>.</p>
+          <div style={s.tierControls}>
+            {['today', 'week', 'month'].map(p => (
+              <button key={p} style={{ ...s.tab, ...(costPeriod === p ? s.tabActive : {}) }}
+                onClick={() => { setCostPeriod(p); loadCosts(p); }}>
+                {p}
+              </button>
+            ))}
+            <button style={s.runAll} onClick={() => loadCosts(costPeriod)} disabled={costLoading}>
+              {costLoading ? 'Loading…' : 'Fetch'}
+            </button>
+          </div>
+
+          {costData?.error && (
+            <div style={{ color: '#ff6b6b', fontSize: '0.85rem', marginTop: '0.5rem' }}>Error: {costData.error}</div>
+          )}
+
+          {costData && !costData.error && (
+            <>
+              {/* Summary row */}
+              <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', margin: '1rem 0' }}>
+                {[
+                  ['Total spend', `$${Number(costData.total ?? 0).toFixed(4)}`],
+                  ['Period', costData.period],
+                  ['Since', costData.since?.slice(0, 10)],
+                ].map(([label, val]) => (
+                  <div key={label} style={{ background: '#12141a', borderRadius: 7, padding: '0.6rem 1rem', border: '1px solid #2a2d38', minWidth: 110 }}>
+                    <div style={{ ...s.dim, fontSize: '0.72rem', marginBottom: 3 }}>{label}</div>
+                    <div style={{ fontWeight: 700, fontSize: '1rem', color: '#e8994a' }}>{val}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* By tier */}
+              <h3 style={{ fontSize: '0.85rem', fontWeight: 600, color: '#a0a8b8', margin: '1rem 0 0.4rem' }}>By Tier</h3>
+              <div style={{ display: 'flex', gap: '0.6rem', flexWrap: 'wrap', marginBottom: '1rem' }}>
+                {Object.entries(costData.byTier ?? {}).sort().map(([key, cost]) => {
+                  const t = parseInt(key.replace('tier_', ''), 10);
+                  return (
+                    <div key={key} style={{ background: tierBadgeBg(t), color: tierBadgeFg(t), borderRadius: 6, padding: '0.4rem 0.8rem', fontSize: '0.82rem', fontWeight: 600 }}>
+                      T{t} — ${Number(cost).toFixed(4)}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* By provider */}
+              <h3 style={{ fontSize: '0.85rem', fontWeight: 600, color: '#a0a8b8', margin: '0 0 0.4rem' }}>By Provider</h3>
+              <div style={{ display: 'flex', gap: '0.6rem', flexWrap: 'wrap', marginBottom: '1rem' }}>
+                {Object.entries(costData.byProvider ?? {}).map(([prov, cost]) => (
+                  <div key={prov} style={{ background: '#1a1d28', border: '1px solid #2a2d38', borderRadius: 6, padding: '0.4rem 0.8rem', fontSize: '0.82rem' }}>
+                    <span style={{ color: '#c8cad8' }}>{prov}</span>
+                    <span style={{ color: '#e8994a', marginLeft: 8 }}>${Number(cost).toFixed(4)}</span>
+                  </div>
+                ))}
+              </div>
+
+              {/* Recent calls */}
+              {costData.recent?.length > 0 && (
+                <>
+                  <h3 style={{ fontSize: '0.85rem', fontWeight: 600, color: '#a0a8b8', margin: '0 0 0.4rem' }}>Recent Calls</h3>
+                  <table style={{ ...s.table, fontSize: '0.78rem' }}>
+                    <thead>
+                      <tr>
+                        {['Model', 'Provider', 'Tier', 'Cost', 'Cached', 'Project', 'At'].map(h => (
+                          <th key={h} style={s.th}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {costData.recent.map((r, i) => (
+                        <tr key={i}>
+                          <td style={{ ...s.td, fontFamily: 'monospace', fontSize: '0.72rem' }}>{r.model}</td>
+                          <td style={s.td}>{r.provider}</td>
+                          <td style={{ ...s.td, color: tierBadgeFg(r.tier) }}>T{r.tier}</td>
+                          <td style={{ ...s.td, color: '#e8994a' }}>${Number(r.cost).toFixed(6)}</td>
+                          <td style={{ ...s.td, color: r.cached ? '#4db88a' : '#a0a8b8' }}>{r.cached ? '⚡' : '—'}</td>
+                          <td style={{ ...s.td, color: '#a0a8b8', fontSize: '0.72rem' }}>{r.projectKey ?? '—'}</td>
+                          <td style={{ ...s.td, color: '#a0a8b8', fontSize: '0.72rem' }}>{r.at?.slice(5, 16)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </>
+              )}
+            </>
+          )}
+
+          {!costData && !costLoading && (
+            <p style={{ ...s.tierHint, marginTop: '1rem' }}>Click Fetch to load cost data.</p>
+          )}
+        </div>
+      )}
 
       {/* Tier Inspector tab */}
       {activeTab === 'tier' && (
@@ -179,7 +292,7 @@ export default function TestPage() {
       )}
 
       {/* Controls + table for test tabs */}
-      {activeTab !== 'tier' && (<>
+      {activeTab !== 'tier' && activeTab !== 'costs' && (<>
       <div style={s.toolbar}>
         <button style={s.runAll} onClick={() => runAll(visibleTests)}>▶ Run {visibleTests.length} Tests</button>
         <button style={s.runAll} onClick={() => runAll(allTests)}>▶▶ Run All 29</button>
