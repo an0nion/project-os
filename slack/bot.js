@@ -20,6 +20,8 @@ import { logCostViaApi } from '../lib/vmCostLogger.js';
 import { Deduplicator } from '../lib/deduplicator.js';
 import PendingStore from '../lib/pendingStore.js';
 import { loadQuota } from '../lib/geminiQuota.js';
+import { classifyTier } from '../lib/tierClassifier.js';
+import { compressHistory } from '../lib/conversationManager.js';
 
 const { App } = bolt;
 
@@ -611,9 +613,22 @@ type=chat: everything else — user wants more info, is exploring, asking questi
         saveAsText = userText.trim().slice(0, 60);
 
       } else if (classifyType === 'chat' && step < 8) {
-        // ── Call 2: conversational response with full conversation history ────
+        // ── Call 2: conversational response — tier-routed for depth ──────────
+        const tier = classifyTier(userText, {
+          projectKey:  'learning_tech',
+          messageCount: step,
+          isEscalated:  state.isEscalated ?? false,
+        });
+        if (tier.tier === 3) console.log(`[bot:learningMode] Tier 3 — ${tier.reason}`);
+
+        // Compress history before Tier 3 (Opus) calls to cap input cost
+        const rawHistory = [...history, { role: 'user', content: userText }];
+        const callHistory = tier.tier === 3
+          ? await compressHistory(rawHistory)
+          : rawHistory;
+
         try {
-          const explainResult = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
+          const explainResult = await callModelWithFallback(tier.primaryModel, tier.fallbackModel, {
             system: `You are a knowledgeable research companion in an ongoing Slack conversation.
 Topic the user is exploring: "${state.originalText.slice(0, 150)}"
 
@@ -624,8 +639,8 @@ Rules:
 - Write like a colleague: no "Great question!", no textbook openers, no bullet points, no headers.
 - End with a specific observation or question that opens the next line of inquiry. Not a menu of options.
 - Plain text only.`,
-            messages: [...history, { role: 'user', content: userText }],
-            maxTokens: 500,
+            messages: callHistory,
+            maxTokens: tier.maxTokens,
           });
           logCostViaApi(explainResult.modelKey, explainResult.usage, 'learning_explain');
           chatReply = explainResult.text?.trim() ?? null;
@@ -651,7 +666,8 @@ Rules:
           { role: 'user', content: userText },
           { role: 'assistant', content: chatReply },
         ];
-        pending.set(userId, { ...state, step: step + 1, history: newHistory });
+        const nowEscalated = (tier?.tier ?? 0) === 3;
+        pending.set(userId, { ...state, step: step + 1, history: newHistory, isEscalated: nowEscalated }, 14400);
         await say(chatReply);
         return;
       }

@@ -7,6 +7,7 @@
 'use client';
 
 import { useState } from 'react';
+import { classifyTier } from '../../lib/tierClassifier.js';
 
 // ── Original 20 tests ─────────────────────────────────────────────────────────
 const ORIGINAL_TESTS = [
@@ -46,12 +47,27 @@ const MODEL_TESTS = [
 ];
 
 export default function TestPage() {
-  const [results,    setResults]    = useState({});
-  const [running,    setRunning]    = useState(null);
-  const [cronSecret, setCronSecret] = useState('dev-secret');
-  const [activeTab,  setActiveTab]  = useState('original'); // 'original' | 'model'
+  const [results,       setResults]       = useState({});
+  const [running,       setRunning]       = useState(null);
+  const [cronSecret,    setCronSecret]    = useState('dev-secret');
+  const [activeTab,     setActiveTab]     = useState('original'); // 'original' | 'model' | 'tier'
+  const [tierInput,     setTierInput]     = useState('');
+  const [tierStep,      setTierStep]      = useState(0);
+  const [tierEscalated, setTierEscalated] = useState(false);
+  const [tierResult,    setTierResult]    = useState(null);
+
+  function runTierClassify() {
+    if (!tierInput.trim()) return;
+    const result = classifyTier(tierInput, {
+      projectKey:  'learning_tech',
+      messageCount: tierStep,
+      isEscalated:  tierEscalated,
+    });
+    setTierResult(result);
+  }
 
   const allTests = [...ORIGINAL_TESTS, ...MODEL_TESTS];
+  const visibleTests = activeTab === 'original' ? ORIGINAL_TESTS : MODEL_TESTS;
 
   async function runTest(test) {
     setRunning(test.id);
@@ -81,7 +97,6 @@ export default function TestPage() {
     for (const t of tests) await runTest(t);
   }
 
-  const visibleTests = activeTab === 'original' ? ORIGINAL_TESTS : MODEL_TESTS;
   const passed = Object.values(results).filter(r => r.pass).length;
   const total  = Object.keys(results).length;
 
@@ -92,14 +107,79 @@ export default function TestPage() {
 
       {/* Tabs */}
       <div style={s.tabs}>
-        {['original', 'model'].map(tab => (
+        {[['original', '20 Original Tests'], ['model', '9 Multi-Model Tests'], ['tier', 'Tier Inspector']].map(([tab, label]) => (
           <button key={tab} style={{ ...s.tab, ...(activeTab === tab ? s.tabActive : {}) }} onClick={() => setActiveTab(tab)}>
-            {tab === 'original' ? '20 Original Tests' : '9 Multi-Model Tests'}
+            {label}
           </button>
         ))}
       </div>
 
-      {/* Controls */}
+      {/* Tier Inspector tab */}
+      {activeTab === 'tier' && (
+        <div style={s.tierPanel}>
+          <p style={s.tierHint}>Pure client-side — no API call. Tests the tier classifier logic directly.</p>
+          <textarea
+            style={s.tierTextarea}
+            placeholder="Type a message to classify… e.g. 'help me think through my alignment research'"
+            value={tierInput}
+            onChange={e => setTierInput(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runTierClassify(); } }}
+            rows={3}
+          />
+          <div style={s.tierControls}>
+            <label style={s.label}>
+              Step (depth):&nbsp;
+              <input type="number" min={0} max={20} style={{ ...s.input, width: 60 }} value={tierStep} onChange={e => setTierStep(+e.target.value)} />
+            </label>
+            <label style={{ ...s.label, display: 'flex', alignItems: 'center', gap: 6 }}>
+              <input type="checkbox" checked={tierEscalated} onChange={e => setTierEscalated(e.target.checked)} />
+              Sticky Opus (isEscalated)
+            </label>
+            <button style={s.runAll} onClick={runTierClassify}>Classify</button>
+          </div>
+
+          {tierResult && (
+            <div style={s.tierResult}>
+              <span style={{ ...s.tierBadge, background: tierBadgeBg(tierResult.tier), color: tierBadgeFg(tierResult.tier) }}>
+                Tier {tierResult.tier}
+              </span>
+              <div style={s.inspectorRow}><span style={s.dim}>Primary model</span><strong style={{ fontFamily: 'monospace' }}>{tierResult.primaryModel ?? '(none)'}</strong></div>
+              <div style={s.inspectorRow}><span style={s.dim}>Fallback model</span><span style={{ fontFamily: 'monospace', color: '#a0a8b8' }}>{tierResult.fallbackModel ?? '(none)'}</span></div>
+              <div style={s.inspectorRow}><span style={s.dim}>Max tokens</span><span>{tierResult.maxTokens}</span></div>
+              <div style={s.inspectorRow}><span style={s.dim}>Reason</span><span style={{ color: '#c8cad8', fontSize: '0.82rem' }}>{tierResult.reason}</span></div>
+            </div>
+          )}
+
+          {/* Quick examples */}
+          <div style={{ marginTop: '1.5rem' }}>
+            <div style={{ ...s.dim, fontSize: '0.78rem', marginBottom: '0.5rem' }}>Quick examples:</div>
+            {[
+              ['remind me to buy milk', 0, false],
+              ['route this to the right project', 0, false],
+              ['explain transformer attention mechanisms', 0, false],
+              ['help me think through my research direction', 0, false],
+              ['go deeper on that last point', 0, false],
+              ['but why does this matter for alignment?', 3, false],
+              ['tell me more', 9, false],
+              ['ok add that to calendar', 0, true],
+              ['steelman the opposing view', 0, false],
+              ['what is wrong with this framing?', 0, false],
+            ].map(([msg, step, esc]) => {
+              const r = classifyTier(msg, { projectKey: 'learning_tech', messageCount: step, isEscalated: esc });
+              return (
+                <div key={msg} style={s.exampleRow} onClick={() => { setTierInput(msg); setTierStep(step); setTierEscalated(esc); setTierResult(r); }}>
+                  <span style={{ ...s.tierBadgeSm, background: tierBadgeBg(r.tier), color: tierBadgeFg(r.tier) }}>T{r.tier}</span>
+                  <span style={{ fontFamily: 'monospace', fontSize: '0.78rem', flex: 1 }}>{msg}</span>
+                  <span style={{ ...s.dim, fontSize: '0.72rem' }}>{r.primaryModel ?? 'none'}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Controls + table for test tabs */}
+      {activeTab !== 'tier' && (<>
       <div style={s.toolbar}>
         <button style={s.runAll} onClick={() => runAll(visibleTests)}>▶ Run {visibleTests.length} Tests</button>
         <button style={s.runAll} onClick={() => runAll(allTests)}>▶▶ Run All 29</button>
@@ -177,12 +257,20 @@ export default function TestPage() {
           </div>
         </div>
       )}
+      </>)}
     </main>
   );
 }
 
 function tierColor(tier) {
   return { 0: '#a0a8b8', 1: '#4db88a', 2: '#6b8aed', 3: '#c47be0' }[tier] ?? '#e8eaf0';
+}
+
+function tierBadgeBg(tier) {
+  return { 0: '#1f2128', 1: '#0d2b1a', 2: '#0d1533', 3: '#2b1a00' }[tier] ?? '#1a1d28';
+}
+function tierBadgeFg(tier) {
+  return { 0: '#a0a8b8', 1: '#4db88a', 2: '#6b8aed', 3: '#e8994a' }[tier] ?? '#e8eaf0';
 }
 
 const s = {
@@ -211,4 +299,13 @@ const s = {
   inspectorRow:  { display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', margin: '0.2rem 0' },
   dim:           { color: '#a0a8b8' },
   mono:          { fontFamily: 'monospace', fontSize: '0.75rem' },
+  // Tier Inspector
+  tierPanel:     { maxWidth: 700 },
+  tierHint:      { color: '#a0a8b8', fontSize: '0.82rem', margin: '0 0 0.8rem' },
+  tierTextarea:  { width: '100%', padding: '0.6rem', borderRadius: 7, border: '1px solid #2a2d38', background: '#12141a', color: '#e8eaf0', fontSize: '0.85rem', fontFamily: 'system-ui', resize: 'vertical', boxSizing: 'border-box' },
+  tierControls:  { display: 'flex', gap: '1rem', alignItems: 'center', margin: '0.7rem 0' },
+  tierResult:    { background: '#12141a', borderRadius: 8, padding: '1rem', border: '1px solid #2a2d38', marginTop: '0.8rem' },
+  tierBadge:     { display: 'inline-block', padding: '3px 12px', borderRadius: 6, fontWeight: 700, fontSize: '0.9rem', marginBottom: '0.8rem' },
+  tierBadgeSm:   { display: 'inline-block', padding: '1px 7px', borderRadius: 4, fontWeight: 700, fontSize: '0.72rem', marginRight: 8 },
+  exampleRow:    { display: 'flex', alignItems: 'center', padding: '0.35rem 0.5rem', borderRadius: 5, cursor: 'pointer', gap: 8, marginBottom: 3, background: '#0d0f15' },
 };
