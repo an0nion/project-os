@@ -454,6 +454,58 @@ app.message(async ({ message, say }) => {
       }
     }
 
+    // Edit mode: user confirming a field update
+    if (state.editMode) {
+      const yn = await parseYesNo(userText);
+      if (yn === 'yes') {
+        try {
+          if (state.field === 'project_key') {
+            await fetch(`${process.env.APP_URL}/api/inbox/correct`, {
+              method:  'POST',
+              headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
+              body:    JSON.stringify({ itemId: state.matchId, projectKey: state.value }),
+            });
+          } else {
+            await fetch(`${process.env.APP_URL}/api/items/${state.matchId}`, {
+              method:  'PATCH',
+              headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
+              body:    JSON.stringify({ [state.field]: state.value }),
+            });
+          }
+          await say(`updated: *${state.matchTitle}*`);
+        } catch (err) {
+          console.error('[editMode] patch failed:', err.message);
+          await say("couldn't update that item");
+        }
+      } else {
+        await say('ok, nothing changed');
+      }
+      pending.delete(userId);
+      return;
+    }
+
+    // Recall more: user asking for next page of recall results
+    if (state.recallMore) {
+      const wants = /\bmore\b/i.test(userText) || (await parseYesNo(userText)) === 'yes';
+      if (wants && state.recallResults?.length) {
+        const projectEmoji = {
+          personal: '🗓️', learning_tech: '📚', work: '💼', school: '🎓',
+          research_apps: '🔬', baking: '🍞', beadwork: '📿', art: '🎨',
+          reading: '📖', exercise: '💪', circuitry: '⚡',
+        };
+        const lines = state.recallResults.map(r => {
+          const emoji   = projectEmoji[r.project] ?? '📁';
+          const dateStr = r.saved_at ? ` · ${new Date(r.saved_at).toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })}` : '';
+          const link    = r.url ? `<${r.url}|${r.title}>` : r.title;
+          const why     = r._why ? ` — _${r._why}_` : '';
+          return `${emoji} ${link}${why}${dateStr}`;
+        });
+        await say(lines.join('\n'));
+      }
+      pending.delete(userId);
+      return;
+    }
+
     // Correction mode: "which project did you mean?"
     if (state.correctionMode) {
       const proj = await parseProjectKey(userText);
@@ -610,6 +662,32 @@ type=chat: everything else — user wants more info, is exploring, asking questi
 
       // ── Decide based on classification ────────────────────────────────────
       if (classifyType === 'action') {
+        // Async batch path: longer drafts go to Anthropic Batch API (50% cost, non-blocking)
+        const isDraft = /\b(draft|write|outline|summarize|study.?plan|write.?up)\b/i.test(userText);
+        if (isDraft && process.env.APP_URL) {
+          try {
+            await fetch(`${process.env.APP_URL}/api/batch/submit`, {
+              method:  'POST',
+              headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
+              body:    JSON.stringify({
+                jobs: [{
+                  system:    `You are a knowledgeable research companion. The user has been exploring: "${state.originalText.slice(0, 150)}". Write a thorough, well-structured response to their request. Use headers and bullet points where appropriate. Be specific and actionable.`,
+                  messages:  [...history, { role: 'user', content: userText }],
+                  maxTokens: 2000,
+                }],
+                projectKey:      'learning_tech',
+                deliveryUserId:  userId,
+                deliveryChannel: message.channel,
+              }),
+            });
+            pending.delete(userId);
+            await say(`on it — I'll send you the draft shortly ✦`);
+            return;
+          } catch (err) {
+            console.error('[learningMode] batch submit failed, falling back:', err.message);
+            // Fall through to synchronous save path
+          }
+        }
         saveAsText = userText.trim().slice(0, 60);
 
       } else if (classifyType === 'chat' && step < 8) {
@@ -826,6 +904,41 @@ Rules:
     return;
   }
 
+  // ── Edit intent — handle before task loop ────────────────────────────────────
+  const editTask = tasks.find(t => t.intent === 'edit');
+  if (editTask) {
+    const editTitle = editTask.title ?? editTask.recall_topic ?? userText.slice(0, 60);
+    try {
+      const searchRes = await fetch(
+        `${process.env.APP_URL}/api/inbox/search?q=${encodeURIComponent(editTitle)}&limit=5`,
+        { headers: { 'x-api-secret': process.env.APP_SECRET } },
+      );
+      const { results } = await searchRes.json();
+      if (!results?.length) {
+        await say(`nothing saved matching "${editTitle}"`);
+        return;
+      }
+      const match = results.find(r => r.title?.toLowerCase() === editTitle.toLowerCase()) ?? results[0];
+      const field  = editTask.edit_field ?? 'title';
+      const value  = editTask.edit_value ?? '';
+      const FIELD_LABELS = { due_date: 'deadline', title: 'title', status: 'status',
+                             notes: 'notes', project_key: 'project' };
+      const fieldLabel = FIELD_LABELS[field] ?? field;
+      await say(`Update *${match.title}* — change ${fieldLabel} to "${value}"? (y/n)`);
+      pending.set(userId, {
+        editMode:   true,
+        matchId:    match.id,
+        matchTitle: match.title,
+        field,
+        value,
+      }, 300);
+    } catch (err) {
+      console.error('[editMode] search failed:', err.message);
+      await say("couldn't search for that item");
+    }
+    return;
+  }
+
   for (const cls of tasks) {
     if (cls.intent === 'converse') {
       // Only reply when this is the sole task — mixed converse+save messages don't need ack
@@ -836,6 +949,10 @@ Rules:
     }
 
     if (cls.intent === 'preferences') {
+      continue; // handled above before the loop
+    }
+
+    if (cls.intent === 'edit') {
       continue; // handled above before the loop
     }
 
@@ -871,12 +988,13 @@ Rules:
     if (cls.intent === 'recall') {
       const topic = cls.recall_topic ?? cls.title ?? userText;
       try {
+        // Fetch up to 10 — show first 5, stash the rest for "more"
         const res = await fetch(
-          `${process.env.APP_URL}/api/inbox/search?q=${encodeURIComponent(topic)}&limit=5`,
+          `${process.env.APP_URL}/api/inbox/search?q=${encodeURIComponent(topic)}&limit=10`,
           { headers: { 'x-api-secret': process.env.APP_SECRET } },
         );
-        const { results } = await res.json();
-        if (!results?.length) {
+        const { results: rawResults } = await res.json();
+        if (!rawResults?.length) {
           // If the user was asking for a date/location of an event, try a web search
           const wantsEventDate = tasks.some(t => t.intent === 'web_search');
           if (wantsEventDate) {
@@ -895,18 +1013,49 @@ Rules:
           await say(`nothing saved about "${topic}" yet`);
           continue;
         }
+
+        // AI rerank if multiple results — Gemini Flash (free), fire-and-forget on failure
+        let results = rawResults;
+        if (results.length > 1) {
+          try {
+            const rankResult = await callModelWithFallback('gemini-flash', 'deepseek-chat', {
+              system: `You are a recall assistant. Rank these saved items by relevance to the query and write a 5-10 word reason for each. Return ONLY a JSON array: [{ "id": "...", "title": "...", "why": "..." }] sorted most relevant first. Max 5 items.`,
+              messages: [{ role: 'user', content: `Query: "${topic}"\nItems: ${JSON.stringify(results.slice(0, 10).map(r => ({ id: r.id, title: r.title, subtitle: r.subtitle })))}` }],
+              maxTokens: 300,
+            });
+            logCostViaApi(rankResult.modelKey, rankResult.usage, 'recall_rerank');
+            const ranked = JSON.parse(rankResult.text.replace(/```json\n?|```/g, '').trim());
+            const reranked = ranked
+              .map(r => ({ ...(results.find(x => x.id === r.id) ?? {}), _why: r.why }))
+              .filter(r => r.id);
+            if (reranked.length) results = reranked;
+          } catch { /* keep original order on parse failure */ }
+        }
+
+        const PAGE = 5;
+        const page1   = results.slice(0, PAGE);
+        const overflow = results.slice(PAGE);
+
         const projectEmoji = {
           personal: '🗓️', learning_tech: '📚', work: '💼', school: '🎓',
           research_apps: '🔬', baking: '🍞', beadwork: '📿', art: '🎨',
           reading: '📖', exercise: '💪', circuitry: '⚡',
         };
-        const lines = results.map(r => {
+        const formatLine = r => {
           const emoji   = projectEmoji[r.project] ?? '📁';
           const dateStr = r.saved_at ? ` · ${new Date(r.saved_at).toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })}` : '';
           const link    = r.url ? `<${r.url}|${r.title}>` : r.title;
-          return `${emoji} ${link}${dateStr}`;
-        });
-        await reply(message.channel, `here's what I have on "${topic}":\n${lines.join('\n')}`);
+          const why     = r._why ? ` — _${r._why}_` : '';
+          return `${emoji} ${link}${why}${dateStr}`;
+        };
+
+        const lines   = page1.map(formatLine);
+        const moreStr = overflow.length ? `\n+${overflow.length} more — say *more* to see them` : '';
+        await reply(message.channel, `here's what I have on "${topic}":\n${lines.join('\n')}${moreStr}`);
+
+        if (overflow.length) {
+          pending.set(userId, { recallMore: true, recallResults: overflow, recallTopic: topic }, 120);
+        }
       } catch (err) {
         console.error('[recall] search failed:', err.message);
         await say("couldn't search that");
@@ -1036,3 +1185,21 @@ await loadQuota(process.env.APP_URL, process.env.APP_SECRET);
 await pending.hydrateAll();
 await app.start();
 console.log('✅ Project OS bot running');
+
+// ── Batch draft delivery — poll every 60s for completed async jobs ────────────
+if (process.env.APP_URL && process.env.APP_SECRET) {
+  setInterval(async () => {
+    try {
+      const res = await fetch(`${process.env.APP_URL}/api/batch/poll`, {
+        headers: { 'x-api-secret': process.env.APP_SECRET },
+      });
+      const { completed } = await res.json();
+      for (const { text, channel } of (completed ?? [])) {
+        await app.client.chat.postMessage({ channel, text });
+        console.log(`[batch:poll] delivered draft to ${channel}`);
+      }
+    } catch (err) {
+      console.error('[batch:poll] poll failed:', err.message);
+    }
+  }, 60_000);
+}

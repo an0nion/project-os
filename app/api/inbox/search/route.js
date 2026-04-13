@@ -22,12 +22,12 @@ export async function GET(req) {
 
   if (!q) return NextResponse.json({ error: 'q required' }, { status: 400 });
 
-  // Search items table (title ILIKE) and inbox_log (summary ILIKE), merge, deduplicate
+  // Search items table (title/subtitle/notes ILIKE) and inbox_log (summary ILIKE), merge, deduplicate
   const [itemsRes, logRes] = await Promise.all([
     supabase
       .from('items')
-      .select('id, title, project_key, url, created_at')
-      .ilike('title', `%${q}%`)
+      .select('id, title, subtitle, notes, project_key, url, created_at')
+      .or(`title.ilike.%${q}%,subtitle.ilike.%${q}%,notes.ilike.%${q}%`)
       .order('created_at', { ascending: false })
       .limit(limit),
 
@@ -47,7 +47,9 @@ export async function GET(req) {
     if (seen.has(key)) continue;
     seen.add(key);
     results.push({
+      id:       row.id,
       title:    row.title,
+      subtitle: row.subtitle ?? null,
       project:  row.project_key,
       url:      row.url ?? null,
       saved_at: row.created_at,
