@@ -257,6 +257,36 @@ async function createCalendarEventWithPrefs({ title, date, colorId, description 
 }
 
 // ── Process a single reminder task ───────────────────────────────────────────
+// ── Transactional inbox→calendar save for reminders ──────────────────────────
+// Inbox first, then calendar. If calendar fails, the items row stays with
+// calendar_event_id IS NULL so the backfill cron (Unit 6) can retry without
+// leaving an orphan calendar event paired to no task.
+// Returns { ok, inboxId, calCreated, message } — caller emits `message`.
+async function saveReminderTransactional({ title, originalText, date, colorId, project, timelineLabel }) {
+  let inboxId;
+  try {
+    const data = await callInbox({ text: originalText, title, source: 'slack', project, timeline: timelineLabel });
+    inboxId = data.itemId ?? null;
+  } catch (err) {
+    console.error('[reminder] inbox save failed:', err.message);
+    return { ok: false, message: "couldn't save that — try again" };
+  }
+
+  const calendarEnabled = process.env.CALENDAR_ENABLED === 'true' && !!date;
+  let calCreated = false;
+  if (calendarEnabled) {
+    try {
+      calCreated = await createCalendarEventWithPrefs({ title, date, colorId, description: originalText, inboxId });
+    } catch (err) { console.error('[calendar] event creation failed (network):', err.message); }
+  }
+
+  let suffix = '';
+  if (calCreated)            suffix = ' · added to calendar';
+  else if (calendarEnabled)  suffix = ' · saved to inbox; calendar create failed — will retry later';
+
+  return { ok: true, inboxId, calCreated, message: `📅 ${title} · ${timelineLabel}${suffix}` };
+}
+
 // cls.title is the AI-extracted clean title from classifyIntent — no extra call needed.
 // If timeline is present → create calendar event immediately.
 // If no timeline → ask "when is X?" and wait for reminderMode reply.
@@ -267,14 +297,15 @@ async function processReminderTask(cls, channel, userId, say, deferredQueue = []
   if (cls.timeline) {
     const date    = await parseTimelineToDate(cls.timeline);
     const colorId = pickColorId(cls.project_hint ?? 'personal', reminderTitle);
-    let calCreated = false;
-
-    if (process.env.CALENDAR_ENABLED === 'true' && date) {
-      try {
-        calCreated = await createCalendarEventWithPrefs({ title: reminderTitle, date, colorId, description: cls.title ?? reminderTitle });
-      } catch (err) { console.error('[calendar] event creation failed (network):', err.message); }
-    }
-    await reply(channel, `📅 ${reminderTitle} · ${cls.timeline}${calCreated ? ' · added to calendar' : ''}`);
+    const result  = await saveReminderTransactional({
+      title:         reminderTitle,
+      originalText:  cls.title ?? reminderTitle,
+      date,
+      colorId,
+      project:       cls.project_hint ?? 'personal',
+      timelineLabel: cls.timeline,
+    });
+    await reply(channel, result.message);
     await processNextDeferred(userId, channel, say, deferredQueue);
 
   } else {
@@ -321,7 +352,7 @@ function buildModeCtx({ message, userId, userText, say }) {
     // State
     pending, lastSaved, setLastSaved,
     // API calls
-    callInbox, callCorrect, createCalendarEventWithPrefs,
+    callInbox, callCorrect, createCalendarEventWithPrefs, saveReminderTransactional,
     // Parsing
     parseTimelineToDate, pickColorId,
     parseProjectKey, parseTodoReply, parseSoftCheckInReply,
