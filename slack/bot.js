@@ -110,9 +110,11 @@ Examples given current date ${nowStr.split(' ')[0]}:
 }
 
 // ── Deduplication ─────────────────────────────────────────────────────────────
+// Persistent across bot restarts (Supabase-backed) — prevents reprocessing
+// Slack events replayed by Socket Mode reconnects mid-restart.
 const _dedup = new Deduplicator({ maxSize: 200, ttlSeconds: 90 });
-function isDuplicate(message) {
-  return _dedup.isDuplicate(message.client_msg_id ?? message.ts);
+async function isDuplicate(message) {
+  return _dedup.seen(message.client_msg_id ?? message.ts);
 }
 
 // ── Pending clarification (write-through: in-memory + Supabase via Vercel proxy) ──
@@ -336,7 +338,7 @@ app.message(async ({ message, say }) => {
   if (message.channel_type !== 'im') return;
   if (message.subtype) return;
   if (message.bot_id)  return;
-  if (isDuplicate(message)) return;
+  if (await isDuplicate(message)) return;
 
   const userId   = message.user;
   const urls     = extractUrls(message);
