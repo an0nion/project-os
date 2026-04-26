@@ -1,52 +1,56 @@
 /**
- * App-wide password protection.
+ * App-wide auth gate.
  *
- * - All pages and API routes require either:
- *     a) a valid `session` cookie (set after correct password)
- *     b) a valid `x-api-secret` header (for Slack bot / cron callers)
- * - /api/login is always public (the login endpoint itself)
- * - Static assets (_next/*) are always public
+ * Routes through `lib/auth.js` so the middleware uses the same checks the
+ * route handlers do. For /api/* paths we accept EITHER a valid session
+ * cookie (browser users) OR a valid `x-api-secret` header (Slack bot, cron).
+ * For page paths we require a session cookie and otherwise redirect to /login.
+ *
+ * Public paths: /api/login, /login, static assets.
  */
 
 import { NextResponse } from 'next/server';
+import { requireAuth, unauthorizedBody } from './lib/auth.js';
 
-const PUBLIC_PATHS = [
+const PUBLIC_PATHS = new Set([
   '/api/login',
+  '/api/logout',
   '/login',
-];
+]);
 
-export function middleware(req) {
-  const { pathname } = req.nextUrl;
-
-  // Always allow static assets and public paths
-  if (
+function isPublicAsset(pathname) {
+  return (
     pathname.startsWith('/_next') ||
     pathname.startsWith('/favicon') ||
     pathname.startsWith('/icons') ||
-    pathname.startsWith('/manifest') ||
-    PUBLIC_PATHS.includes(pathname)
-  ) {
+    pathname.startsWith('/manifest')
+  );
+}
+
+export async function middleware(req) {
+  const { pathname } = req.nextUrl;
+
+  if (isPublicAsset(pathname) || PUBLIC_PATHS.has(pathname)) {
     return NextResponse.next();
   }
 
-  // Allow API calls with the correct secret header (Slack bot, cron, etc.)
-  const apiSecret = req.headers.get('x-api-secret');
-  if (apiSecret && apiSecret === process.env.APP_SECRET) {
-    return NextResponse.next();
+  const isApi = pathname.startsWith('/api/');
+
+  // API routes: accept apiSecret header OR session cookie.
+  if (isApi) {
+    const headerCheck = await requireAuth(req, { kind: 'apiSecret' });
+    if (headerCheck.ok) return NextResponse.next();
+
+    const sessionCheck = await requireAuth(req, { kind: 'session' });
+    if (sessionCheck.ok) return NextResponse.next();
+
+    return NextResponse.json(unauthorizedBody(), { status: 401 });
   }
 
-  // Allow requests with valid session cookie
-  const session = req.cookies.get('session')?.value;
-  if (session && session === process.env.APP_SECRET) {
-    return NextResponse.next();
-  }
+  // Page routes: must have a valid session cookie.
+  const sessionCheck = await requireAuth(req, { kind: 'session' });
+  if (sessionCheck.ok) return NextResponse.next();
 
-  // API routes: return 401 JSON
-  if (pathname.startsWith('/api/')) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
-
-  // Pages: redirect to login
   const loginUrl = new URL('/login', req.url);
   loginUrl.searchParams.set('next', pathname);
   return NextResponse.redirect(loginUrl);

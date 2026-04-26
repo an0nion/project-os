@@ -5,7 +5,11 @@
  * so lib/pendingStore.js calls these endpoints to persist/restore session state
  * across PM2 restarts.
  *
- * Auth: x-api-secret header (same pattern as /api/costs/log)
+ * Auth: x-api-secret header via lib/auth.js (kind: 'apiSecret').
+ *
+ * NOTE: this table (`bot_sessions`) is unrelated to browser session cookies.
+ * Browser sessions live in `session_tokens` and are managed by /api/login,
+ * /api/logout, and lib/auth.js.
  *
  * GET    /api/sessions              → { sessions: [{ user_id, state }] }  (all non-expired)
  * GET    /api/sessions?userId=<id>  → { state: object | null }
@@ -13,22 +17,23 @@
  * DELETE /api/sessions?userId=<id>  → { ok: true }
  */
 
-import { NextResponse } from 'next/server';
-import { supabase }     from '../../../lib/supabase.js';
+import { NextResponse }                  from 'next/server';
+import { supabase }                      from '../../../lib/supabase.js';
+import { requireAuth, unauthorizedBody } from '../../../lib/auth.js';
 
-function authCheck(req) {
-  const secret = req.headers.get('x-api-secret');
-  return secret && secret === process.env.APP_SECRET;
+async function gate(req) {
+  const r = await requireAuth(req, { kind: 'apiSecret' });
+  if (!r.ok) return NextResponse.json(unauthorizedBody(), { status: 401 });
+  return null;
 }
 
 export async function GET(req) {
-  if (!authCheck(req)) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const fail = await gate(req); if (fail) return fail;
 
   const userId = new URL(req.url).searchParams.get('userId');
   const now    = new Date().toISOString();
 
   if (userId) {
-    // Single session lookup
     const { data } = await supabase
       .from('bot_sessions')
       .select('state')
@@ -39,7 +44,6 @@ export async function GET(req) {
     return NextResponse.json({ state: data?.state ?? null });
   }
 
-  // Bulk hydration — return all non-expired sessions
   const { data } = await supabase
     .from('bot_sessions')
     .select('user_id, state')
@@ -49,10 +53,12 @@ export async function GET(req) {
 }
 
 export async function POST(req) {
-  if (!authCheck(req)) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const fail = await gate(req); if (fail) return fail;
 
   const { userId, state, ttlSeconds = 3600 } = await req.json().catch(() => ({}));
-  if (!userId || !state) return NextResponse.json({ error: 'userId and state required' }, { status: 400 });
+  if (!userId || !state) {
+    return NextResponse.json({ error: 'userId and state required' }, { status: 400 });
+  }
 
   const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
 
@@ -67,12 +73,11 @@ export async function POST(req) {
 }
 
 export async function DELETE(req) {
-  if (!authCheck(req)) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  const fail = await gate(req); if (fail) return fail;
 
   const userId = new URL(req.url).searchParams.get('userId');
   if (!userId) return NextResponse.json({ error: 'userId required' }, { status: 400 });
 
   await supabase.from('bot_sessions').delete().eq('user_id', userId);
-
   return NextResponse.json({ ok: true });
 }
