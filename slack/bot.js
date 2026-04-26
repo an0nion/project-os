@@ -7,6 +7,13 @@
  *   - Ask ONE question max, not two steps
  *   - Responses sound like a person, not a notification system
  *   - Silent on success unless there's something worth saying
+ *
+ * Architecture (post Unit 1a):
+ *   - Pure helpers live in lib/botHelpers.js (importable + testable)
+ *   - Multi-step pending modes live in lib/botModes/{reminder,learning,correction}.js
+ *   - This file is the entry point: Slack event → dedup → dispatch → reply
+ *   - Top-level try/catch in the message handler ALWAYS clears pending on
+ *     failure so a thrown error doesn't strand a user mid-conversation.
  */
 
 import 'dotenv/config';
@@ -16,12 +23,16 @@ import { webSearch } from '../lib/search.js';
 import { pickColorId } from '../lib/calendar.js';
 import { PROJECT_KEYS, VALID_INTENTS, INTENT_SYSTEM_PROMPT } from '../lib/intentPrompt.js';
 import { parseContext, parseProjectKey, parseReminderMins, parseDurationMins, parseTodoReply, parseSoftCheckInReply, parseYesNo } from '../lib/naturalParser.js';
-import { logCost } from '../lib/costLog.js';
+import { logCostViaApi } from '../lib/vmCostLogger.js';
 import { Deduplicator } from '../lib/deduplicator.js';
 import PendingStore from '../lib/pendingStore.js';
 import { loadQuota } from '../lib/geminiQuota.js';
 import { classifyTier } from '../lib/tierClassifier.js';
 import { compressHistory } from '../lib/conversationManager.js';
+import {
+  buildSuccessMessage, buildEnrichedText, extractUrls, normaliseTask,
+} from '../lib/botHelpers.js';
+import { dispatchPending } from '../lib/botIntents.js';
 
 const { App } = bolt;
 
@@ -71,7 +82,7 @@ Examples given current date ${nowStr.split(' ')[0]}:
       messages: [{ role: 'user', content: timeline }],
       maxTokens: 60,
     });
-    logCost(result.modelKey, result.usage, { reason: 'timeline_parse' });
+    logCostViaApi(result.modelKey, result.usage, 'timeline_parse');
 
     const raw    = result.text?.trim() ?? '';
     const json   = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
@@ -118,22 +129,7 @@ function setLastSaved(userId, data) {
 
 // ── AI Intent Classifier ──────────────────────────────────────────────────────
 // PROJECT_KEYS, VALID_INTENTS, INTENT_SYSTEM_PROMPT imported from lib/intentPrompt.js
-
-function normaliseTask(t) {
-  const tier = t.priority_tier;
-  return {
-    intent:              VALID_INTENTS.includes(t.intent) ? t.intent : 'save',
-    title:               typeof t.title === 'string' && t.title.trim() ? t.title.trim() : null,
-    timeline:            typeof t.timeline === 'string' && t.timeline.trim() ? t.timeline.trim() : null,
-    context:             t.context             ?? null,
-    project_hint:        PROJECT_KEYS.includes(t.project_hint) ? t.project_hint : null,
-    priority_tier:       (Number.isInteger(tier) && tier >= 1 && tier <= 4) ? tier : null,
-    needs_clarification: t.needs_clarification === true,
-    corrected_project:   t.corrected_project   ?? null,
-    recall_topic:        typeof t.recall_topic === 'string' && t.recall_topic.trim() ? t.recall_topic.trim() : null,
-    search_query:        typeof t.search_query === 'string' && t.search_query.trim() ? t.search_query.trim() : null,
-  };
-}
+// normaliseTask, buildSuccessMessage, buildEnrichedText, extractUrls — from lib/botHelpers.js
 
 // Returns an array of task objects — always at least one.
 async function classifyIntent(text, urls) {
@@ -156,7 +152,7 @@ async function classifyIntent(text, urls) {
       maxTokens: 300,
     });
 
-    logCost(result.modelKey, result.usage, { reason: 'intent_classification' });
+    logCostViaApi(result.modelKey, result.usage, 'intent_classification');
 
     const raw    = result.text?.trim() ?? '';
     const json   = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
@@ -229,80 +225,6 @@ async function callInbox(body) {
   if (!text.startsWith('{')) throw new Error(`Non-JSON response (${res.status}) — check APP_SECRET`);
   return JSON.parse(text);
 }
-
-// ── URL extraction (http/https only — ignore mailto:, tel:, etc.) ─────────────
-function extractUrls(message) {
-  const urls = [];
-  const urlRegex = /https?:\/\/[^\s<>|]+/g;
-  if (message.text) urls.push(...(message.text.match(urlRegex) ?? []));
-  if (message.blocks) {
-    const walk = els => {
-      for (const el of els ?? []) {
-        if (el.type === 'link' && el.url?.startsWith('http')) urls.push(el.url);
-        if (el.elements) walk(el.elements);
-      }
-    };
-    message.blocks.forEach(b => walk(b.elements));
-  }
-  if (message.attachments) {
-    for (const a of message.attachments) {
-      if (a.original_url?.startsWith('http')) urls.push(a.original_url);
-      if (a.from_url?.startsWith('http'))     urls.push(a.from_url);
-      if (a.title_link?.startsWith('http'))   urls.push(a.title_link);
-    }
-  }
-  return [...new Set(urls)].filter(u =>
-    !u.includes('slack.com') && !u.includes('slack-edge.com')
-  );
-}
-
-// ── Minimal success reply ─────────────────────────────────────────────────────
-// One line, embedded link, no buttons, no blocks.
-// Format: "📚 <url|Title> · 1-2 months"
-function buildSuccessMessage(data, cls) {
-  const projectEmoji = {
-    personal:      '🗓️',
-    learning_tech: '📚',
-    work:          '💼',
-    school:        '🎓',
-    research_apps: '🔬',
-    baking:        '🍞',
-    beadwork:      '📿',
-    art:           '🎨',
-    reading:       '📖',
-    exercise:      '💪',
-    circuitry:     '⚡',
-  }[data.project] ?? '📁';
-
-  const appUrl = `${process.env.APP_URL}/project/${data.project}`;
-
-  // Clean title: strip newlines, emoji codes, chars that break Slack link syntax
-  const rawTitle = data.summary ?? '';
-  const cleanTitle = rawTitle
-    .replace(/\n|\r/g, ' ')
-    .replace(/:[a-z_]+:/g, '')
-    .replace(/[<>|]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 60);
-
-  const parts = [];
-  if (cleanTitle) parts.push(`<${appUrl}|${cleanTitle}>`);
-  if (cls?.timeline) parts.push(cls.timeline);
-
-  return `${projectEmoji} ${parts.join(' · ') || 'saved'}`;
-}
-
-// ── Build enriched text for routing context ───────────────────────────────────
-function buildEnrichedText(context, timeline, text, url) {
-  const parts = [];
-  if (context === 'work')     parts.push('[Work]');
-  if (context === 'personal') parts.push('[Personal]');
-  if (text && text !== url)   parts.push(text.replace(url ?? '', '').trim());
-  if (timeline)               parts.push(`— ${timeline}`);
-  return parts.filter(Boolean).join(' ');
-}
-
 
 // ── Post a clean one-liner (no link unfurls) ──────────────────────────────────
 async function reply(channel, text) {
@@ -386,6 +308,29 @@ async function processNextDeferred(userId, channel, say, queue) {
   }
 }
 
+// Build the ctx object passed to extracted mode handlers in lib/botModes/.
+// Every mode handler receives the same shape — kept here so callers don't have
+// to re-thread dependencies and modes don't import slack-specific runtime.
+function buildModeCtx({ message, userId, userText, say }) {
+  return {
+    // Slack runtime
+    message, userId, userText, say,
+    reply,
+    // State
+    pending, lastSaved, setLastSaved,
+    // API calls
+    callInbox, callCorrect, createCalendarEventWithPrefs,
+    // Parsing
+    parseTimelineToDate, pickColorId,
+    parseProjectKey, parseTodoReply, parseSoftCheckInReply,
+    // AI
+    callModelWithFallback, logCostViaApi,
+    classifyTier, compressHistory,
+    // Flow
+    processNextDeferred,
+  };
+}
+
 // ── Main listener ─────────────────────────────────────────────────────────────
 app.message(async ({ message, say }) => {
   if (message.channel_type !== 'im') return;
@@ -396,6 +341,31 @@ app.message(async ({ message, say }) => {
   const userId   = message.user;
   const urls     = extractUrls(message);
   const userText = message.text ?? '';
+
+  // ── Top-level error boundary ─────────────────────────────────────────────
+  // Any unhandled throw inside the dispatch tree below would otherwise leave
+  // pending state intact and the user mid-conversation with a bot that no
+  // longer responds. Always clear pending on error and send a recovery reply.
+  try {
+    await handleMessage({ message, userId, urls, userText, say });
+  } catch (err) {
+    console.error('[bot:handleMessage] unhandled error:', err);
+    try {
+      pending.delete(userId);
+    } catch (cleanupErr) {
+      console.error('[bot:handleMessage] pending cleanup failed:', cleanupErr.message);
+    }
+    try {
+      await say("Something went wrong on my end — your last message wasn't saved. Try again?");
+    } catch (sayErr) {
+      console.error('[bot:handleMessage] recovery reply failed:', sayErr.message);
+    }
+  }
+});
+
+// Inner handler — kept as a separate function so the message-handler wrapper
+// above can do its try/catch cleanly without nesting.
+async function handleMessage({ message, userId, urls, userText, say }) {
 
   // ── Handle pending states first (no AI needed, user is answering a specific question) ──
 
@@ -506,271 +476,10 @@ app.message(async ({ message, say }) => {
       return;
     }
 
-    // Correction mode: "which project did you mean?"
-    if (state.correctionMode) {
-      const proj = await parseProjectKey(userText);
-      if (!proj) {
-        const reaskCount = (state.correctionStep ?? 0) + 1;
-        if (reaskCount >= 2) {
-          // Gave up — just confirm it stays where it is
-          pending.delete(userId);
-          await say(`ok, keeping it as-is`);
-          await processNextDeferred(userId, message.channel, say, state.deferredQueue);
-          return;
-        }
-        pending.set(userId, { ...state, correctionStep: reaskCount });
-        await say("didn't catch that — try: school, work, learning, research, art, baking, beads, circuits, reading, exercise, personal");
-        return;
-      }
-      pending.delete(userId);
-      await callCorrect(state.logId, proj, userText);
-      lastSaved.delete(userId);
-      await say(`moved to ${proj} ✓`);
-      await processNextDeferred(userId, message.channel, say, state.deferredQueue);
-      return;
-    }
-
-    // Reminder date prompt — user is answering "when is this?"
-    if (state.reminderMode) {
-      const isToDoReply = await parseTodoReply(userText);
-
-      if (isToDoReply) {
-        // Save to personal Kanban, no calendar
-        pending.delete(userId);
-        try {
-          const data = await callInbox({
-            text:    state.reminderTitle,
-            title:   state.reminderTitle,
-            source:  'slack',
-            project: 'personal',
-          });
-          if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: state.reminderTitle });
-          await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${state.reminderTitle.slice(0, 60)}> · added to your to-do list`);
-          await processNextDeferred(userId, message.channel, say, state.deferredQueue);
-        } catch (err) { console.error('[bot:reminderMode:todoSave]', err.message); await say("couldn't save that"); }
-        return;
-      }
-
-      // User gave a date — parse it and route to calendar
-      const date = await parseTimelineToDate(userText) ?? await parseTimelineToDate(userText.replace(/^(on|at|by|this|next)\s+/i, ''));
-      if (!date) {
-        // Couldn't parse — re-ask once then save as to-do
-        const reask = (state.reminderReask ?? 0) + 1;
-        if (reask >= 2) {
-          pending.delete(userId);
-          try {
-            await callInbox({ text: state.reminderTitle, title: state.reminderTitle, source: 'slack', project: 'personal' });
-            await reply(message.channel, `🗓️ <${process.env.APP_URL}/project/personal|${state.reminderTitle.slice(0, 60)}> · added to your to-do list`);
-            await processNextDeferred(userId, message.channel, say, state.deferredQueue);
-          } catch (err) { console.error('[bot:reminderMode:reaskSave]', err.message); await say("couldn't save that"); }
-          return;
-        }
-        pending.set(userId, { ...state, reminderReask: reask });
-        await say(`didn't catch a date — try "this Saturday", "13th", "in 2 weeks", or say *to do* to add to your list`);
-        return;
-      }
-
-      // Got a valid date — create calendar event with user preferences
-      pending.delete(userId);
-      const colorId = pickColorId('personal', state.originalText);
-      let calCreated = false;
-      if (process.env.CALENDAR_ENABLED === 'true') {
-        try {
-          calCreated = await createCalendarEventWithPrefs({ title: state.reminderTitle, date, colorId, description: state.originalText });
-        } catch (err) { console.error('[calendar] event creation failed (network):', err.message); }
-      }
-      await say(`📅 ${state.reminderTitle} · ${userText.trim()}${calCreated ? ' · added to calendar' : ''}`);
-      await processNextDeferred(userId, message.channel, say, state.deferredQueue);
-      return;
-    }
-
-    // Learning clarification mode — two-call architecture:
-    // Call 1: classify reply as "action" or "chat" — tiny JSON, 60 tokens, never truncates
-    // Call 2: if chat, conversational response with full history — plain text, 500 tokens
-    // History: each exchange is stored so Call 2 can answer follow-up questions correctly.
-    // Step cap: 8 chat turns before a soft check-in ("want me to save something?")
-    if (state.learningMode) {
-      const step    = state.step ?? 1;
-      const history = state.history ?? [];
-      let saveAsText = null;
-      let chatReply  = null;
-
-      // ── Build a clean, action-led Kanban title from the learning dialogue ────
-      // Format: "Implement linear probes for AI alignment" — sentence-case, natural English.
-      // Strips "I want to learn about / I want to" from the original topic.
-      // Passed as forcedTitle to /api/inbox so the AI title extractor is bypassed.
-      const buildLearningTitle = (action, topic) => {
-        // Strip common filler openers from the topic
-        const topicSlug = topic
-          .replace(/^i (want to learn about|want to understand|am learning about|want to)\s*/i, '')
-          .replace(/^(learn about|tell me about|explain|what is|what are)\s*/i, '')
-          .trim();
-        // Normalise action: strip "it", "the paper", etc. to get a clean verb
-        const verb = action
-          .replace(/\s+(it|the paper|more|about it|everything)$/i, '')
-          .trim() || 'Explore';
-        // Capitalise first letter; trim ensures no trailing space when topicSlug is empty
-        const title = `${verb.charAt(0).toUpperCase() + verb.slice(1)}${topicSlug ? ` ${topicSlug}` : ''}`;
-        return title.slice(0, 80);
-      };
-
-      // ── Soft check-in response: user replied to "shall I save?" prompt ─────
-      if (state.softCheckIn) {
-        const softReply = await parseSoftCheckInReply(userText);
-        if (softReply === 'decline') {
-          // Reset step to 5 so the next 3 turns allow chat before triggering check-in again at step=8
-          pending.set(userId, { ...state, softCheckIn: false, step: 5 });
-          await say(`all good — keep going`);
-          return;
-        }
-        // User said what to save (or anything non-negative) — save it
-        pending.delete(userId);
-        const saveText = userText.trim().slice(0, 60) || `Explore ${state.originalText.slice(0, 60)}`;
-        const title    = buildLearningTitle(saveText, state.originalText);
-        const enriched = `${saveText} — ${state.originalText.slice(0, 120)}`;
-        try {
-          const data = await callInbox({ text: enriched, title, source: 'slack', project: 'learning_tech' });
-          if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
-          await reply(message.channel, buildSuccessMessage(data, {}));
-          await processNextDeferred(userId, message.channel, say, state.deferredQueue);
-        } catch (err) { console.error('[bot:learningMode:softCheckInSave]', err.message); await say("couldn't save that"); }
-        return;
-      }
-
-      // ── Call 1: classify only — tiny JSON, never truncates ─────────────────
-      let classifyType = null;
-      try {
-        const classifyResult = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
-          system: `You are classifying a reply in a learning dialogue about: "${state.originalText.slice(0, 150)}"
-The user was asked: "what do you want to do — read, implement, understand the theory, or write about it?"
-
-Return ONLY valid JSON, nothing else: {"type": "action"} or {"type": "chat"}
-
-type=action: reply is a short unambiguous task commitment. Examples:
-  "implement it" → action  |  "read the paper" → action  |  "write a summary" → action
-type=chat: everything else — user wants more info, is exploring, asking questions, or hasn't decided. When in doubt: chat.`,
-          messages: [{ role: 'user', content: userText }],
-          maxTokens: 60,
-        });
-        logCost(classifyResult.modelKey, classifyResult.usage, { reason: 'learning_classify' });
-        const raw    = classifyResult.text?.trim() ?? '';
-        const parsed = JSON.parse(raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim());
-        classifyType = parsed?.type ?? null;
-      } catch (err) {
-        console.error('[learningMode] classify call failed:', err.message);
-      }
-
-      // ── Decide based on classification ────────────────────────────────────
-      if (classifyType === 'action') {
-        // Async batch path: longer drafts go to Anthropic Batch API (50% cost, non-blocking)
-        const isDraft = /\b(draft|write|outline|summarize|study.?plan|write.?up)\b/i.test(userText);
-        if (isDraft && process.env.APP_URL) {
-          try {
-            await fetch(`${process.env.APP_URL}/api/batch/submit`, {
-              method:  'POST',
-              headers: { 'Content-Type': 'application/json', 'x-api-secret': process.env.APP_SECRET },
-              body:    JSON.stringify({
-                jobs: [{
-                  system:    `You are a knowledgeable research companion. The user has been exploring: "${state.originalText.slice(0, 150)}". Write a thorough, well-structured response to their request. Use headers and bullet points where appropriate. Be specific and actionable.`,
-                  messages:  [...history, { role: 'user', content: userText }],
-                  maxTokens: 2000,
-                }],
-                projectKey:      'learning_tech',
-                deliveryUserId:  userId,
-                deliveryChannel: message.channel,
-              }),
-            });
-            pending.delete(userId);
-            await say(`on it — I'll send you the draft shortly ✦`);
-            return;
-          } catch (err) {
-            console.error('[learningMode] batch submit failed, falling back:', err.message);
-            // Fall through to synchronous save path
-          }
-        }
-        saveAsText = userText.trim().slice(0, 60);
-
-      } else if (classifyType === 'chat' && step < 8) {
-        // ── Call 2: conversational response — tier-routed for depth ──────────
-        const tier = classifyTier(userText, {
-          projectKey:  'learning_tech',
-          messageCount: step,
-          isEscalated:  state.isEscalated ?? false,
-        });
-        if (tier.tier === 3) console.log(`[bot:learningMode] Tier 3 — ${tier.reason}`);
-
-        // Compress history before Tier 3 (Opus) calls to cap input cost
-        const rawHistory = [...history, { role: 'user', content: userText }];
-        const callHistory = tier.tier === 3
-          ? await compressHistory(rawHistory)
-          : rawHistory;
-
-        try {
-          const explainResult = await callModelWithFallback(tier.primaryModel, tier.fallbackModel, {
-            system: `You are a knowledgeable research companion in an ongoing Slack conversation.
-Topic the user is exploring: "${state.originalText.slice(0, 150)}"
-
-Rules:
-- Do NOT re-introduce or define the topic from scratch — respond directly to what the user just said.
-- Match length to the user's question: short exploratory question → 2-3 sentences max. Detailed technical question → up to 5-6 sentences. Default to shorter.
-- Be specific: cite real papers, researchers, findings by name when you know them. Mention them naturally, not as a list.
-- Write like a colleague: no "Great question!", no textbook openers, no bullet points, no headers.
-- End with a specific observation or question that opens the next line of inquiry. Not a menu of options.
-- Plain text only.`,
-            messages: callHistory,
-            maxTokens: tier.maxTokens,
-          });
-          logCost(explainResult.modelKey, explainResult.usage, { reason: 'learning_explain' });
-          chatReply = explainResult.text?.trim() ?? null;
-        } catch (err) {
-          console.error('[learningMode] explain call failed:', err.message);
-        }
-
-      } else if (classifyType === 'chat' && step >= 8) {
-        // Soft check-in: 8 turns is a solid conversation — offer to save without forcing
-        const shortTopic = state.originalText.slice(0, 60);
-        pending.set(userId, { ...state, softCheckIn: true });
-        await say(`We've been deep in ${shortTopic} for a while — want me to save something specific to your Learning board so you can come back to it? If so, just say what you'd like to capture.`);
-        return;
-
-      } else if (classifyType === null && step >= 3) {
-        // AI failed multiple times — save generic rather than loop forever
-        saveAsText = `Explore and learn about ${state.originalText.slice(0, 60)}`;
-      }
-
-      if (chatReply) {
-        const newHistory = [
-          ...history,
-          { role: 'user', content: userText },
-          { role: 'assistant', content: chatReply },
-        ];
-        const nowEscalated = (tier?.tier ?? 0) === 3;
-        pending.set(userId, { ...state, step: step + 1, history: newHistory, isEscalated: nowEscalated }, 14400);
-        await say(chatReply);
-        return;
-      }
-
-      if (!saveAsText) {
-        pending.set(userId, { ...state, step: step + 1 });
-        await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
-        return;
-      }
-
-      // Save the clean task
-      pending.delete(userId);
-      const title    = buildLearningTitle(saveAsText, state.originalText);
-      const enriched = `${saveAsText} — ${state.originalText.slice(0, 120)}`;
-      try {
-        const data = await callInbox({ text: enriched, title, source: 'slack', project: 'learning_tech' });
-        if (data.logId) setLastSaved(userId, { logId: data.logId, project: data.project, title: data.summary });
-        await reply(message.channel, buildSuccessMessage(data, {}));
-        await processNextDeferred(userId, message.channel, say, state.deferredQueue);
-      } catch (err) {
-        console.error('[bot:learningMode:finalSave]', err.message);
-        await say("couldn't save that");
-      }
-      return;
-    }
+    // Extracted modes: correction / reminder / learning live in lib/botModes/.
+    // dispatchPending returns true if it routed; bot.js continues only if false.
+    const ctx = buildModeCtx({ message, userId, userText, say });
+    if (await dispatchPending(state, ctx)) return;
 
     // Search mode: "no link — want me to search? (y/n)"
     if (state.searchMode) {
@@ -1023,7 +732,7 @@ Rules:
               messages: [{ role: 'user', content: `Query: "${topic}"\nItems: ${JSON.stringify(results.slice(0, 10).map(r => ({ id: r.id, title: r.title, subtitle: r.subtitle })))}` }],
               maxTokens: 300,
             });
-            logCost(rankResult.modelKey, rankResult.usage, { reason: 'recall_rerank' });
+            logCostViaApi(rankResult.modelKey, rankResult.usage, 'recall_rerank');
             const ranked = JSON.parse(rankResult.text.replace(/```json\n?|```/g, '').trim());
             const reranked = ranked
               .map(r => ({ ...(results.find(x => x.id === r.id) ?? {}), _why: r.why }))
@@ -1152,7 +861,7 @@ Rules:
       await say(`what do you want to do with this — read, implement something, understand the theory, or write about it?`);
     }
   }
-});
+}
 
 // ── Deadline nudge (called externally by cron/scheduler) ─────────────────────
 export async function sendSlackDeadlineNudge(slackUserId, apps) {
