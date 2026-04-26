@@ -3,29 +3,39 @@
  * Internal endpoint — lets the Slack bot log AI call costs without importing
  * supabase directly (which crashes on startup if SUPABASE_URL isn't in VM .env).
  *
- * Auth: x-api-secret header validated against COST_LOG_SECRET (preferred).
+ * Auth: x-api-secret header validated via lib/auth.js (kind 'costLog').
  * Older bot deploys still send APP_SECRET — lib/auth.js accepts it as a
  * deprecated fallback and emits a one-time warning. Once VM .env has been
  * rotated to COST_LOG_SECRET, the fallback can be removed.
  *
- * Body: { modelKey, usage: { input_tokens, output_tokens }, reason?, projectKey? }
+ * Body: see lib/schemas.js#CostsLogPost
  */
 
-import { NextResponse }                  from 'next/server';
-import { logCost }                       from '../../../../lib/costTracker.js';
-import { requireAuth, unauthorizedBody } from '../../../../lib/auth.js';
+import { logCost }      from '../../../../lib/costTracker.js';
+import { requireAuth }  from '../../../../lib/auth.js';
+import { ok, fail }     from '../../../../lib/apiResponse.js';
+import { CostsLogPost } from '../../../../lib/schemas.js';
+import { ValidationError, AuthError } from '../../../../lib/errors.js';
+import { log }          from '../../../../lib/log.js';
 
 export async function POST(req) {
-  const auth = await requireAuth(req, { kind: 'costLog' });
-  if (!auth.ok) {
-    return NextResponse.json(unauthorizedBody(), { status: 401 });
-  }
+  try {
+    const auth = await requireAuth(req, { kind: 'costLog' });
+    if (!auth.ok) throw new AuthError(auth.reason ?? 'Unauthorized');
 
-  const { modelKey, usage, reason, projectKey } = await req.json();
-  if (!modelKey || !usage) {
-    return NextResponse.json({ error: 'modelKey and usage required' }, { status: 400 });
-  }
+    let body;
+    try { body = await req.json(); }
+    catch { throw new ValidationError('Invalid JSON'); }
 
-  await logCost(modelKey, usage, { reason, projectKey });
-  return NextResponse.json({ ok: true });
+    const parsed = CostsLogPost.safeParse(body);
+    if (!parsed.success) throw new ValidationError('Bad request', parsed.error.format());
+
+    const { modelKey, usage, reason, projectKey } = parsed.data;
+
+    await logCost(modelKey, usage, { reason, projectKey });
+    return ok({ ok: true });
+  } catch (err) {
+    log.error('costs:log', 'failed', { err: err.message });
+    return fail(err);
+  }
 }

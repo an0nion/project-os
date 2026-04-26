@@ -7,51 +7,55 @@
  * Returns: { completed: [{ text, channel, userId }] }
  */
 
-import { NextResponse }        from 'next/server';
 import { pollPendingBatches }  from '../../../../lib/batchQueue.js';
 import { supabaseAdmin }       from '../../../../lib/supabase.js';
+import { ok, fail }            from '../../../../lib/apiResponse.js';
+import { AuthError }           from '../../../../lib/errors.js';
+import { log }                 from '../../../../lib/log.js';
 
 export async function GET(req) {
-  const secret = req.headers.get('x-api-secret');
-  if (!secret || secret !== process.env.APP_SECRET) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
-
-  const newlyCompleted = await pollPendingBatches();
-  if (!newlyCompleted?.length) {
-    return NextResponse.json({ completed: [] });
-  }
-
-  const db = supabaseAdmin();
-  const completed = [];
-
-  for (const { job, results } of newlyCompleted) {
-    // Extract delivery info from the first job's metadata
-    const meta = Array.isArray(job.metadata) ? job.metadata[0] : job.metadata;
-    const deliveryChannel = meta?.deliveryChannel;
-    const deliveryUserId  = meta?.deliveryUserId;
-
-    if (!deliveryChannel) continue;
-
-    // Concatenate all result texts (usually just one job per batch for draft use case)
-    const texts = results
-      .filter(r => r.result?.type === 'succeeded')
-      .map(r => r.result.message?.content?.filter(b => b.type === 'text').map(b => b.text).join('\n') ?? '')
-      .filter(Boolean);
-
-    if (!texts.length) continue;
-
-    const text = texts.join('\n\n---\n\n');
-
-    // Mark as delivered so we don't re-deliver on next poll
-    try {
-      await db.from('batch_jobs').update({ status: 'delivered' }).eq('id', job.id);
-    } catch (err) {
-      console.error('[batch:poll] failed to mark delivered:', err.message);
+  try {
+    const secret = req.headers.get('x-api-secret');
+    if (!secret || secret !== process.env.APP_SECRET) {
+      throw new AuthError();
     }
 
-    completed.push({ text, channel: deliveryChannel, userId: deliveryUserId });
-  }
+    const newlyCompleted = await pollPendingBatches();
+    if (!newlyCompleted?.length) {
+      return ok({ completed: [] });
+    }
 
-  return NextResponse.json({ completed });
+    const db = supabaseAdmin();
+    const completed = [];
+
+    for (const { job, results } of newlyCompleted) {
+      const meta = Array.isArray(job.metadata) ? job.metadata[0] : job.metadata;
+      const deliveryChannel = meta?.deliveryChannel;
+      const deliveryUserId  = meta?.deliveryUserId;
+
+      if (!deliveryChannel) continue;
+
+      const texts = results
+        .filter(r => r.result?.type === 'succeeded')
+        .map(r => r.result.message?.content?.filter(b => b.type === 'text').map(b => b.text).join('\n') ?? '')
+        .filter(Boolean);
+
+      if (!texts.length) continue;
+
+      const text = texts.join('\n\n---\n\n');
+
+      try {
+        await db.from('batch_jobs').update({ status: 'delivered' }).eq('id', job.id);
+      } catch (e) {
+        log.warn('batch:poll', 'mark_delivered_failed', { err: e.message });
+      }
+
+      completed.push({ text, channel: deliveryChannel, userId: deliveryUserId });
+    }
+
+    return ok({ completed });
+  } catch (err) {
+    log.error('batch:poll', 'failed', { err: err.message });
+    return fail(err);
+  }
 }

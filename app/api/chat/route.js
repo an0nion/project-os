@@ -12,34 +12,40 @@
  *   7. Call primary model, auto-fallback to secondary
  *   8. Log cost
  *   9. Save assistant response
- *  10. Return { message, tier, model, provider, cached, reason, usage, cost, isEscalated, latencyMs }
+ *  10. Return chat envelope
  *
  * Accepts two body formats:
  *   Flat:  { projectKey, message, conversationHistory?, isEscalated? }
  *   Array: { messages[], projectKey?, appId?, questionId?, isEscalated? }
  */
 
-import { NextResponse }              from 'next/server';
 import { classifyTier }              from '../../../lib/tierClassifier.js';
 import { callModelWithFallback }     from '../../../lib/multiModelClient.js';
 import { compressHistory }           from '../../../lib/conversationManager.js';
 import { buildSystemPrompt }         from '../../../lib/buildSystemPrompt.js';
 import { logCost, calculateCost }    from '../../../lib/costLog.js';
 import { PROJECTS }                  from '../../../lib/projects.js';
-import { MODELS }                    from '../../../lib/models.js';
 import { supabase, getMessages, addMessage, getProfile, getTasks } from '../../../lib/supabase.js';
+import { ok, fail }                  from '../../../lib/apiResponse.js';
+import { ChatPost }                  from '../../../lib/schemas.js';
+import { ValidationError }           from '../../../lib/errors.js';
+import { log }                       from '../../../lib/log.js';
 
 export async function POST(req) {
   const startTime = Date.now();
 
   try {
-    const body = await req.json();
+    let body;
+    try { body = await req.json(); }
+    catch { throw new ValidationError('Invalid JSON'); }
+
+    const parsed = ChatPost.safeParse(body);
+    if (!parsed.success) throw new ValidationError('Bad request', parsed.error.format());
 
     // ── 1. Normalise input ──────────────────────────────────────────────────
     let messages, projectKey, appId, questionId, isEscalated;
 
     if (body.message !== undefined) {
-      // Flat format: { projectKey, message, conversationHistory?, isEscalated? }
       projectKey   = body.projectKey   ?? null;
       appId        = body.appId        ?? null;
       questionId   = body.questionId   ?? null;
@@ -49,14 +55,11 @@ export async function POST(req) {
         { role: 'user', content: String(body.message) },
       ];
     } else {
-      // Array format: { messages[], projectKey?, appId?, questionId?, isEscalated? }
       ({ messages, projectKey, appId, questionId } = body);
       isEscalated = body.isEscalated ?? false;
     }
 
-    if (!messages?.length) {
-      return NextResponse.json({ error: 'messages required' }, { status: 400 });
-    }
+    if (!messages?.length) throw new ValidationError('messages required');
 
     const userMessage = messages[messages.length - 1].content;
 
@@ -81,7 +84,7 @@ export async function POST(req) {
     if (classification.tier === 0) {
       const reply = `Done. (${classification.reason})`;
       if (projectKey) await addMessage(projectKey, 'assistant', reply, { tier: 0 }).catch(() => {});
-      return NextResponse.json({
+      return ok({
         message: reply, reply, tier: 0, model: null, provider: null,
         reason: classification.reason, usage: null, cost: null,
         isEscalated: false, latencyMs: Date.now() - startTime,
@@ -91,7 +94,6 @@ export async function POST(req) {
     // ── 6. Build system prompt ──────────────────────────────────────────────
     const projectDef = PROJECTS.find(p => p.key === projectKey);
 
-    // Per-question context (goes into dynamic block, not cached)
     let dynamicContext = '';
     if (questionId) {
       const { data: question } = await supabase
@@ -126,7 +128,6 @@ export async function POST(req) {
       role:    m.role === 'system' ? 'user' : m.role,
       content: m.content,
     }));
-    // Include current message in compression window, then separate it out
     const compressedHistory = await compressHistory(historyMessages);
     const apiMessages = [...compressedHistory, { role: 'user', content: userMessage }];
 
@@ -168,7 +169,7 @@ export async function POST(req) {
       } catch { /* non-fatal */ }
     }
 
-    return NextResponse.json({
+    return ok({
       message:     result.text,
       reply:       result.text,
       tier:        classification.tier,
@@ -183,7 +184,7 @@ export async function POST(req) {
     });
 
   } catch (err) {
-    console.error('[Chat] Error:', err);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    log.error('chat', 'failed', { err: err.message });
+    return fail(err);
   }
 }
