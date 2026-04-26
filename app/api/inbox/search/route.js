@@ -2,9 +2,11 @@
  * GET /api/inbox/search?q=topic&limit=5
  * Full-text search across saved items and inbox log.
  * Used by the Slack bot recall intent.
+ *
+ * Soft-delete-aware: rows with deleted_at IS NOT NULL are hidden via lib/supabaseQuery.js.
  */
 
-import { supabase }         from '../../../../lib/supabase.js';
+import { selectFrom }       from '../../../../lib/supabaseQuery.js';
 import { ok, fail }         from '../../../../lib/apiResponse.js';
 import { InboxSearchQuery } from '../../../../lib/schemas.js';
 import { ValidationError, AuthError } from '../../../../lib/errors.js';
@@ -26,16 +28,16 @@ export async function GET(req) {
     const { q, limit } = parsed.data;
 
     const [itemsRes, logRes] = await Promise.all([
-      supabase
-        .from('items')
-        .select('id, title, subtitle, notes, project_key, url, created_at')
+      selectFrom('items', {
+        columns: 'id, title, subtitle, notes, project_key, url, created_at',
+      })
         .or(`title.ilike.%${q}%,subtitle.ilike.%${q}%,notes.ilike.%${q}%`)
         .order('created_at', { ascending: false })
         .limit(limit),
 
-      supabase
-        .from('inbox_log')
-        .select('id, summary, project, url, created_at')
+      selectFrom('inbox_log', {
+        columns: 'id, summary, project, url, created_at',
+      })
         .ilike('summary', `%${q}%`)
         .order('created_at', { ascending: false })
         .limit(limit),

@@ -5,13 +5,12 @@
 
 import { NextResponse } from 'next/server';
 import { supabase }     from '../../../../lib/supabase.js';
+import { selectFrom }   from '../../../../lib/supabaseQuery.js';
 
 export async function GET(req, { params }) {
   const { key } = params;
 
-  const { data, error } = await supabase
-    .from('applications')
-    .select('*, questions(*)')
+  const { data, error } = await selectFrom('applications', { columns: '*, questions(*)' })
     .eq('project_key', key)
     .order('deadline', { ascending: true, nullsFirst: false });
 
@@ -22,10 +21,10 @@ export async function GET(req, { params }) {
   if (key === 'research_apps') {
     itemCount = (data ?? []).length;
   } else {
-    const { count } = await supabase
-      .from('items')
-      .select('*', { count: 'exact', head: true })
-      .eq('project_key', key);
+    const { count } = await selectFrom('items', {
+      columns: '*',
+      selectOptions: { count: 'exact', head: true },
+    }).eq('project_key', key);
     itemCount = count ?? 0;
   }
 
