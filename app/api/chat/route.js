@@ -24,7 +24,7 @@ import { classifyTier }              from '../../../lib/tierClassifier.js';
 import { callModelWithFallback }     from '../../../lib/multiModelClient.js';
 import { compressHistory }           from '../../../lib/conversationManager.js';
 import { buildSystemPrompt }         from '../../../lib/buildSystemPrompt.js';
-import { logCost, calculateCost }    from '../../../lib/costTracker.js';
+import { logCost, calculateCost }    from '../../../lib/costLog.js';
 import { PROJECTS }                  from '../../../lib/projects.js';
 import { MODELS }                    from '../../../lib/models.js';
 import { supabase, getMessages, addMessage, getProfile, getTasks } from '../../../lib/supabase.js';

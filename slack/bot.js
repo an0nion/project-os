@@ -16,7 +16,7 @@ import { webSearch } from '../lib/search.js';
 import { pickColorId } from '../lib/calendar.js';
 import { PROJECT_KEYS, VALID_INTENTS, INTENT_SYSTEM_PROMPT } from '../lib/intentPrompt.js';
 import { parseContext, parseProjectKey, parseReminderMins, parseDurationMins, parseTodoReply, parseSoftCheckInReply, parseYesNo } from '../lib/naturalParser.js';
-import { logCostViaApi } from '../lib/vmCostLogger.js';
+import { logCost } from '../lib/costLog.js';
 import { Deduplicator } from '../lib/deduplicator.js';
 import PendingStore from '../lib/pendingStore.js';
 import { loadQuota } from '../lib/geminiQuota.js';
@@ -71,7 +71,7 @@ Examples given current date ${nowStr.split(' ')[0]}:
       messages: [{ role: 'user', content: timeline }],
       maxTokens: 60,
     });
-    logCostViaApi(result.modelKey, result.usage, 'timeline_parse');
+    logCost(result.modelKey, result.usage, { reason: 'timeline_parse' });
 
     const raw    = result.text?.trim() ?? '';
     const json   = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
@@ -156,7 +156,7 @@ async function classifyIntent(text, urls) {
       maxTokens: 300,
     });
 
-    logCostViaApi(result.modelKey, result.usage, 'intent_classification');
+    logCost(result.modelKey, result.usage, { reason: 'intent_classification' });
 
     const raw    = result.text?.trim() ?? '';
     const json   = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
@@ -652,7 +652,7 @@ type=chat: everything else — user wants more info, is exploring, asking questi
           messages: [{ role: 'user', content: userText }],
           maxTokens: 60,
         });
-        logCostViaApi(classifyResult.modelKey, classifyResult.usage, 'learning_classify');
+        logCost(classifyResult.modelKey, classifyResult.usage, { reason: 'learning_classify' });
         const raw    = classifyResult.text?.trim() ?? '';
         const parsed = JSON.parse(raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim());
         classifyType = parsed?.type ?? null;
@@ -720,7 +720,7 @@ Rules:
             messages: callHistory,
             maxTokens: tier.maxTokens,
           });
-          logCostViaApi(explainResult.modelKey, explainResult.usage, 'learning_explain');
+          logCost(explainResult.modelKey, explainResult.usage, { reason: 'learning_explain' });
           chatReply = explainResult.text?.trim() ?? null;
         } catch (err) {
           console.error('[learningMode] explain call failed:', err.message);
@@ -1023,7 +1023,7 @@ Rules:
               messages: [{ role: 'user', content: `Query: "${topic}"\nItems: ${JSON.stringify(results.slice(0, 10).map(r => ({ id: r.id, title: r.title, subtitle: r.subtitle })))}` }],
               maxTokens: 300,
             });
-            logCostViaApi(rankResult.modelKey, rankResult.usage, 'recall_rerank');
+            logCost(rankResult.modelKey, rankResult.usage, { reason: 'recall_rerank' });
             const ranked = JSON.parse(rankResult.text.replace(/```json\n?|```/g, '').trim());
             const reranked = ranked
               .map(r => ({ ...(results.find(x => x.id === r.id) ?? {}), _why: r.why }))

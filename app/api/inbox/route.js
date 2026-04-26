@@ -27,7 +27,7 @@ import { scrapeApplication }      from '../../../scraper/index.js';
 import { supabase }               from '../../../lib/supabase.js';
 import { PROJECTS }               from '../../../lib/projects.js';
 import { callModelWithFallback }  from '../../../lib/multiModelClient.js';
-import { logCost }                from '../../../lib/costTracker.js';
+import { logCost }                from '../../../lib/costLog.js';
 
 // ── Fetch page HTML (title + body text for AI summary) ───────────────────────
 function decodeHtmlEntities(str) {
