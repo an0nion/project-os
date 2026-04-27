@@ -6,72 +6,28 @@
  *
  * Run: node --test tests/bot-flow.test.mjs
  *
- * Pure functions are duplicated here from bot.js to avoid importing Slack Bolt
- * (which has side effects). Future refactor: extract bot.js pure functions into
- * lib/botHelpers.js and import from there.
+ * Pure helpers are imported from lib/botHelpers.js (extracted from slack/bot.js
+ * in Unit 1a). Helpers that read process.env.APP_URL are exercised against the
+ * fixed test value below — set BEFORE any helper is called.
  */
+
+// Set APP_URL for any helper that reads it via process.env.
+// Must run before tests, but helpers read it lazily at call time so this is fine.
+process.env.APP_URL = process.env.APP_URL ?? 'https://project-os.vercel.app';
+const APP_URL = process.env.APP_URL;
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { VALID_INTENTS, PROJECT_KEYS, INTENT_SYSTEM_PROMPT } from '../lib/intentPrompt.js';
-
-// ── Replicated pure functions from bot.js ─────────────────────────────────────
-// Keep these in sync with bot.js. If bot.js changes, update here too.
-
-const APP_URL = 'https://project-os.vercel.app'; // test constant
-
-// --- buildSuccessMessage ---
-const PROJECT_EMOJI = {
-  learning_tech: '📚', work: '💼', school: '🎓', research_apps: '🔬',
-  baking: '🍞', beadwork: '📿', art: '🎨', reading: '📖',
-  exercise: '💪', circuitry: '⚡', personal: '🗓️',
-};
-
-function buildSuccessMessage(data, cls) {
-  const projectEmoji = PROJECT_EMOJI[data.project] ?? '📁';
-  const appUrl = `${APP_URL}/project/${data.project}`;
-  const rawTitle = data.summary ?? '';
-  const cleanTitle = rawTitle
-    .replace(/\n|\r/g, ' ')
-    .replace(/:[a-z_]+:/g, '')
-    .replace(/[<>|]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 60);
-
-  const parts = [];
-  if (cleanTitle) parts.push(`<${appUrl}|${cleanTitle}>`);
-  if (cls?.timeline) parts.push(cls.timeline);
-
-  return `${projectEmoji} ${parts.join(' · ') || 'saved'}`;
-}
-
-// --- buildReminderMessage (mirrors bot.js reminder reply format) ---
-function buildReminderMessage(data, cls) {
-  const title = (data.summary ?? 'reminder').slice(0, 60);
-  const timeNote = cls?.timeline ? ` · ${cls.timeline}` : '';
-  return `🗓️ <${APP_URL}/project/personal|${title}>${timeNote}`;
-}
-
-// --- buildEnrichedText ---
-function buildEnrichedText(context, timeline, text, url) {
-  const parts = [];
-  if (context === 'work')     parts.push('[Work]');
-  if (context === 'personal') parts.push('[Personal]');
-  if (text && text !== url)   parts.push(text.replace(url ?? '', '').trim());
-  if (timeline)               parts.push(`— ${timeline}`);
-  return parts.filter(Boolean).join(' ');
-}
-
-// --- parseClarificationContext ---
-function parseClarificationContext(text) {
-  const t = text.toLowerCase();
-  if (/\bwork\b|\bjob\b|\bprofessional\b|\bsprint\b|\bticket\b/i.test(text)) return 'work';
-  if (/\bpersonal\b|\bperson\b|\bmine\b|\bme\b|\blearning\b|\bfun\b|\bcurious\b/i.test(text)) return 'personal';
-  if (/^w\b/i.test(t.trim())) return 'work';
-  if (/^p\b/i.test(t.trim())) return 'personal';
-  return null;
-}
+import {
+  buildSuccessMessage,
+  buildReminderMessage,
+  buildEnrichedText,
+  parseClarificationContext,
+  extractUrls,
+  normaliseTask,
+  PROJECT_EMOJI,
+} from '../lib/botHelpers.js';
 
 // --- parseProjectFromText ---
 const PROJECT_ALIASES = {
@@ -92,32 +48,6 @@ function parseProjectFromText(text) {
     if (lower.includes(alias)) return key;
   }
   return null;
-}
-
-// --- extractUrls ---
-function extractUrls(message) {
-  const urls = [];
-  const urlRegex = /https?:\/\/[^\s<>|]+/g;
-  if (message.text) urls.push(...(message.text.match(urlRegex) ?? []));
-  if (message.blocks) {
-    const walk = els => {
-      for (const el of els ?? []) {
-        if (el.type === 'link' && el.url?.startsWith('http')) urls.push(el.url);
-        if (el.elements) walk(el.elements);
-      }
-    };
-    message.blocks.forEach(b => walk(b.elements));
-  }
-  if (message.attachments) {
-    for (const a of message.attachments) {
-      if (a.original_url?.startsWith('http')) urls.push(a.original_url);
-      if (a.from_url?.startsWith('http'))     urls.push(a.from_url);
-      if (a.title_link?.startsWith('http'))   urls.push(a.title_link);
-    }
-  }
-  return [...new Set(urls)].filter(u =>
-    !u.includes('slack.com') && !u.includes('slack-edge.com')
-  );
 }
 
 // --- buildDeadlineNudgeLine (extracted from sendSlackDeadlineNudge inline logic) ---
@@ -2241,23 +2171,7 @@ describe('pickColorId (lib/calendar.js) — keyword + project color routing', ()
 // SECTION 18 — normaliseTask — validation, defaulting, VALID_INTENTS filter
 // ══════════════════════════════════════════════════════════════════════════════
 // VALID_INTENTS and PROJECT_KEYS imported from lib/intentPrompt.js — single source of truth.
-
-// Replicated from bot.js — must stay in sync
-function normaliseTask(t) {
-  const tier = t.priority_tier;
-  return {
-    intent:              VALID_INTENTS.includes(t.intent) ? t.intent : 'save',
-    title:               typeof t.title === 'string' && t.title.trim() ? t.title.trim() : null,
-    timeline:            typeof t.timeline === 'string' && t.timeline.trim() ? t.timeline.trim() : null,
-    context:             t.context             ?? null,
-    project_hint:        PROJECT_KEYS.includes(t.project_hint) ? t.project_hint : null,
-    priority_tier:       (Number.isInteger(tier) && tier >= 1 && tier <= 4) ? tier : null,
-    needs_clarification: t.needs_clarification === true,
-    corrected_project:   t.corrected_project   ?? null,
-    recall_topic:        typeof t.recall_topic === 'string' && t.recall_topic.trim() ? t.recall_topic.trim() : null,
-    search_query:        typeof t.search_query === 'string' && t.search_query.trim() ? t.search_query.trim() : null,
-  };
-}
+// normaliseTask imported from lib/botHelpers.js (extracted in Unit 1a).
 
 describe('normaliseTask — field defaulting and intent validation', () => {
 
