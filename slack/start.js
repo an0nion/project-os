@@ -14,4 +14,5 @@ import { validateEnv } from '../lib/envSchema.js';
 
 validateEnv({ context: 'bot' });
 
-await import('./bot.js');
+const { runBot } = await import('./bot.js');
+await runBot();
