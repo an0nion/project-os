@@ -11,7 +11,7 @@
  */
 
 import { NextResponse } from 'next/server';
-import { supabase }     from '../../../../../lib/supabase.js';
+import { selectFrom }   from '../../../../../lib/supabaseQuery.js';
 import { PROJECTS }     from '../../../../../lib/projects.js';
 
 export async function GET(req, { params }) {
@@ -28,9 +28,9 @@ export async function GET(req, { params }) {
 
   if (key === 'research_apps') {
     // Map applications → unified item shape
-    const { data, error } = await supabase
-      .from('applications')
-      .select('id, name, org, status, deadline, url, questions(id, text, status, answer)')
+    const { data, error } = await selectFrom('applications', {
+      columns: 'id, name, org, status, deadline, url, questions(id, text, status, answer)',
+    })
       .eq('project_key', key)
       .order('deadline', { ascending: true, nullsFirst: false });
 
@@ -44,12 +44,12 @@ export async function GET(req, { params }) {
       due_date: a.deadline,
       url:      a.url,
       notes:    null,
-      extra:    { questions: a.questions ?? [] },
+      // Filter out soft-deleted child questions (Supabase nested selects don't
+      // honour the parent's deleted_at filter).
+      extra:    { questions: (a.questions ?? []).filter(q => q.deleted_at == null) },
     }));
   } else {
-    const { data, error } = await supabase
-      .from('items')
-      .select('*')
+    const { data, error } = await selectFrom('items')
       .eq('project_key', key)
       .order('position', { ascending: true })
       .order('created_at', { ascending: false });

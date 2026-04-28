@@ -1,10 +1,12 @@
 /**
  * GET    /api/applications/:id  — fetch single application with questions
  * PATCH  /api/applications/:id  — update fields (status, name, org, deadline, etc.)
- * DELETE /api/applications/:id  — delete application + cascades to questions/chat
+ * DELETE /api/applications/:id  — soft-delete: sets deleted_at; trigger
+ *                                 propagates to child questions (audit-safe).
  */
 
-import { supabase }             from '../../../../lib/supabase.js';
+import { supabase }              from '../../../../lib/supabase.js';
+import { selectFrom, softDelete } from '../../../../lib/supabaseQuery.js';
 import { ok, fail }              from '../../../../lib/apiResponse.js';
 import { ApplicationPatch }      from '../../../../lib/schemas.js';
 import { ValidationError, NotFoundError, UpstreamError } from '../../../../lib/errors.js';
@@ -12,9 +14,7 @@ import { log }                   from '../../../../lib/log.js';
 
 export async function GET(req, { params }) {
   try {
-    const { data, error } = await supabase
-      .from('applications')
-      .select('*, questions(*)')
+    const { data, error } = await selectFrom('applications', { columns: '*, questions(*)' })
       .eq('id', params.id)
       .single();
 
@@ -61,10 +61,10 @@ export async function PATCH(req, { params }) {
 
 export async function DELETE(req, { params }) {
   try {
-    const { error } = await supabase
-      .from('applications')
-      .delete()
-      .eq('id', params.id);
+    // Soft-delete: preserves the row + audit trail. The
+    // trg_propagate_soft_delete_questions trigger cascades deleted_at to child
+    // questions automatically.
+    const { error } = await softDelete('applications').eq('id', params.id);
 
     if (error) throw new UpstreamError(error.message);
     return ok({ ok: true });

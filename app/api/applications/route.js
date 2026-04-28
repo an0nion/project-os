@@ -1,22 +1,23 @@
 /**
  * GET  /api/applications        — list all applications (optional ?project= filter)
  * POST /api/applications        — create application manually (without scraping)
+ *
+ * Soft-delete-aware: GET hides rows with deleted_at IS NOT NULL via lib/supabaseQuery.js.
  */
 
 import { supabase }              from '../../../lib/supabase.js';
-import { ok, fail }               from '../../../lib/apiResponse.js';
-import { ApplicationPost }        from '../../../lib/schemas.js';
+import { selectFrom }            from '../../../lib/supabaseQuery.js';
+import { ok, fail }              from '../../../lib/apiResponse.js';
+import { ApplicationPost }       from '../../../lib/schemas.js';
 import { ValidationError, UpstreamError } from '../../../lib/errors.js';
-import { log }                    from '../../../lib/log.js';
+import { log }                   from '../../../lib/log.js';
 
 export async function GET(req) {
   try {
     const { searchParams } = new URL(req.url);
     const projectKey = searchParams.get('project');
 
-    let query = supabase
-      .from('applications')
-      .select('*, questions(*)')
+    let query = selectFrom('applications', { columns: '*, questions(*)' })
       .order('deadline', { ascending: true, nullsFirst: false });
 
     if (projectKey) query = query.eq('project_key', projectKey);
