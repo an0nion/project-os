@@ -28,6 +28,7 @@ import { supabase }               from '../../../lib/supabase.js';
 import { PROJECTS }               from '../../../lib/projects.js';
 import { callModelWithFallback }  from '../../../lib/multiModelClient.js';
 import { logCost }                from '../../../lib/costLog.js';
+import { addDays, formatInTz }    from '../../../lib/timezone.js';
 
 // ── Fetch page HTML (title + body text for AI summary) ───────────────────────
 function decodeHtmlEntities(str) {
@@ -113,24 +114,20 @@ function parseDeadlineDate(timeline) {
   const low  = timeline.toLowerCase().trim();
 
   if (/tomorrow/.test(low)) {
-    const d = new Date(now); d.setDate(d.getDate() + 1);
-    return d.toISOString().slice(0, 10);
+    return formatInTz(addDays(now, 1), 'yyyy-MM-dd');
   }
   if (/today|tonight|asap|urgent/.test(low)) {
-    return now.toISOString().slice(0, 10);
+    return formatInTz(now, 'yyyy-MM-dd');
   }
   if (/this week/.test(low)) {
-    const d = new Date(now); d.setDate(d.getDate() + 7);
-    return d.toISOString().slice(0, 10);
+    return formatInTz(addDays(now, 7), 'yyyy-MM-dd');
   }
   if (/next week/.test(low)) {
-    const d = new Date(now); d.setDate(d.getDate() + 14);
-    return d.toISOString().slice(0, 10);
+    return formatInTz(addDays(now, 14), 'yyyy-MM-dd');
   }
   if (/in (\d+) week/.test(low)) {
     const weeks = parseInt(low.match(/in (\d+) week/)[1]);
-    const d = new Date(now); d.setDate(d.getDate() + weeks * 7);
-    return d.toISOString().slice(0, 10);
+    return formatInTz(addDays(now, weeks * 7), 'yyyy-MM-dd');
   }
   if (/in (\d+) month/.test(low)) {
     const months = parseInt(low.match(/in (\d+) month/)[1]);

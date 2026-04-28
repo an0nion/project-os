@@ -6,15 +6,14 @@
  * Not an HTTP route — pure async function.
  */
 
-const AEST_OFFSET_MS = 10 * 60 * 60 * 1000;
+import { startOfDayInTz, addDays } from '../../../../lib/timezone.js';
 
 export async function run(db) {
-  const nowUtc = Date.now();
-  const todayAestMidnight = new Date(
-    Math.floor((nowUtc + AEST_OFFSET_MS) / 86_400_000) * 86_400_000 - AEST_OFFSET_MS
-  );
-  const yesterdayStart = new Date(todayAestMidnight.getTime() - 86_400_000).toISOString();
-  const yesterdayEnd   = todayAestMidnight.toISOString();
+  // DST-safe: midnight of today/yesterday in APP_TZ, regardless of AEDT/AEST.
+  const todayMidnight     = startOfDayInTz();
+  const yesterdayMidnight = addDays(todayMidnight, -1);
+  const yesterdayStart    = yesterdayMidnight.toISOString();
+  const yesterdayEnd      = todayMidnight.toISOString();
 
   const { data: rows } = await db
     .from('cost_log')
