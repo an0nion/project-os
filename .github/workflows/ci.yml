@@ -28,10 +28,20 @@ jobs:
       ANTHROPIC_API_KEY: sk-ant-stub-anthropic-key-for-build-only
       GOOGLE_AI_API_KEY: AIzaStubGoogleAIKeyForBuildOnly
       DEEPSEEK_API_KEY: sk-stub-deepseek-key-for-build-only
-      NEXT_PUBLIC_VAPID_PUBLIC_KEY: BNstubVapidPublicKeyForBuildOnly_paddingToReachMinLength_xxxxxxxxxxxxxxxxxxxx
-      VAPID_PRIVATE_KEY: stub_vapid_private_key_for_build_only_xxx
+      # Real-format VAPID public key (65-byte P-256 EC point, base64url) so
+      # web-push's startup decode check passes. This is a known throwaway test
+      # pair — never use for real notifications.
+      NEXT_PUBLIC_VAPID_PUBLIC_KEY: BO5sWjHrQEKYO2_jklr3QHJ8qHHAtAh5q4vmJU0AuP8Ji0HAvfu4bMx30QjhRT8mLzS8gSPKCH3Xrm7uyJxh3fU
+      VAPID_PRIVATE_KEY: cQjBNZAtVW9xPjpIN5BfjUOJzoHFPlXRfKrIGJlZqqA
       VAPID_EMAIL: mailto:ci@example.com
       APP_TIMEZONE: Australia/Melbourne
+      # Slack Bolt validates appToken format on App() construction at module
+      # load. Bot bot.js gets statically imported by /api/cron/deadlines via
+      # sendSlackDeadlineNudge.
+      SLACK_BOT_TOKEN: xoxb-stub-bot-token-for-build-only
+      SLACK_APP_TOKEN: xapp-1-stub-app-token-for-build-only-AAAAAAA
+      SLACK_USER_ID: U00STUB000
+      TAVILY_API_KEY: tvly-stub-tavily-key-for-build-only
       # NODE_ENV=test bypasses V2.5's strict production env validation while
       # still exercising the build path. Next.js build sets its own NODE_ENV
       # internally for the build step; instrumentation.js register() doesn't
