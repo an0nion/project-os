@@ -67,4 +67,6 @@ jobs:
         run: npm run build
 
       - name: Test
-        run: node --test "tests/**/*.test.mjs"
+        # Bash globstar (**) is off by default; tests are all flat at tests/
+        # top level so single-* glob is sufficient.
+        run: node --test tests/*.test.mjs
