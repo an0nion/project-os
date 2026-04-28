@@ -2,41 +2,39 @@
  * POST /api/inbox/correct
  * Record a user correction on a previously logged inbox item.
  *
- * This is the primary mechanism for building a labelled training dataset.
- * Every row in inbox_log with corrected_project != null is a training example:
- *   input:     { url, text }          (what was sent)
- *   predicted: model_project          (what the router guessed)
- *   correct:   corrected_project      (what it should have been)
- *
  * Body: { logId, correctedProject, note? }
  */
 
-import { NextResponse } from 'next/server';
-import { supabase }     from '../../../../lib/supabase.js';
-import { PROJECTS }     from '../../../../lib/projects.js';
+import { supabase }       from '../../../../lib/supabase.js';
+import { ok, fail }       from '../../../../lib/apiResponse.js';
+import { InboxCorrectPost } from '../../../../lib/schemas.js';
+import { ValidationError, UpstreamError } from '../../../../lib/errors.js';
+import { log }            from '../../../../lib/log.js';
 
 export async function POST(req) {
-  const { logId, correctedProject, note } = await req.json();
+  try {
+    let body;
+    try { body = await req.json(); }
+    catch { throw new ValidationError('Invalid JSON'); }
 
-  if (!logId || !correctedProject) {
-    return NextResponse.json({ error: 'logId and correctedProject required' }, { status: 400 });
+    const parsed = InboxCorrectPost.safeParse(body);
+    if (!parsed.success) throw new ValidationError('Bad request', parsed.error.format());
+
+    const { logId, correctedProject, note } = parsed.data;
+
+    const { error } = await supabase
+      .from('inbox_log')
+      .update({
+        corrected_project: correctedProject,
+        correction_note:   note ?? null,
+        is_correction:     true,
+      })
+      .eq('id', logId);
+
+    if (error) throw new UpstreamError(error.message);
+    return ok({ ok: true, correctedProject });
+  } catch (err) {
+    log.error('inbox:correct', 'failed', { err: err.message });
+    return fail(err);
   }
-
-  const validKey = PROJECTS.find(p => p.key === correctedProject);
-  if (!validKey) {
-    return NextResponse.json({ error: `Unknown project key: ${correctedProject}` }, { status: 400 });
-  }
-
-  const { error } = await supabase
-    .from('inbox_log')
-    .update({
-      corrected_project: correctedProject,
-      correction_note:   note ?? null,
-      is_correction:     true,
-    })
-    .eq('id', logId);
-
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
-
-  return NextResponse.json({ ok: true, correctedProject });
 }

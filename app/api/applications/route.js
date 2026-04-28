@@ -3,39 +3,56 @@
  * POST /api/applications        — create application manually (without scraping)
  */
 
-import { NextResponse } from 'next/server';
-import { supabase }     from '../../../lib/supabase.js';
+import { supabase }              from '../../../lib/supabase.js';
+import { ok, fail }               from '../../../lib/apiResponse.js';
+import { ApplicationPost }        from '../../../lib/schemas.js';
+import { ValidationError, UpstreamError } from '../../../lib/errors.js';
+import { log }                    from '../../../lib/log.js';
 
 export async function GET(req) {
-  const { searchParams } = new URL(req.url);
-  const projectKey = searchParams.get('project');
+  try {
+    const { searchParams } = new URL(req.url);
+    const projectKey = searchParams.get('project');
 
-  let query = supabase
-    .from('applications')
-    .select('*, questions(*)')
-    .order('deadline', { ascending: true, nullsFirst: false });
+    let query = supabase
+      .from('applications')
+      .select('*, questions(*)')
+      .order('deadline', { ascending: true, nullsFirst: false });
 
-  if (projectKey) query = query.eq('project_key', projectKey);
+    if (projectKey) query = query.eq('project_key', projectKey);
 
-  const { data, error } = await query;
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+    const { data, error } = await query;
+    if (error) throw new UpstreamError(error.message);
 
-  return NextResponse.json({ applications: data ?? [] });
+    return ok({ applications: data ?? [] });
+  } catch (err) {
+    log.error('applications', 'get_failed', { err: err.message });
+    return fail(err);
+  }
 }
 
 export async function POST(req) {
-  const body = await req.json();
-  const { name, org, url, deadline, projectKey = 'research_apps' } = body;
+  try {
+    let body;
+    try { body = await req.json(); }
+    catch { throw new ValidationError('Invalid JSON'); }
 
-  if (!name) return NextResponse.json({ error: 'name required' }, { status: 400 });
+    const parsed = ApplicationPost.safeParse(body);
+    if (!parsed.success) throw new ValidationError('Bad request', parsed.error.format());
 
-  const { data, error } = await supabase
-    .from('applications')
-    .insert({ name, org: org ?? '', url: url ?? null, deadline: deadline ?? null, project_key: projectKey, status: 'backlog' })
-    .select()
-    .single();
+    const { name, org, url, deadline, projectKey } = parsed.data;
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+    const { data, error } = await supabase
+      .from('applications')
+      .insert({ name, org: org ?? '', url: url ?? null, deadline: deadline ?? null, project_key: projectKey, status: 'backlog' })
+      .select()
+      .single();
 
-  return NextResponse.json({ application: data }, { status: 201 });
+    if (error) throw new UpstreamError(error.message);
+
+    return ok({ application: data }, { status: 201 });
+  } catch (err) {
+    log.error('applications', 'post_failed', { err: err.message });
+    return fail(err);
+  }
 }

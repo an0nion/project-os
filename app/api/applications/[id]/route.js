@@ -4,49 +4,72 @@
  * DELETE /api/applications/:id  — delete application + cascades to questions/chat
  */
 
-import { NextResponse } from 'next/server';
-import { supabase }     from '../../../../lib/supabase.js';
+import { supabase }             from '../../../../lib/supabase.js';
+import { ok, fail }              from '../../../../lib/apiResponse.js';
+import { ApplicationPatch }      from '../../../../lib/schemas.js';
+import { ValidationError, NotFoundError, UpstreamError } from '../../../../lib/errors.js';
+import { log }                   from '../../../../lib/log.js';
 
 export async function GET(req, { params }) {
-  const { data, error } = await supabase
-    .from('applications')
-    .select('*, questions(*)')
-    .eq('id', params.id)
-    .single();
+  try {
+    const { data, error } = await supabase
+      .from('applications')
+      .select('*, questions(*)')
+      .eq('id', params.id)
+      .single();
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 404 });
-  return NextResponse.json({ application: data });
+    if (error) throw new NotFoundError(error.message);
+    return ok({ application: data });
+  } catch (err) {
+    log.error('applications', 'get_one_failed', { err: err.message });
+    return fail(err);
+  }
 }
 
 export async function PATCH(req, { params }) {
-  const body = await req.json();
+  try {
+    let body;
+    try { body = await req.json(); }
+    catch { throw new ValidationError('Invalid JSON'); }
 
-  const allowed = ['name', 'org', 'url', 'deadline', 'status', 'project_key'];
-  const updates = Object.fromEntries(
-    Object.entries(body).filter(([k]) => allowed.includes(k)),
-  );
+    const parsed = ApplicationPatch.safeParse(body);
+    if (!parsed.success) throw new ValidationError('Bad request', parsed.error.format());
 
-  if (Object.keys(updates).length === 0) {
-    return NextResponse.json({ error: 'No valid fields to update' }, { status: 400 });
+    const allowed = ['name', 'org', 'url', 'deadline', 'status', 'project_key'];
+    const updates = Object.fromEntries(
+      Object.entries(parsed.data).filter(([k]) => allowed.includes(k)),
+    );
+
+    if (Object.keys(updates).length === 0) {
+      throw new ValidationError('No valid fields to update');
+    }
+
+    const { data, error } = await supabase
+      .from('applications')
+      .update(updates)
+      .eq('id', params.id)
+      .select()
+      .single();
+
+    if (error) throw new UpstreamError(error.message);
+    return ok({ application: data });
+  } catch (err) {
+    log.error('applications', 'patch_failed', { err: err.message });
+    return fail(err);
   }
-
-  const { data, error } = await supabase
-    .from('applications')
-    .update(updates)
-    .eq('id', params.id)
-    .select()
-    .single();
-
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
-  return NextResponse.json({ application: data });
 }
 
 export async function DELETE(req, { params }) {
-  const { error } = await supabase
-    .from('applications')
-    .delete()
-    .eq('id', params.id);
+  try {
+    const { error } = await supabase
+      .from('applications')
+      .delete()
+      .eq('id', params.id);
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
-  return NextResponse.json({ ok: true });
+    if (error) throw new UpstreamError(error.message);
+    return ok({ ok: true });
+  } catch (err) {
+    log.error('applications', 'delete_failed', { err: err.message });
+    return fail(err);
+  }
 }
