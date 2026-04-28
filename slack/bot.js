@@ -944,25 +944,30 @@ export async function sendSlackDeadlineNudge(slackUserId, apps) {
   });
 }
 
-await loadQuota(process.env.APP_URL, process.env.APP_SECRET);
-await pending.hydrateAll();
-await app.start();
-console.log('✅ Project OS bot running');
+// ── Bot lifecycle (only runs when invoked via slack/start.js) ────────────────
+// Extracted so this file can be imported by Vercel routes (e.g. sendSlackDeadlineNudge)
+// without triggering app.start() / Slack socket connect / Bolt auth at module load.
+export async function runBot() {
+  await loadQuota(process.env.APP_URL, process.env.APP_SECRET);
+  await pending.hydrateAll();
+  await app.start();
+  console.log('✅ Project OS bot running');
 
-// ── Batch draft delivery — poll every 60s for completed async jobs ────────────
-if (process.env.APP_URL && process.env.APP_SECRET) {
-  setInterval(async () => {
-    try {
-      const res = await fetch(`${process.env.APP_URL}/api/batch/poll`, {
-        headers: { 'x-api-secret': process.env.APP_SECRET },
-      });
-      const { completed } = await res.json();
-      for (const { text, channel } of (completed ?? [])) {
-        await app.client.chat.postMessage({ channel, text });
-        console.log(`[batch:poll] delivered draft to ${channel}`);
+  // Batch draft delivery — poll every 60s for completed async jobs
+  if (process.env.APP_URL && process.env.APP_SECRET) {
+    setInterval(async () => {
+      try {
+        const res = await fetch(`${process.env.APP_URL}/api/batch/poll`, {
+          headers: { 'x-api-secret': process.env.APP_SECRET },
+        });
+        const { completed } = await res.json();
+        for (const { text, channel } of (completed ?? [])) {
+          await app.client.chat.postMessage({ channel, text });
+          console.log(`[batch:poll] delivered draft to ${channel}`);
+        }
+      } catch (err) {
+        console.error('[batch:poll] poll failed:', err.message);
       }
-    } catch (err) {
-      console.error('[batch:poll] poll failed:', err.message);
-    }
-  }, 60_000);
+    }, 60_000);
+  }
 }
