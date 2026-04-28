@@ -17,6 +17,24 @@
  */
 
 import 'dotenv/config';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { validateEnv } from '../lib/envSchema.js';
+
+// Only validate env when this file is the bot's entry point (npm run slack /
+// node slack/bot.js). When `sendSlackDeadlineNudge` is imported by Next.js
+// during build, we DON'T want to throw — the web context has its own
+// validation via `instrumentation.js`.
+const _isBotEntry = (() => {
+  try {
+    const argv1 = process.argv[1];
+    if (!argv1) return false;
+    return path.resolve(argv1) === fileURLToPath(import.meta.url);
+  } catch { return false; }
+})();
+if (_isBotEntry) {
+  validateEnv({ context: 'bot' });   // throws BEFORE Bolt construction if config is bad
+}
 import bolt from '@slack/bolt';
 import { callModelWithFallback } from '../lib/multiModelClient.js';
 import { webSearch } from '../lib/search.js';
@@ -33,6 +51,7 @@ import {
   buildSuccessMessage, buildEnrichedText, extractUrls, normaliseTask,
 } from '../lib/botHelpers.js';
 import { dispatchPending } from '../lib/botIntents.js';
+import { APP_TZ, formatInTz, addDays as tzAddDays } from '../lib/timezone.js';
 
 const { App } = bolt;
 
@@ -49,10 +68,12 @@ const app = new App({
 async function parseTimelineToDate(timeline) {
   if (!timeline) return null;
 
-  const TZ = 'Australia/Melbourne';
-  // Compute current Melbourne local time for AI context
-  const mel = new Date(new Date().toLocaleString('en-US', { timeZone: TZ }));
-  const nowStr = `${mel.getFullYear()}-${String(mel.getMonth()+1).padStart(2,'0')}-${String(mel.getDate()).padStart(2,'0')} ${String(mel.getHours()).padStart(2,'0')}:${String(mel.getMinutes()).padStart(2,'0')} (${TZ})`;
+  const TZ = APP_TZ();
+  // Compute current local time (in TZ) for AI context — DST-safe via timezone helpers.
+  const nowDate = new Date();
+  const todayStr = formatInTz(nowDate, 'yyyy-MM-dd');
+  const nowStr = `${formatInTz(nowDate, 'yyyy-MM-dd HH:mm')} (${TZ})`;
+  const tomorrowStr = formatInTz(tzAddDays(nowDate, 1), 'yyyy-MM-dd');
 
   try {
     const result = await callModelWithFallback('deepseek-chat', 'gemini-flash', {
@@ -72,9 +93,9 @@ Rules:
 - Use 24-hour format for datetime output
 - Dot notation times: "5.20pm" = "17:20"
 
-Examples given current date ${nowStr.split(' ')[0]}:
-"tomorrow" → {"date": "${(() => { const d = new Date(mel); d.setDate(d.getDate()+1); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; })()}"}
-"today at 5.20pm" → {"datetime": "${mel.getFullYear()}-${String(mel.getMonth()+1).padStart(2,'0')}-${String(mel.getDate()).padStart(2,'0')}T17:20:00"}
+Examples given current date ${todayStr}:
+"tomorrow" → {"date": "${tomorrowStr}"}
+"today at 5.20pm" → {"datetime": "${todayStr}T17:20:00"}
 "this Saturday at 2pm" → (compute next Saturday date with T14:00:00)
 "13th" → (compute correct month's 13th)
 "in 2 weeks" → {"date": "(date + 14 days)"}

@@ -8,15 +8,14 @@
  */
 
 import { callModelWithFallback } from '../../../../lib/multiModelClient.js';
-
-const AEST_OFFSET_MS = 10 * 60 * 60 * 1000;
+import { startOfDayInTz, addDays, formatInTz } from '../../../../lib/timezone.js';
 
 export async function run(db) {
-  const nowUtc     = Date.now();
-  const todayAest  = new Date(Math.floor((nowUtc + AEST_OFFSET_MS) / 86_400_000) * 86_400_000 - AEST_OFFSET_MS);
-  const todayStart = todayAest.toISOString();
-  const todayEnd   = new Date(todayAest.getTime() + 86_400_000).toISOString();
-  const dateStr    = todayStart.slice(0, 10);
+  // DST-safe: midnight today in APP_TZ; "+1 day" preserves local clock across DST.
+  const todayMidnight = startOfDayInTz();
+  const todayStart    = todayMidnight.toISOString();
+  const todayEnd      = addDays(todayMidnight, 1).toISOString();
+  const dateStr       = formatInTz(todayMidnight, 'yyyy-MM-dd');
 
   const { data: dueToday } = await db
     .from('items')
@@ -25,7 +24,7 @@ export async function run(db) {
     .lt('due_date', todayEnd)
     .neq('status', 'done');
 
-  const cutoff = new Date(todayAest.getTime() + 7 * 86_400_000).toISOString();
+  const cutoff = addDays(todayMidnight, 7).toISOString();
   const { data: upcoming } = await db
     .from('applications')
     .select('name, org, deadline, status')
@@ -51,7 +50,7 @@ export async function run(db) {
   if (hasUpcoming) {
     contextLines.push(`\nUpcoming application deadlines (next 7 days):`);
     for (const app of upcoming) {
-      const daysLeft = Math.ceil((new Date(app.deadline) - todayAest) / 86_400_000);
+      const daysLeft = Math.ceil((new Date(app.deadline) - todayMidnight) / 86_400_000);
       contextLines.push(`  - ${app.name} (${app.org}) — ${daysLeft}d left, status: ${app.status}`);
     }
   }
